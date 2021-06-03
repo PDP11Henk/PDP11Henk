@@ -1,0 +1,236 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-queues
+--
+--    this module contains the circular buffer to store/retrieve CDI setpoints,
+--    and store/retrieve CRS and HDG averaged settingz.
+
+
+var sword lastHDGsetting
+var word  lastCRSsetting, lastCRSperiod
+var word  crsDataValue, crsDataPeriod        -- global "transfer" variables
+
+procedure initQueueAdministration() is
+    CDIupdate         = FALSE
+    CDIheadIndex      = 0
+    CDItailIndex      = 0
+
+    crsDriveUpdate    = FALSE
+    crsDriveHeadIndex = 0
+    crsDriveTailIndex = 0
+
+    CRSheadIndex      = 0
+    CRStailIndex      = 0
+    HDGheadIndex      = 0
+    HDGtailIndex      = 0
+
+    lastHDGsetting    = 0
+    lastCRSsetting    = 0
+    lastCRSperiod     = 0
+    crsDataValue      = 0
+    crsDataPeriod     = 0
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- accept new setpoint for CDI and CRS drive, accept CRS / HDG setting
+-- -----------------------------------------------------------------------------
+
+procedure accNewCDIsetpoint() is
+  var byte nextIndex
+
+  if (CDIupdate == TRUE) then
+     nextIndex = CDIheadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != CDItailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        CDIbuffer[CDIheadIndex] = CDInewPos
+        CDIheadIndex = nextIndex
+     end if
+     CDIupdate = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewCrsDriveSetpoint() is
+  var byte nextIndex
+
+  if (crsDriveUpdate == TRUE) then
+     nextIndex = crsDriveHeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != crsDriveTailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        crsDriveBuffer[crsDriveHeadIndex] = crsDriveNewPos
+        crsDriveHeadIndex = nextIndex
+     end if
+     crsDriveUpdate = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewCRSsetting(WORD in CRSvalue, WORD in CRSperiod) is
+  var byte nextIndex
+
+  nextIndex = CRSheadIndex + 2
+  if (nextIndex >= MAX_NO_SETPOINTS) then
+     -- the last location of the buffer is not used.
+     -- This makes identification of "buffer full" and "buffer empty" easy.
+     nextIndex = 0
+  end if
+  if (nextIndex != CRStailIndex) then
+     -- space available in buffer: store the new setpoint.
+     -- Note: if no space is available, the new setpoint is simply lost!
+     CRSbuffer[CRSheadIndex] = CRSvalue
+     CRSbuffer[CRSheadIndex+1] = CRSperiod
+     CRSheadIndex = nextIndex
+  end if
+end procedure
+
+
+
+procedure accNewHDGsetting(SWORD in HDGvalue) is
+  var byte nextIndex
+
+  nextIndex = HDGheadIndex + 1
+  if (nextIndex >= MAX_NO_SETPOINTS) then
+     -- the last location of the buffer is not used.
+     -- This makes identification of "buffer full" and "buffer empty" easy.
+     nextIndex = 0
+  end if
+  if (nextIndex != HDGtailIndex) then
+     -- space available in buffer: store the new setpoint.
+     -- Note: if no space is available, the new setpoint is simply lost!
+     HDGbuffer[HDGheadIndex] = HDGvalue
+     HDGheadIndex = nextIndex
+  end if
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new setpoint for CDI and Course drive
+-- -----------------------------------------------------------------------------
+
+function getNewCDIsetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (CDIheadIndex == CDItailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = CDIbuffer[CDItailIndex]
+      nextIndex = CDItailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      CDItailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewCrsDriveSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (crsDriveHeadIndex == crsDriveTailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = crsDriveBuffer[crsDriveTailIndex]
+      nextIndex = crsDriveTailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      crsDriveTailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new setting for CRS
+--
+--  Note: if the queue is empty (no new CRS setting available, the last known
+--        CRS setting is returned. This is done to produce a CRS setting in
+--        case the message request is set to "AT REGULAR INTERVAL".
+--  Output: retrieved values are stored in "crsDataValue" and "crsDataPeriod".
+-- -----------------------------------------------------------------------------
+
+procedure getNewCRSsetting() is
+  var byte nextIndex
+
+  if (CRSheadIndex == CRStailIndex) then
+      -- buffer is empty
+      crsDataValue  = lastCRSsetting
+      crsDataPeriod = lastCRSperiod
+  else
+      crsDataValue   = CRSbuffer[CRStailIndex]
+      crsDataPeriod  = CRSbuffer[CRStailIndex + 1]
+      lastCRSsetting = crsDataValue            -- remember "last" CRS setting
+      lastCRSperiod  = crsDataPeriod
+      nextIndex = CRStailIndex + 2
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      CRStailIndex = nextIndex
+  end if
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new setting for HDG
+--
+--  Note: if the queue is empty (no new HDG setting available, the last known
+--        HDG setting is returned. This is done to produce a HDG setting in
+--        case the message request is set to "AT REGULAR INTERVAL".
+-- -----------------------------------------------------------------------------
+
+function getNewHDGsetting() return SWORD is
+  var sword setting
+  var byte  nextIndex
+
+  if (HDGheadIndex == HDGtailIndex) then
+      -- buffer is empty ==> return last known HDG reference marker setting
+      setting = lastHDGsetting
+  else
+      setting = HDGbuffer[HDGtailIndex]
+      lastHDGsetting = setting              -- remember "last" HDG setting
+      nextIndex = HDGtailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      HDGtailIndex = nextIndex
+  end if
+  return setting
+end function
+

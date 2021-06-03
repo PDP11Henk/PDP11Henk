@@ -1,0 +1,434 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Horizontal Situation Indicator (HSI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-course
+--
+--    this module contains the routines process and output the course setting
+--    as an analog value using a DAC, and as a USB message (if enabled).
+--
+-- ############################# DEBUG  OUTPUT  ################################
+--
+-- one-liner for conversion debugging:
+-- CRSout=xxxx/xxxx
+-- {followed by]
+--    ToDAC=xxxx base=xxxx fac=xxxx norm=xxxx       <output from outputCRStoDAC>
+-- [followed by]
+--    ToUSB=xxxx                                    <output from sendCRStoUSB  >
+--
+-- separate output for convertCourse()
+--
+-- -----------------------------------------------------------------------------
+
+
+var word prevCourseValue
+var word prevCoursePeriod
+var byte debugCRSoutput
+
+
+
+procedure initCRSsettingOutput() is
+    prevCourseValue  = 9999                -- init with "impossible" CRS value
+    prevCoursePeriod = 0
+    debugCRSoutput   = FALSE
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Convert course data to a "course angle"
+--
+--   parameter in : value  (0 .. sinCosCrossOver4) :: 000° - 180°
+--                         *or*
+--                         (sinCosCrossOver4 .. 0) :: 180° - 360°
+--                  period (0 or 1)
+--   parameter out: course angle (0 .. 4095)
+-- -----------------------------------------------------------------------------
+--
+-- ####################### DEBUG  OUTPUT  ######################### --
+-- one-liner for conversion debugging (called from outputCRStoUSB)  --
+-- cnvP=xxxx cnvV=xxxx Cross=xxxx/xxxx/xxxx/xxxx quad=xx baseV=xxxx --
+--      fac=xxxx baseA=xxxx crsA=xxxx                               --
+
+const byte CNV_CROSSOVERS[]  = {" ","C","r","o","s","s","=","!"}
+const byte CNVCRS_QUADRANT[] = {" ","q","u","a","d","=","!"}
+const byte CNVCRS_BASE_V[]   = {" ","b","a","s","e","V","=","!"}
+const byte CNVCRS_FACTOR[]   = {" ","f","a","c","=","!"}
+const byte CNVCRS_BASE_A[]   = {" ","b","a","s","e","A","=","!"}
+const byte CNVCRS_CRS_A[]    = {" ","c","r","s","A","=","!"}
+
+function convertCourse(WORD in value, WORD in period) return WORD is
+  var word baseValue, halfValue, factor
+  var word baseAngle, courseAngle
+  var byte quadrant
+
+    -- courseValue range is
+    --    0 .. sinCosCrossOver4, representing 0° - 180° (period = 0),
+    --    and sinCosCrossOver4 .. 0, representing 180° - 0° (period = 1).
+    -- periodValue defines whether the range is 0° - 180° or 180° - 360°.
+    -- For lookup of the angle, only an arcsine table of 0 .. 90° is needed.
+    -- The data must be converted to a 10-bit angle value for simple conversion.
+    -- Thus, the value range 0 ~ sinCosCrossOver2 is converted to 0 ~ 1023.
+
+    if (period == 0) then
+        if (value < sinCosCrossOver2) then
+            quadrant = 1
+            baseValue = value
+        else
+            quadrant = 2
+            baseValue = value - sinCosCrossOver2
+        end if
+    else -- (period == 1)
+        if (value < sinCosCrossOver2) then
+            quadrant = 4
+            baseValue = sinCosCrossOver2 - value
+        else
+            quadrant = 3
+            baseValue = sinCosCrossOver4 - Value
+        end if
+    end if
+
+    -- In each quadrant when the angle increases, the baseValue increases.
+    --    000° -> 090°  :: quadrant = 1   baseValue  0 -> sinCosCrossOver2
+    --    090° -> 180°  :: quadrant = 2   baseValue  0 -> sinCosCrossOver2
+    --    180° -> 270°  :: quadrant = 3   baseValue  0 -> sinCosCrossOver2
+    --    270° -> 360°  :: quadrant = 4   baseValue  0 -> sinCosCrossOver2
+    --
+    -- The sinCosCrossOver2 value must be converted to 1023.
+    -- Simple math would be angleValue = value * (1023 / sinCosCrossOver2).
+    -- However,
+    --  1. the PIC cannot do floating point calculations
+    --  2. sinCosCrossOver1 is not a fixed number (it is a parameter).
+    -- The implemented solution is applying a factor to the value which is an
+    -- easy calculation in integer math. The factor is 23 / 32.
+    -- For the standard sinCosCrossOver1 value (708), sinCosCrossOver2 = 1416.
+    --    Remark.
+    --       the ADC of the PIC has 10-bit accuracy, thus the maximum converted
+    --       value is 1023, which represents an input voltage of 5 Volt.
+    --       However, the produced analog voltage of the sine and cosine is set
+    --       to 4.9 Volt (adjustment procedure of the HSI #2 hardware).
+    --       Therefore, the maximum converted value is (4.9 / 5) * 1023 = 1002.
+    --       The "cross-over point" for choosing the sine or cosine signal is at
+    --       45°. The converted value would be (sqrt(2) / 2) * 1002 = 708.
+    -- (1416 * 23 ) / 32 = 1017 , so only a small error is introduced.
+    -- Note that this calculation will FAIL if sinCosCrossOver1 value > 712!
+    -- To prevent the overflow failure, the value of sinCosCrossOver1 is checked
+    -- and the factor is adjusted.
+    --     sinCosCrossOver1 > 800  --> value = 20
+    --     sinCosCrossOver1 < 800  --> value = 20.5
+    --     sinCosCrossOver1 < 781  --> value = 21
+    --     sinCosCrossOver1 < 763  --> value = 21.5
+    --     sinCosCrossOver1 < 745  --> value = 22
+    --     etc.
+    -- For better accuracy, "0.5" values are also implemented.
+    -- ### If sinCosCrossOver1 > 819 an overflow will occur ###
+    -- Implementation:
+    --  1. calculate factor = value * 20
+    --  2. if sinCosCrossOver1 value < specific value, the factor is adjusted.
+    --  3. divide result by 32.
+
+    halfValue = baseValue >> 1    -- may cause round-off error, but OK as in the
+                                  -- end the calculated factor is divided by 32.
+
+    factor = (baseValue << 4) + (baseValue << 2)                        -- *20.0
+
+    if (sinCosCrossOver1 < 800) then factor = factor + halfValue end if -- *20.5
+    if (sinCosCrossOver1 < 781) then factor = factor + halfValue end if -- *21.0
+    if (sinCosCrossOver1 < 763) then factor = factor + halfValue end if -- *21.5
+    if (sinCosCrossOver1 < 745) then factor = factor + halfValue end if -- *22.0
+    if (sinCosCrossOver1 < 729) then factor = factor + halfValue end if -- *22.5
+    if (sinCosCrossOver1 < 713) then factor = factor + halfValue end if -- *23.0
+    if (sinCosCrossOver1 < 698) then factor = factor + halfValue end if -- *23.5
+    if (sinCosCrossOver1 < 683) then factor = factor + halfValue end if -- *24.0
+    if (sinCosCrossOver1 < 669) then factor = factor + halfValue end if -- *24.5
+    if (sinCosCrossOver1 < 656) then factor = factor + halfValue end if -- *25.0
+    if (sinCosCrossOver1 < 643) then factor = factor + halfValue end if -- *25.5
+    if (sinCosCrossOver1 < 631) then factor = factor + halfValue end if -- *26.0
+    if (sinCosCrossOver1 < 619) then factor = factor + halfValue end if -- *26.5
+    if (sinCosCrossOver1 < 607) then factor = factor + halfValue end if -- *27.0
+
+    baseAngle = factor >> 5                                             -- /32
+
+    -- the retrieved angle value range is 0 .. 1023 which represents an angle
+    -- between 000° and 090°. Add retrieved value to quadrant base value
+
+    if (quadrant == 2) then
+        courseAngle = baseAngle + 1024          -- 090° .. 180° :: 1024 .. 2047
+    elsif (quadrant == 3) then
+        courseAngle = 2048 + baseAngle          -- 180° .. 270° :: 2048 .. 3071
+    elsif (quadrant == 4) then
+        courseAngle = 3072 + baseAngle          -- 270° .. 360° :: 3072 .. 4095
+    else -- quadrant == 1
+        courseAngle = baseAngle                 -- 000° .. 090° :: 0 .. 1023
+    end if
+
+    -- ##
+    if (debugCRSoutput == TRUE) then
+        sendDebugString(CNV_CROSSOVERS)
+        sendDebugWord(sinCosCrossOver1)
+        sendDebugChar("/")
+        sendDebugWord(sinCosCrossOver2)
+        sendDebugChar("/")
+        sendDebugWord(sinCosCrossOver4)
+        sendDebugString(CNVCRS_QUADRANT)
+        sendDebugByte(quadrant)
+        sendDebugString(CNVCRS_BASE_V)
+        sendDebugWord(baseValue)
+        sendDebugString(CNVCRS_FACTOR)
+        sendDebugWord(factor)
+        sendDebugString(CNVCRS_BASE_A)
+        sendDebugWord(baseAngle)
+        sendDebugString(CNVCRS_CRS_A)
+        sendDebugWord(courseAngle)
+        sendDebugChar(" ")
+    end if
+    -- ##
+
+    return courseAngle
+end function
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Output course data to the DAC
+--
+--   parameter in : courseValue  (0 .. 2895) representing 0-180° *or* 180-360°
+--                  coursePeriod (0 or 1)
+--   parameter out: -
+--
+-- ####################### DEBUG  OUTPUT  ######################### --
+-- one-liner for conversion debugging:
+-- ToDAC=xxxx base=xxxx factor=xxxx norm=xxxx
+
+;const byte TO_DAC_TXT[] = {" ","T","o","D","A","C","=","!"}
+;const byte TO_DAC_BASE[]   = {" ","b","a","s","e","=","!"}
+;const byte TO_DAC_FACTOR[] = {" ","f","a","c","t","o","r","=","!"}
+
+-- -----------------------------------------------------------------------------
+procedure outputCRStoDAC(WORD in courseValue, WORD in periodValue) is
+  var word crsValueToDAC, baseValue, factor
+
+    -- crsPriod = 0 :: crsValue range is 0 .. sinCosCrossOver4 (0 - 180°).
+    -- crsPriod = 1 :: crsValue range is sinCosCrossOver4 .. 0 (180° - 0).
+    -- crsPeriod defines whether the CRS setting is 0-180° or 180-360°.
+    -- The data range is simply doubled: 0 - (2 * sinCosCrossOver4).
+    -- see sendCRStoUSB()
+
+    if (periodValue == 0) then
+        baseValue = courseValue
+    else
+        baseValue = (sinCosCrossOver4 + sinCosCrossOver4) - courseValue
+    end if
+
+    -- the maximum value sinCosCrossOver1 * 8 must be scaled to maximum 1023
+    -- using simple arithmatic, while avoiding 16 bit overflow.
+    -- Depending on the value of sinCosCrossOver1, baseValue is multiplied
+    -- by a value and then divided by 64 to obtain a maximum value as close
+    -- as possible to 1023 (within reason, given possibilities).
+    -- The values are the following:
+    --     sinCosCrossOver1 < 819  --> value = 10
+    --     sinCosCrossOver1 < 781  --> value = 10.5
+    --     sinCosCrossOver1 < 745  --> value = 11
+    --     sinCosCrossOver1 < 713  --> value = 11.5
+    --     sinCosCrossOver1 < 683  --> value = 12
+    -- ### If sinCosCrossOver1 > 820 an overflow will occur ###
+
+    factor = (baseValue << 3) + baseValue + baseValue              -- *10
+    if (sinCosCrossOver1 < 781) then
+        factor = factor + (baseValue > 1)                          -- *10.5
+    end if
+    if (sinCosCrossOver1 < 745) then
+        factor = factor + (baseValue > 1)                          -- *11
+    end if
+    if (sinCosCrossOver1 < 713) then
+        factor = factor + (baseValue > 1)                          -- *11.5
+    end if
+    if (sinCosCrossOver1 < 683) then
+        factor = factor + (baseValue > 1)                          -- *12
+    end if
+    crsValueToDAC = factor >> 6                                    -- /64
+
+    -- ##
+;    if (debugCRSoutput == TRUE) then
+;        sendDebugString(TO_DAC_TXT)
+;        sendDebugWord(crsValueToDAC)
+;        sendDebugString(TO_DAC_BASE)
+;        sendDebugWord(baseValue)
+;        sendDebugString(TO_DAC_FACTOR)
+;        sendDebugWord(factor)
+;    end if
+    -- ##
+
+    storeNewValue(crsValueToDAC, CRS_VALUE_ID)
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Send course data to the USB port
+--
+--   parameter in : course value, course period, and send action
+--   parameter out: -
+--
+-- Optionally, the course *value* is converted to a course angle {0 .. 1023},
+-- representing 0° .. 360°.
+-- Optionally, the course value is sin/cos ADC value and period as msb added.
+-- Note. The data is not directly sent to the USB port, but to a routine that
+--       checks the "action". When the action is SEND_ON_TIMER, the data is
+--       stored in a data packet (that also contains the heading setting). Based
+--       on a timer the data packet is sent to the USB port. When the action is
+--       SEND_NOW, the data is stored in the same packet, but the data packet is
+--       sent immediately (bypassing the timer delay).
+-- -----------------------------------------------------------------------------
+
+-- ####################### DEBUG  OUTPUT  ######################### --
+-- one-liner for conversion debugging:
+-- ToUSB=xxxx
+
+const byte TO_USB_TXT[] = {" ","T","o","U","S","B","=","!"}
+
+procedure sendCRStoUSB(WORD in crsValue, WORD in crsPeriod, BYTE in action) is
+  var word crsValueToSend
+
+    if (crsConvertToDegree == TRUE) then
+        crsValueToSend = convertCourse(crsValue, crsPeriod)
+
+    elsif (crsOutputADCPeriod == TRUE) then
+        crsValueToSend = crsValue
+        if (crsPeriod == 1) then
+            crsValueToSend = crsValueToSend | 0x8000
+        end if
+
+    else
+        -- crsPriod = 0 :: crsValue range is 0 .. sinCosCrossOver4 (0 - 180°).
+        -- crsPriod = 1 :: crsValue range is sinCosCrossOver4 .. 0 (180° - 0).
+        -- crsPeriod defines whether the CRS setting is 0-180° or 180-360°.
+        -- The data range is simply doubled: 0 - (2 * sinCosCrossOver4).
+
+        if (crsPeriod == 0) then
+            crsValueToSend = crsValue
+        else
+            crsValueToSend = (sinCosCrossOver4 + sinCosCrossOver4) - crsValue
+        end if
+    end if
+
+    -- ##
+    if (debugCRSoutput == TRUE) then
+        sendDebugString(TO_USB_TXT)
+        sendDebugWord(crsValueToSend)
+        sendDebugChar(" ")
+    end if
+    -- ##
+
+    -- store data in USBpacket
+    --
+    -- in case of debugging active: do NOT send to avoid cluttering debug output
+    -- (remove when debug output no longer needed)
+    if (debugCRSoutput == FALSE) then
+        sendDataToUSB(crsValueToSend, CRS_VALUE_ID, action)
+    end if
+end procedure
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Process course setting
+--
+--   parameter in : -
+--   parameter out: -
+--   description  : last course data is retrieved from the queue. Note that
+--                  the retrieved values may be identical to the previous ones.
+--                  The data is optionally converted to an angle (degrees).
+--
+--                  The course value is stored in the DAC output packet. The
+--                  DAC output handler takes care of SPI data transmission.
+--
+--                  The course value is also sent to the USB output.
+--
+--                  If sin/cos alignment mode is active, the sin and cos value
+--                  are stored directly in the USB packet.
+--   called from main()
+-- -----------------------------------------------------------------------------
+--
+-- ####################### DEBUG  OUTPUT  ######################### --
+-- one-liner for conversion debugging:
+-- CRSout=xxxx/xxxx <followed by debug output from sendCRStoUSB()>
+
+const byte CRS_OUT_TXT[] = {0x0D, 0x0A,"C","R","S","o","u","t","=","!"}
+
+procedure processCRSsetting() is
+    -- retrieve CRS data set from queue
+    --     - value  {0 .. sinCosCrossOver4}  --> crsDataValue
+    --     - period { 0 or 1 }               --> crsDataPeriod
+    --
+    -- note: a course data tuple (course & period) is always available,
+    --       can be the same as previous tuple
+    --
+    getNewCRSsetting()   -- load (new) crsDataValue and crsDataPeriod
+
+    if (sinCosAlignActive == FALSE) then
+
+        -- ##
+        if (debugCRSoutput == TRUE) then
+            sendDebugString(CRS_OUT_TXT)
+            sendDebugWord(crsDataValue)
+            sendDebugChar("/")
+            sendDebugWord(crsDataPeriod)
+        end if
+        -- ##
+
+        -- output to DAC: only when data has changed
+        if ( (crsDataValue != prevCourseValue) |
+             (crsDataPeriod != prevCoursePeriod) ) then
+            outputCRStoDAC(crsDataValue, crsDataPeriod)
+        end if
+
+        -- output via USB
+
+        -- ##
+        if (debugCRSoutput == TRUE) then
+            sendCRStoUSB(crsDataValue, crsDataPeriod, SEND_NOW)
+            debugCRSoutput = FALSE
+        end if
+        -- ##
+
+        case (sendUSBmethod) of
+            SEND_USB_REQUEST : block
+                if (requestCourseData == TRUE) then
+                    requestCourseData = FALSE
+                    sendCRStoUSB(crsDataValue, crsDataPeriod, SEND_NOW)
+                end if
+            end block
+
+            SEND_USB_CHANGE : block
+                if ( (crsDataValue != prevCourseValue) |
+                     (crsDataPeriod != prevCoursePeriod) ) then
+                    sendCRStoUSB(crsDataValue, crsDataPeriod, SEND_ON_TIMER)
+                end if
+            end block
+
+            SEND_USB_ALWAYS : block
+                sendCRStoUSB(crsDataValue, crsDataPeriod, SEND_ON_TIMER)
+            end block
+
+            -- ignore everything else (SEND_USB_NEVER or bad value)
+            otherwise block
+                -- do nothing
+            end block
+        end case
+
+        prevCourseValue  = crsDataValue
+        prevCoursePeriod = crsDataPeriod
+
+    else  -- (sinCosAlignActive == TRUE)
+        -- crsDataValue is raw sine value
+        -- crsDataPeriod is raw cosine value
+        sendSinCosAlign(crsDataValue, crsDataPeriod)
+    end if
+end procedure
+

@@ -1,0 +1,623 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Author: Henk Gooijen, Copyright (c) 2019, all rights reserved
+--
+-- Compiler: 2.5r1
+--
+-- Description:
+--         HSI control module #2 is the firmware that controls indicators and
+--         the feedback of the CRS and the HDG setting knob.
+--         Indicators of the HSI controlled by this module:
+--         1. Navigation warning flag (red rectangle)
+--         2. TO / FROM indicators (white triangles)
+--         3. Course Deviation Indicator (CDI) with positive/negative deflection
+--
+--         The CRS and HDG set knob setting are determined by processing signals
+--         from the interface hardware. These signals are:
+--         1. CRS sine and CRS cosine (analog)
+--         2. HDG heading reference marker error signal
+--         3. 115V AC 400 Hz reference signal
+--         The CRS and HDG setting is available on the HSI #2 interface as:
+--            1. analog signal outputs (0 ... 4095 mV)
+--            2. a communication message as a response on a request message
+--         Note that the 2nd method is not available for DOA, only for USB.
+--
+-- Notes:
+--         - 02-05-2019: file creation.
+--         - 22-07-2019: changed value processing of HDG samples
+--         - 05-08-2019: major changes to the internal mechanisms of how the
+--                       CDI, HDG, and CRS data is processed to output to the
+--                       DACs, and USB messages (for HDG and CRS).
+--         - 03-09-2019: added CMD_SINCOS_ALIGN command
+--         - 11-09-2019: added Course synchro drive output control
+--         - 18-10-2019: added CMD_DEBUG_MASK command to manipulate DEBUG output
+--
+-- -----------------------------------------------------------------------------
+
+const byte MAJOR_VERSION = 0
+const byte MINOR_VERSION = 1
+
+include 18f4550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- *** defines for compiler version 2.4o
+--pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+--pragma target WDT           DISABLED    -- no watchdog
+--
+-- *** defines for compiler version 2.5r1
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+
+alias  HDGSIG       is pin_A0    -- HEADING signal
+alias  CRSSINSIG    is pin_A1    -- COURSE sine signal
+alias  CRSCOSSIG    is pin_A2    -- COURSE cosine signal
+alias  DOA_DATA     is pin_A3    -- PHCC DOA bus data signal
+alias  DIAGLED      is pin_A4    -- diagnostic on-board LED
+alias  USB_DOA      is pin_A5    -- USB/DOA communication port selection
+
+alias  SPI_SDI      is pin_B0    -- SPI data input (not used)
+alias  SPI_CLK      is pin_B1    -- SPI clock to DACs
+alias  DOA_CLOCK    is pin_B2    -- PHCC DOA bus clock signal
+alias  CRS_S1_POL   is pin_B3    -- CRS synchro drive stator S1 polarity
+alias  TO_FROM_1    is pin_B4    -- TO/FROM indication signal #1
+alias  NAV_WARN     is pin_B5    -- Navigation Warning flag
+alias  TO_FROM_2    is pin_B6    -- TO/FROM indication signal #2
+alias  USEROUTX     is pin_B7    -- user output X (L293D - 24V)
+
+alias  CS_CRSS3_S2  is pin_C0    -- DAC CS* CRSS3/CRSS2
+alias  CS_HDG_CRSS1 is pin_C1    -- DAC CS* HDG/CRSS1
+alias  VsenseIN     is pin_C2    -- USB host voltage sense
+--     USBvoltRef   is pin_C3    -- USB voltage reference
+--     USBdataN     is pin_C4    -- USB data -
+--     USBdataP     is pin_C5    -- USB data +
+alias  CRSQUADRNT   is pin_C6    -- CRS quadrant indicator
+alias  SPI_SDO      is pin_C7    -- SPI data output to DACs
+--
+alias  USEROUTA     is pin_D0    -- user output A (F4550 - 5V)
+alias  USEROUTB     is pin_D1    -- user output B (F4550 - 5V)
+alias  LD_CDI_CRS   is pin_D2    -- DAC LOAD* strobe CDI/CRS
+alias  PWR_PRESENT  is pin_D3    -- 115V AC power present
+alias  CRS_INPHASE  is pin_D4    -- CRS sine in phase with REF115
+alias  HDG_INPHASE  is pin_D5    -- HDG signal in phase with 115V reference
+alias  CRS_S3_POL   is pin_D6    -- CRS synchro drive stator S3 polarity
+alias  CRS_S2_POL   is pin_D7    -- CRS synchro drive stator S2 polarity
+
+alias  CS_CDI_CRS   is pin_E0    -- DAC CS* CDI/CRS
+alias  LD_HDG_CRSS1 is pin_E1    -- DAC LOAD* strobe CRS/HDG
+alias  LD_CRSS3_S2  is pin_E2    -- DAC LOAD* strobe CDI/CRS
+
+
+--  set the I/O direction
+
+pin_A0_direction = input
+pin_A1_direction = input
+pin_A2_direction = input
+pin_A3_direction = input
+pin_A4_direction = output
+pin_A5_direction = input
+
+pin_B0_direction = input
+pin_B1_direction = output
+pin_B2_direction = input
+pin_B3_direction = output
+pin_B4_direction = output
+pin_B5_direction = output
+pin_B6_direction = output
+pin_B7_direction = output
+
+pin_C0_direction = output
+pin_C1_direction = output
+pin_C2_direction = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction = input
+pin_C7_direction = output
+
+pin_D0_direction = output
+pin_D1_direction = output
+pin_D2_direction = output
+pin_D3_direction = input
+pin_D4_direction = input
+pin_D5_direction = input
+pin_D6_direction = output
+pin_D7_direction = output
+
+pin_E0_direction = output
+pin_E1_direction = output
+pin_E2_direction = output
+
+
+
+-- =============================================================================
+-- ** constants and variables: DOA and USB protocol receiver routines
+-- =============================================================================
+
+-- DOA and USB receiver
+const byte HSI_DEVICE_ADDR_2     = 0x49    -- HSI #2 ASCII-H (+1) PHCC ADDRESS
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var byte   commandCode             -- received command code (DOA / USB) sub
+var byte   commandData             -- received command data (DOA / USB) sub
+
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition, diagnostic LED and watchdog
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT         = 0     -- time slot for flashing DIAG LED
+const COMM_WATCHDOG_SLOT     = 1     -- DOA & USB communication watchdog timer
+const READ_ADC_SLOT          = 2
+const SEND_USB_INTERVAL_SLOT = 3
+const DELAY_SLOTS            = 4     -- number of needed time slots
+const timer0_isr_rate        = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON            = 0     -- LED connected to common +5, so:
+const byte LED_OFF           = 1     -- inverted logic: 0::on // 1::off
+
+-- diagnostic LED usage definitions
+const byte DIAGLED_OFF       = 0     -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1     -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2     -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3     -- DIAG LED ON/OFF per received message
+const byte DIAGLED_DOA_CHK   = 4     -- DIAG LED DOA protocol check error flag
+var   byte diagLEDuse                -- current usage mode for the DIAG LED
+
+-- variables for USB (dis)connection monitoring
+var byte   chkUSBconnect             -- USB uses a startup (connection made)
+var word   prevISRcounter            -- fast period connection check timer
+
+
+
+  -- setpoint commands
+const byte CMD_CDI_0        = 0      -- CDI indicator -511 .. -256
+const byte CMD_CDI_1        = 1      -- CDI indicator -255 .. 0
+const byte CMD_CDI_2        = 2      -- CDI indicator 1 .. 255
+const byte CMD_CDI_3        = 3      -- CDI indicator 256 .. 511
+const byte CMD_NAV_WARN     = 4      -- Navigation warning flag indicator
+const byte CMD_TO_FROM      = 5      -- TO / FROM indicators
+
+  -- HDG & CRS setting retrieval commands
+const byte CMD_HDG_REQ      = 6      -- request HEADING data
+const byte CMD_HDG_CONV     = 7      -- convert HDG data to degree value [Y/N]
+const byte CMD_HDG_NOISE    = 8      -- set heading signal noise threshold
+const byte CMD_CRS_REQ      = 9      -- request COURSE data
+const byte CMD_CRS_CONV     = 10     -- convert CRS data to degree value [0-1-2]
+const byte CMD_CRS_NOISE    = 11     -- set course signal noise threshold
+const byte CMD_SINCOS_CROSS = 12
+const byte CMD_SEND_USB     = 13     -- send data via USB method option
+const byte CMD_SEND_DELAY   = 14     -- set interval between USB transmissions
+const byte CMD_SINCOS_ALIGN = 15     -- en/disable SIN/COS alignment output mode
+
+  -- course drive synchro control
+const byte CMD_CRS_Q1       = 16     -- set COURSE drive in Q1 (000..255)
+const byte CMD_CRS_Q2       = 17     -- set COURSE drive in Q2 (256..511)
+const byte CMD_CRS_Q3       = 18     -- set COURSE drive in Q3 (512..767)
+const byte CMD_CRS_Q4       = 19     -- set COURSE drive in Q4 (768..1023)
+
+  -- course drive synchro stator offsets
+const byte CMD_CRS_OFFS_L   = 20     -- load offset value (lo 8 bits)  (1st cmd)
+const byte CMD_CRS_OFFS_H   = 21     -- load offset value (hi 2 bits)  (2nd cmd)
+const byte CMD_LOAD_CRS     = 22     -- load COURSE offset value mask  (3rd cmd)
+
+   -- spare 5V and 24V outputs
+const byte CMD_OUT_A2       = 23     -- set spare output A (of HSI #2)
+const byte CMD_OUT_B2       = 24     -- set spare output B (of HSI #2)
+const byte CMD_OUT_X24      = 25     -- set spare output X (via L293D - 24V)
+
+   -- commands for course drive synchro amplitude output adjustment
+const byte CMD_CRS_S1       = 26     -- set output value COURSE S1
+const byte CMD_CRS_S2       = 27     -- set output value COURSE S2
+const byte CMD_CRS_S3       = 28     -- set output value COURSE S3
+const byte CMD_CRS_POL      = 29     -- activate COURSE S1, S2, S3, and polarity
+
+  -- system control commands
+const byte CMD_WTCHDOG_DIS  = 30     -- disabled watchdog
+const byte CMD_WTCHDOG_ENA  = 31     -- enable watchdog
+const byte CMD_DIAGMODE     = 32     -- set diagnostic LED operating mode
+
+const byte CMD_LASTVAL      = 32     -- last valid command for DOA
+   -- USB only commands
+const byte CMD_IDENTIFY     = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG    = (CMD_LASTVAL+2)   -- USB only: enable debug output
+const byte CMD_DEBUG_MASK   = (CMD_LASTVAL+3)   -- USB only: debug output mask
+
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+const byte USE_USB         = 1             -- no jumper installed
+const byte USE_DOA         = 0             -- jumper installed
+var   byte commPort                        -- selected port at startup
+
+-- watchdog
+var   byte wtchdogState               -- watchdog ENABLED/DISABLED flag
+const byte WTCHDOG_ENABLED    = 1
+const byte WTCHDOG_DISABLED   = 0
+var   word wtchdogDelayValue          -- set watchdog timeout value
+
+-- debugging features
+var   byte debugMask                  -- mask bits for debugging features
+                                      -- default: all bits cleared
+                                      --   bit meaning   CLEAR    SET
+const byte PRINT_DECIMAL   = 0x01     --  print numbers  binary   decimal
+const byte PACKET_DECIMAL  = 0x02     --  HDG/CRS packet binary   decimal
+const byte REQUEST_HDG     = 0x04     -- request 1x HDG debug output data
+const byte REQUEST_CRS     = 0x08     -- request 1x CRS debug output data
+
+
+-- HSI #2 control inputs active level definitions
+const byte PWR_115VAC_ON   = 1        -- 115V AC 400 Hz present on HSI
+const byte PWR_115VAC_OFF  = 0
+const byte HDG_PHASE_000   = 1        -- HDG_INPHASE input signal
+const byte HDG_PHASE_180   = 0
+const byte CRS_PHASE_000   = 1        -- CRS_INPHASE input signal
+const byte CRS_PHASE_180   = 0
+const byte CRS_1ST_QUAD    = 1        -- CRSQUADRNT
+const byte CRS_2ND_QUAD    = 0
+
+-- setpoints / settings
+   -- cyclic buffers used to store new setpoint / settings
+const byte MAX_NO_SETPOINTS = 20
+const word NO_NEW_SETPOINT  = 31313  -- impossible value : no setpoint available
+
+   -- CDI
+var   word CDIbuffer[MAX_NO_SETPOINTS+1]
+var   byte CDIheadIndex
+var   byte CDItailIndex
+var   word CDInewPos                  -- new CDI setpoint value
+var   byte CDIupdate                  -- CDI value update request
+
+   -- CRS (setting and drive)
+var   word CRSbuffer[MAX_NO_SETPOINTS+2]  -- note: value and period are stored
+var   byte CRSheadIndex
+var   byte CRStailIndex
+var   word crsDriveBuffer[MAX_NO_SETPOINTS+1]
+var   byte crsDriveHeadIndex
+var   byte crsDriveTailIndex
+var   word crsDriveNewPos            -- COURSE drive new setpoint position
+var   byte crsDriveUpdate            -- COURSE drive position update request
+
+   -- HDG
+var   sword HDGbuffer[MAX_NO_SETPOINTS+1] -- note: signed values!
+var   byte  HDGheadIndex
+var   byte  HDGtailIndex
+
+   -- analog data
+var   word  prevAvgCRSsine           -- previous averaged CRS sine value
+var   word  prevAvgCRScosine         --                   CRS cosine value
+var   word  curAvgCRSsine            -- current  averaged CRS sine value
+var   word  curAvgCRScosine          --                   CRS cosine value
+
+var   byte  hdgConvertToDegree       -- flag: convert HDG value to degrees
+var   sword hdgNoiseThreshold        -- heading signal hysteresis threshold
+var   byte  crsConvertToDegree       -- flag: convert CRS value to degrees
+var   byte  crsOutputADCPeriod       -- flag: output ADC sin/cos & period
+var   sword crsNoiseThreshold        -- course signal hysteresis threshold
+
+const word  SINCOS_CROSSOVER_DFLT = 708 -- ADC value for sine & cosine 45° point
+var   word  sinCosCrossOver1            -- decision to use sin or cos lookup
+var   word  sinCosCrossOver2            -- ::: (0.5*sqrt(2) * 10-bit resolution
+var   word  sinCosCrossOver4
+
+var   byte  sinCosAlignActive           -- alignment mode activated/de-activated
+
+-- default COURSE drive synchro stator offset values
+const word CRS_DRIVE_DFLT_S1 = 156   -- 0 degrees
+const word CRS_DRIVE_DFLT_S2 = 497   -- 120 degrees
+const word CRS_DRIVE_DFLT_S3 = 838   -- 240 degrees
+
+   -- CRS drive synchro
+var   word  crsDriveS1Offset         -- CRS drive synchro stator offset values
+var   word  crsDriveS2Offset
+var   word  crsDriveS3Offset
+var   word  crsDriveAmplitudeS1      -- CRS drive synchro amplitude & polarity
+var   word  crsDriveAmplitudeS2
+var   word  crsDriveAmplitudeS3
+var   byte  crsDrivePolarityS1
+var   byte  crsDrivePolarityS2
+var   byte  crsDrivePolarityS3
+
+
+-- SPI data transmission to DACs
+var   byte setpointsToDACsActive     -- indicates SPI transmission in progress
+
+var   byte requestHeadingData        -- request HDG data via USB
+var   byte requestCourseData         -- request CRS data via USB
+var   byte sendUSBmethod             -- method for HDG/CRS data via USB
+const byte SEND_USB_NEVER    = 0     --    send never
+const byte SEND_USB_REQUEST  = 1     --    on request (via USB)
+const byte SEND_USB_ALWAYS   = 2     --    on time interval, always
+const byte SEND_USB_CHANGE   = 3     --    on time interval, only if changed
+var   byte prevSendUSBmethod         -- save (for return from ALIGN mode)
+var   word sendUSBtimeDelay          -- send USB message time interval delay
+const word USB_DELAY_DEFAULT = 200   -- default delay is 200 ms
+
+const  byte SEND_NOW         = 0     -- send (heading) data indicator
+const  byte SEND_ON_TIMER    = 1
+
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+-- include spi_master_hw       -- SPI master hardware library
+include hsi2-doa               -- PHCC DOA receiver routine
+include hsi-usb                -- USB handler
+include hsi-led                -- DIAG LED routines
+include hsi-watchdog           -- communication watchdog
+include hsi2-queues            -- CDI/CRS/HDG setpoint queues
+include hsi2-debug             -- debug output (HP5082-7340 displays)
+include hsi2-dacs              -- DAC output
+include hsi2-send2usb          -- send CRS/HDG setting via USB port
+include hsi2-heading           -- heading output (DAC and USB)
+include hsi2-course            -- course  output (DAC and USB)
+include hsi2-crsdrive          -- course drive synchro
+include hsi2-crsdev            -- course deviation
+include hsi2-cmds              -- process received commands
+
+
+
+-- =============================================================================
+-- ############  START OF INDICATORS, CRS and HDG (HSI #2) CONTROL  ############
+-- =============================================================================
+
+
+BSR               = 0                    -- set bank select register to default
+INTCON_GIE        = FALSE                -- disable all interrupts
+enable_digital_io()                      -- will turn ADC on later (by adc lib)
+INTCON            = 0                    -- all interrupts disabled
+
+initSPIhardware()                        -- SPI hardware control lines
+initDOA()                                -- init variables DOA communication
+initUSB()                                -- init variables USB communication
+debugMask = 0                            -- all debug "features": default state
+initDiagLED()                            -- diagnostic LED initialization
+set_delay(HEARTBEAT_SLOT, flashRate)     -- start heartbeat blinking
+
+-- configure ADC
+const byte ADC_NCHANNEL = 3              -- 3 analog channels needed
+const byte ADC_NVREF = ADC_NO_EXT_VREF   -- no external voltage reference
+const ADC_MIN_TAD = 8                    -- fastest possible ADC timing (0.8 us)
+
+include adc
+adc_init()                               -- initialize the ADCs
+include hsi2-adc                         -- read ADC CRS/HDG channels
+
+-- initial output settings
+NAV_WARN     = 0
+TO_FROM_1    = 0
+TO_FROM_2    = 0
+
+
+-- initialize variables
+prevAvgCRSsine      = 0xFFFF             -- impossible value: force initial upd
+prevAvgCRScosine    = 0xFFFF
+curAvgCRSsine       = 0                  -- initial averaged value
+curAvgCRScosine     = 0
+
+crsDriveAmplitudeS1 = 0                  -- CRS drive synchro
+crsDriveAmplitudeS2 = 0
+crsDriveAmplitudeS3 = 0
+crsDrivePolarityS1  = 0
+crsDrivePolarityS2  = 0
+crsDrivePolarityS3  = 0
+crsDriveS1Offset    = CRS_DRIVE_DFLT_S1  --     offset values
+crsDriveS2Offset    = CRS_DRIVE_DFLT_S2
+crsDriveS3Offset    = CRS_DRIVE_DFLT_S3
+crsDriveNewPos      = 0                  --     initial setpoint position
+
+hdgConvertToDegree  = FALSE              -- convert HDG value to degrees
+hdgNoiseThreshold   = 1                  -- heading signal hysteresis threshold
+crsConvertToDegree  = FALSE              -- convert CRS value to degrees
+crsOutputADCPeriod  = FALSE              -- output sin/cos ADC and period
+crsNoiseThreshold   = 1                  -- course signal hysteresis threshold
+requestHeadingData  = FALSE
+requestCourseData   = FALSE
+sendUSBmethod       = SEND_USB_NEVER     -- turn on or request required
+prevSendUSBmethod   = SEND_USB_NEVER     -- return from ALIGN mode
+sendUSBtimeDelay    = USB_DELAY_DEFAULT  -- default USB message interval delay
+
+sinCosCrossOver1    = SINCOS_CROSSOVER_DFLT   -- decision to use sin/cos lookup
+sinCosCrossOver2    = sinCosCrossOver1 << 1
+sinCosCrossOver4    = sinCosCrossOver1 << 2
+
+sinCosAlignActive   = FALSE              -- default sin/cos alignment disabled
+
+initQueueAdministration()                -- cyclic buffers adminstration
+initAnalogSampler()                      -- analog ADC value averaging
+initSPIcontrol()                         -- initialize DAC load state machine
+initHDGsettingOutput()                   -- set initial "previous HDG value"
+initCRSsettingOutput()                   -- set initial "previous CRS value"
+initUSBcontrol()                         -- init USB data transmission
+
+;initDebugDisplay()                      -- init HP debug displays
+
+-- set environment
+prevISRcounter    = 0
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF     = 0           ; clear SPI interrupt flag
+-- PIE1_SSPIE     = 1           ; enable SPI interrupt
+INTCON2_INTEDG2   = 1           ; external INT2 (DOA) interrupt on rising edge
+INTCON3_INT2IF    = 0           ; clear INT2 (DOA) interrupt flag
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+-- if (USB_DOA == USE_USB) then         FORCE USING USB !!!
+    commPort       = USE_USB
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = STARTUP_FLASHRATE
+    chkUSBconnect  = TRUE
+    wtchdogState   = WTCHDOG_DISABLED   -- USB DEFAULT watchdog state: disabled
+    INTCON3_INT2IE = 0                  -- disable INT2 (DOA) external interrupt
+--else
+--    commPort       = USE_DOA
+--    diagLEDuse     = DIAGLED_HEARTBEAT
+--    flashRate      = DOA_RESET_RATE     -- indicate initial 1 sec delay
+--    chkUSBconnect  = FALSE
+--    wtchdogState   = WTCHDOG_ENABLED    -- DOA DEFAULT watchdog state: enabled
+--    INTCON3_INT2IE = 1                  -- enable INT2 DOA external interrupt
+--end if
+
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT    -- initialize watchdog
+commRestartWatchdog()                       -- start comm protocol watchdog
+set_delay(READ_ADC_SLOT, 10)                -- read one ADC channel every 10 ms
+preloadDACregisters()                       -- load DAC registers (and output)
+setCrsDrive(0)                              -- load course DRIVE synchro coils
+
+forever loop
+  -- for PHCC, the DOA communication can start immediately
+  -- for USB, there is first a check that the USB connection is made
+
+  if (chkUSBconnect == TRUE) then
+     -- periodically check for USB connection active
+     diagLEDheartBeat()                                 -- update DIAG LED state
+     if (isr_counter != prevISRcounter) then
+        -- one (or more) timer tick elapsed
+        prevISRcounter = isr_counter
+        if (VsenseIN) then                               -- check_comm_active()
+           chkUSBconnect = FALSE
+           -- USB connection established: setup USB serial library
+           usb_serial_init()
+           flashRate = USB_FLASH_RATE
+        end if
+     end if
+  else
+     -- main loop: startup phase for USB done __OR__ PHCC DOA selected
+     if (commPort == USE_USB) then
+        -- USB communication: keep checking whether USB is still connected!
+        if (VsenseIN) then
+           handleUSBcommunication()
+           if (USBcmdReceived == TRUE) then
+              USBcmdReceived = FALSE
+              commandCode = USBrxByte1
+              commandData = USBrxByte2
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        else
+           -- USB connection lost -> restart USB connection setup loop
+           chkUSBconnect  = TRUE
+           flashRate      = STARTUP_FLASHRATE
+           diagLEDuse     = DIAGLED_HEARTBEAT  -- make sure the DIAG LED flashes
+           prevISRcounter = 0
+        end if
+     else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+     end if
+
+     -- execute continuously running actions (if required).
+
+     diagLEDheartBeat()         -- update DIAG LED state if in "heart beat" mode
+     commCheckWatchdog()        -- check communication protocol watchdog
+     readADCchannels()          -- read ADCs and process/store data in queue
+     accNewCDIsetpoint()        -- store new CDI setpoint (if received)
+     accNewCrsDriveSetpoint()   -- store new CRS drive setpoint (if received)
+
+     processCDIsetpoint()       -- process COURSE DEVIATION setpoint
+     updCrsDrivePosition()      -- process COURSE drive setpoint
+     processCRSsetting()        -- process COURSE setting
+     processHDGsetting()        -- process HEADING setting
+     loadSPIvalue()             -- load new setpoint for DAC output
+     processSPIloading()        -- send data to DACs (if active)
+     dataToUSB()                -- send data to USB port (if conditions met)
+
+  end if
+end loop
+
+
+-- =============================================================================
+-- Interrupt routine for the DOA serial communication and SPI processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( INTCON3_INT2IF ) then
+      processDOAinterrupt()
+  end if
+
+  -- if ( PIR1_SSPIF ) then
+  --     processSPIinterrupt()
+  -- end if
+end procedure
+

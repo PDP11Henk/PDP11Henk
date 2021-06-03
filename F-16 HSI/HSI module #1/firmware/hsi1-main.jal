@@ -1,0 +1,690 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #1
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Author: Henk Gooijen, Copyright (c) 2016, all rights reserved
+--
+-- Compiler: 2.5r1
+--
+-- Description:
+--         HSI control module #1 is the firmware to control 12 synchro coils.
+--         In principle, every output can be set to a specific amplitude, but
+--         the firmware controls 2 groups of 3 coils (for HEADING synchro and
+--         for BEARING synchro), and 3 groups of 2 coils for the MILES indicator
+--         units, tens and hundreds drum counters. This controls the following
+--         functionality of the HSI:
+--         1. Heading indicator (compass, outer "ring").
+--         2. Bearing indicator (small triangle along outer "ring").
+--         3. Range indicator ("Miles", 3 numeric drum indicators).
+--         Further, the HSI #1 module has a relay output to control the RANGE
+--         "invalid" bar which is in front of the RANGE numeric drum indicators.
+--
+--         2 digital outputs are freely available for any on/off functionality.
+--         The firmware uses a jumper-selectable USB or PHCC-DOA interface.
+--         The communication is one-way only: from PC to HSI #1.
+--
+-- Notes:
+--         - 14-07-2016: file creation.
+--         - 02-01-2017: stator amplitude is now using DACs instead of PWM.
+--         - 27-02-2019: serious start of the design, incl. PCB manufacturing
+--         - 04-04-2019: 1st version of the code finished, waiting for PCB!
+--         - 26-04-2019: Added range indication setpoint as a value (000..999)
+--         - 14-06-2019: Removed range indication setpoint as a value, because
+--                       the digit synchros are far from linear (S2 grounded).
+--                       For the same reason is jump-scroll / smooth-scroll also
+--                       removed.
+--                       For more accurate control, changed the RANGE synchro
+--                       interface from 8 bit to 10 bit (offsets remain 8 bit).
+--         - 19-06-2019: Changed the method how to load offset values. Also made
+--                       the RANGE offset values 10 bit.
+--
+-- -----------------------------------------------------------------------------
+
+const byte MAJOR_VERSION = 1
+const byte MINOR_VERSION = 1
+
+include 18f4550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- *** defines for compiler version 2.4o
+--pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+--pragma target WDT           DISABLED    -- no watchdog
+--
+-- *** defines for compiler version 2.5r1
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+
+-- HEADING control: HDG_POL_X, HDG_POL_Y, HDG_POL_Z, HDG_DAC_YZ,
+-- BEARING control: BRG_POL_X, BRG_POL_Y, BRG_POL_Z, BRG_DAC_XZ,
+--                  shared DAC for HEADING X and BEARING Y: HX_BY_DAC
+-- MILES units    : ML1_POL_X, ML1_POL_Y, ML1_DAC_XY
+-- MILES tens     : ML2_POL_X, ML2_POL_Y, ML2_DAC_YX
+-- MILES hundreds : ML3_POL_X, ML3_POL_Y, ML3_DAC_YX
+
+alias  USB_DOA      is pin_A0    -- USB/DOA communication port selection
+alias  MLSSHUTTER   is pin_A1    -- MILES shutter indicator
+alias  DOA_DATA     is pin_A2    -- PHCC DOA bus data signal
+alias  BRG_DAC_ZX   is pin_A3    -- DAC CS* BEARING stator coils Z and X
+alias  DIAGLED      is pin_A4    -- diagnostic on-board LED
+alias  ML3_DAC_YX   is pin_A5    -- DAC CS* MILES 100s stator coils Y and X
+
+alias  SPI_SDI      is pin_B0    -- SPI data input (not used)
+alias  SPI_CLK      is pin_B1    -- SPI clock to DACs
+alias  DOA_CLOCK    is pin_B2    -- PHCC DOA bus clock signal
+alias  BRG_POL_X    is pin_B3    -- BEARING stator X polarity
+alias  BRG_POL_Y    is pin_B4    -- BEARING stator Y polarity
+alias  ML3_POL_Y    is pin_B5    -- MILES hundreds Y polarity
+alias  ML2_POL_Y    is pin_B6    -- MILES tens Y polarity
+alias  ML1_POL_X    is pin_B7    -- MILES units X polarity
+
+alias  ML2_DAC_YX   is pin_C0    -- DAC CS* MILES 10s stator coils Y and X
+alias  LOADDACS     is pin_C1    -- DAC LOAD* strobe
+alias  VsenseIN     is pin_C2    -- USB host voltage sense
+--     USBvoltRef   is pin_C3    -- USB voltage reference
+--     USBdataN     is pin_C4    -- USB data -
+--     USBdataP     is pin_C5    -- USB data +
+alias  HDG_POL_Y    is pin_C6    -- HEADING stator Y polarity
+alias  SPI_SDO      is pin_C7    -- SPI data output to DACs
+
+alias  USEROUTA     is pin_D0    -- user-defined digital output A
+alias  USEROUTB     is pin_D1    -- user-defined digital output B
+alias  HDG_POL_X    is pin_D2    -- HEADING stator X polarity
+alias  HDG_POL_Z    is pin_D3    -- HEADING stator Z polarity
+alias  ML3_POL_X    is pin_D4    -- MILES hundreds X polarity
+alias  ML1_POL_Y    is pin_D5    -- MILES units Y polarity
+alias  ML2_POL_X    is pin_D6    -- MILES tens X polarity
+alias  BRG_POL_Z    is pin_D7    -- BEARING stator Z polarity
+
+alias  HDG_DAC_ZY   is pin_E0    -- DAC CS* HEADING stator coils Z and Y
+alias  BY_HX_DAC    is pin_E1    -- DAC CS* BEARING Y and HEADING X stator coil
+alias  ML1_DAC_XY   is pin_E2    -- DAC CS* MILES units stator coils X and Y
+
+--  set the I/O direction
+
+pin_A0_direction = input
+pin_A1_direction = output
+pin_A2_direction = input
+pin_A3_direction = output
+pin_A4_direction = output
+pin_A5_direction = output
+
+pin_B0_direction = input
+pin_B1_direction = output
+pin_B2_direction = input
+pin_B3_direction = output
+pin_B4_direction = output
+pin_B5_direction = output
+pin_B6_direction = output
+pin_B7_direction = output
+
+pin_C0_direction = output
+pin_C1_direction = output
+pin_C2_direction = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction = output
+pin_C7_direction = output
+
+pin_D0_direction = output
+pin_D1_direction = output
+pin_D2_direction = output
+pin_D3_direction = output
+pin_D4_direction = output
+pin_D5_direction = output
+pin_D6_direction = output
+pin_D7_direction = output
+
+pin_E0_direction = output
+pin_E1_direction = output
+pin_E2_direction = output
+
+
+
+-- =============================================================================
+-- ** constants and variables: DOA and USB protocol receiver routines
+-- =============================================================================
+
+-- DOA and USB receiver
+const byte HSI_DEVICE_ADDR_1     = 0x48    -- HSI #1 ASCII-H PHCC ADDRESS
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var byte   commandCode             -- received command code (DOA / USB) sub
+var byte   commandData             -- received command data (DOA / USB) sub
+
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition, diagnostic LED and watchdog
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const COMM_WATCHDOG_SLOT   = 1     -- DOA & USB communication watchdog timer
+const DELAY_SLOTS          = 2     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON          = 0     -- LED connected to common +5, so:
+const byte LED_OFF         = 1     -- inverted logic: 0::on // 1::off
+
+-- diagnostic LED usage definitions
+const byte DIAGLED_OFF       = 0   -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1   -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2   -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3   -- DIAG LED ON/OFF per received message
+const byte DIAGLED_DOA_CHK   = 4   -- DIAG LED DOA protocol check error flag
+var   byte diagLEDuse              -- current usage mode for the DIAG LED
+
+-- variables for USB (dis)connection monitoring
+var byte   chkUSBconnect           -- USB uses a startup (connection made)
+var word   prevISRcounter          -- fast period connection check timer
+
+
+
+  -- setpoint commands
+const byte CMD_BRG_Q1      = 0     -- set BEARING indicator in Q1 (000..255)
+const byte CMD_BRG_Q2      = 1     -- set BEARING indicator in Q2 (256..511)
+const byte CMD_BRG_Q3      = 2     -- set BEARING indicator in Q3 (512..767)
+const byte CMD_BRG_Q4      = 3     -- set BEARING indicator in Q4 (768..1023)
+
+const byte CMD_HDG_Q1      = 4     -- set HEADING indicator in Q1 (000..255)
+const byte CMD_HDG_Q2      = 5     -- set HEADING indicator in Q2 (256..511)
+const byte CMD_HDG_Q3      = 6     -- set HEADING indicator in Q3 (512..767)
+const byte CMD_HDG_Q4      = 7     -- set HEADING indicator in Q4 (768..1023)
+
+const byte CMD_MLS_1Q1     = 8     -- set MILES units indicator (000..255)
+const byte CMD_MLS_1Q2     = 9     -- set MILES units indicator (256..511)
+const byte CMD_MLS_1Q3     = 10    -- set MILES units indicator (512..767)
+const byte CMD_MLS_1Q4     = 11    -- set MILES units indicator (768..1023)
+
+const byte CMD_MLS_2Q1     = 12    -- set MILES tens indicator (000..255)
+const byte CMD_MLS_2Q2     = 13    -- set MILES tens indicator (256..511)
+const byte CMD_MLS_2Q3     = 14    -- set MILES tens indicator (512..767)
+const byte CMD_MLS_2Q4     = 15    -- set MILES tens indicator (768..1023)
+
+const byte CMD_MLS_3Q1     = 16    -- set MILES hundreds indicator (000..255)
+const byte CMD_MLS_3Q2     = 17    -- set MILES hundreds indicator (256..511)
+const byte CMD_MLS_3Q3     = 18    -- set MILES hundreds indicator (512..767)
+const byte CMD_MLS_3Q4     = 19    -- set MILES hundreds indicator (768..1023)
+
+const byte CMD_MILSHUTR    = 20    -- (de)activate MILES indicator shutter flag
+
+  -- user-defined outputs
+const byte CMD_USROUT_A    = 21    -- set user-defined output A
+const byte CMD_USROUT_B    = 22    -- set user-defined output B
+
+  -- stator offsets
+const byte CMD_LD_OFFS_L   = 23    -- load offset value (lo 8 bits)  (1st cmd)
+const byte CMD_LD_OFFS_H   = 24    -- load offset value (hi 2 bits)  (2nd cmd)
+const byte CMD_LOAD_BRG    = 25    -- load BEARING offset value mask (3rd cmd)
+const byte CMD_LOAD_HDG    = 26    -- load HEADING offset value mask (3rd cmd)
+const byte CMD_LOAD_RNG    = 27    -- load RANGE   offset value mask (3rd cmd)
+
+   -- commands for amplitude output adjustment or manual fine setpoint setting
+const byte CMD_BRG_S1      = 28    -- set output value BEARING S1
+const byte CMD_BRG_S2      = 29    -- set output value BEARING S2
+const byte CMD_BRG_S3      = 30    -- set output value BEARING S3
+const byte CMD_BRG_POL     = 31    -- activate BEARING S1, S2, S3 polarity
+
+const byte CMD_HDG_S1      = 32    -- set output value HEADING S1
+const byte CMD_HDG_S2      = 33    -- set output value HEADING S2
+const byte CMD_HDG_S3      = 34    -- set output value HEADING S3
+const byte CMD_HDG_POL     = 35    -- activate HEADING S1, S2, S3 polarity
+
+const byte CMD_MLS_1X      = 36    -- set output value MILES UNITS X
+const byte CMD_MLS_1Y      = 37    -- set output value MILES UNITS Y
+const byte CMD_M1_POL      = 38    -- activate MILES UNITS X, Y polarity
+
+const byte CMD_MLS_2X      = 39    -- set output value MILES TENS X
+const byte CMD_MLS_2Y      = 40    -- set output value MILES TENS Y
+const byte CMD_M2_POL      = 41    -- activate MILES TENS X, Y polarity
+
+const byte CMD_MLS_3X      = 42    -- set output value MILES HUNDREDS X
+const byte CMD_MLS_3Y      = 43    -- set output value MILES HUNDREDS Y
+const byte CMD_M3_POL      = 44    -- set MILES HUNDREDS X, Y polarity
+
+const byte CMD_MLS_LOWPWR  = 45    -- RANGE indicators bar visible -> low-power
+
+  -- system control commands
+const byte CMD_WTCHDOG_DIS = 46    -- disabled watchdog
+const byte CMD_WTCHDOG_ENA = 47    -- enable watchdog
+const byte CMD_DIAGMODE    = 48    -- set diagnostic LED operating mode
+
+const byte CMD_LASTVAL     = 48    -- last valid command for DOA
+   -- USB only commands
+const byte CMD_IDENTIFY    = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG   = (CMD_LASTVAL+2)   -- USB only: enable debug output
+
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+const byte USE_USB         = 1             -- no jumper installed
+const byte USE_DOA         = 0             -- jumper installed
+var   byte commPort                        -- selected port at startup
+
+-- watchdog
+var   byte wtchdogState               -- watchdog ENABLED/DISABLED flag
+const byte WTCHDOG_ENABLED    = 1
+const byte WTCHDOG_DISABLED   = 0
+var   word wtchdogDelayValue          -- set watchdog timeout value
+
+-- debugging features
+var   byte debugMask                  -- mask bits for debugging features
+                                      -- default: all bits cleared
+                                      --   bit meaning   CLEAR    SET
+const byte PRINT_DECIMAL   = 0x01     --  print numbers  binary   decimal
+const byte PACKET_DECIMAL  = 0x02     --  HDG/CRS packet binary   decimal
+const byte REQUEST_HDG     = 0x04     -- request 1x HDG debug output data
+const byte REQUEST_CRS     = 0x08     -- request 1x CRS debug output data
+
+
+-- HSI #1 control
+                                  -- BEARING synchro stator
+var byte   bearingPolarityS1         -- polarity & amplitude
+var byte   bearingPolarityS2
+var byte   bearingPolarityS3
+var word   bearingAmplitudeS1
+var word   bearingAmplitudeS2
+var word   bearingAmplitudeS3
+var word   brgS1Offset               -- offset values
+var word   brgS2Offset
+var word   brgS3Offset
+                                  -- HEADING synchro stator
+var byte   headingPolarityS1         -- polarity & amplitude
+var byte   headingPolarityS2
+var byte   headingPolarityS3
+var word   headingAmplitudeS1
+var word   headingAmplitudeS2
+var word   headingAmplitudeS3
+var word   hdgS1Offset               -- offset values
+var word   hdgS2Offset
+var word   hdgS3Offset
+                                  -- MILES synchro stator drumcounter
+var byte   miles1PolarityX           -- unit polarity and amplitude
+var byte   miles1PolarityY
+var word   miles1AmplitudeX
+var word   miles1AmplitudeY
+var word   miles1OffsetX             -- unit offset values for "zero"
+var word   miles1OffsetY
+var byte   miles2PolarityX           -- tens polarity and amplitude
+var byte   miles2PolarityY
+var word   miles2AmplitudeX
+var word   miles2AmplitudeY
+var word   miles2OffsetX             -- tens offset values for "zero"
+var word   miles2OffsetY
+var byte   miles3PolarityX           -- hundreds polarity and amplitude
+var byte   miles3PolarityY
+var word   miles3AmplitudeX
+var word   miles3AmplitudeY
+var word   miles3OffsetX             -- hundreds offset values for "zero"
+var word   miles3OffsetY
+var byte   milesLowPowerEnabled      -- coils at low power when bar is visible
+
+-- setpoints
+   -- cyclic buffers used to store new setpoints
+const byte MAX_NO_SETPOINTS = 20
+const word NO_NEW_SETPOINT  = 31313  -- impossible value : no setpoint available
+
+   -- BEARING
+var word   bearingBuffer[MAX_NO_SETPOINTS+1]
+var byte   bearingHeadIndex
+var byte   bearingTailIndex
+var word   bearingNewPos             -- BEARING new setpoint position
+var byte   bearingUpdate             -- BEARING position update request
+
+   -- HEADING
+var word   headingBuffer[MAX_NO_SETPOINTS+1]
+var byte   headingHeadIndex
+var byte   headingTailIndex
+var word   headingNewPos             -- HEADING new setpoint position
+var byte   headingUpdate             -- HEADING position update request
+
+   -- MILES UNIT drumcounter
+var word   miles1Buffer[MAX_NO_SETPOINTS+1]
+var byte   miles1HeadIndex
+var byte   miles1TailIndex
+var word   miles1NewPos              -- MILES UNIT new setpoint value
+var byte   miles1Update              -- MILES UNIT value update request
+
+   -- MILES TENS drumcounter
+var word   miles2Buffer[MAX_NO_SETPOINTS+1]
+var byte   miles2HeadIndex
+var byte   miles2TailIndex
+var word   miles2NewPos              -- MILES TEN new setpoint value
+var byte   miles2Update              -- MILES TEN value update request
+
+   -- MILES HUNDREDS drumcounter
+var word   miles3Buffer[MAX_NO_SETPOINTS+1]
+var byte   miles3HeadIndex
+var byte   miles3TailIndex
+var word   miles3NewPos              -- MILES HUNDRED new setpoint value
+var byte   miles3Update              -- MILES HUNDRED value update request
+
+   -- MILES (RANGE) INVALID FLAG (SHUTTER)
+const byte SHUTTER_VISIBLE   = 1     -- reed relay NOT activated
+const byte SHUTTER_HIDDEN    = 0     -- read relay (and shutter) activated
+
+-- SPI data transmission to DACs
+var byte   setpointsToDACsActive     -- indicates SPI transmission in progress
+
+-- default synchro stator offset values
+const word BRG_DFLT_S1_ANGLE = 89    -- 0 degrees
+const word BRG_DFLT_S2_ANGLE = 430   -- 120 degrees
+const word BRG_DFLT_S3_ANGLE = 771   -- 240 degrees
+
+const word HDG_DFLT_S1_ANGLE = 600   -- 0   egrees
+const word HDG_DFLT_S2_ANGLE = 941   -- 120 degrees
+const word HDG_DFLT_S3_ANGLE = 258   -- 240 degrees
+
+const word ML1_DFLT_X_ANGLE  = 682   -- indicator at "0"
+const word ML1_DFLT_Y_ANGLE  = 853   -- 60 degrees
+
+const word ML2_DFLT_X_ANGLE  = 682   -- indicator at "0"
+const word ML2_DFLT_Y_ANGLE  = 853   -- 60 degrees
+
+const word ML3_DFLT_X_ANGLE  = 682   -- indicator at "0"
+const word ML3_DFLT_Y_ANGLE  = 853   -- 60 degrees
+
+-- special value to set all MILES synchros to "LOW POWER"
+const word MILES_LOW_POWER   = 11111
+
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+-- include spi_master_hw       -- SPI master hardware library
+include hsi1-doa               -- PHCC DOA receiver routine
+include hsi-usb                -- USB handler
+include hsi-led                -- DIAG LED routines
+include hsi-watchdog           -- communication watchdog
+include hsi1-queues            -- setpoint queues
+include hsi1-debug             -- debug output (text / HP5082-7340 displays)
+include hsi1-convert           -- setpoint conversion & execution
+include hsi1-cmds              -- process received commands
+
+
+
+
+-- =============================================================================
+-- ############  START OF HEADING, BEARING and MILES (HSI) CONTROL  ############
+-- =============================================================================
+
+
+BSR               = 0                    -- set bank select register to default
+INTCON_GIE        = FALSE                -- disable all interrupts
+enable_digital_io()                      -- all I/O pins set to digital
+INTCON            = 0                    -- all interrupts disabled
+
+initSPIhardware()                        -- SPI hardware control lines
+initDOA()                                -- init variables DOA communication
+initUSB()                                -- init variables USB communication
+debugMask = 0                            -- all debug "features": default state
+initDiagLED()                            -- diagnostic LED initialization
+set_delay(HEARTBEAT_SLOT, flashRate)     -- start heartbeat blinking
+
+
+-- MILES shutter and initial synchro stator polarity output signals
+MLSSHUTTER        = SHUTTER_VISIBLE      -- MILES shutter indicator
+HDG_POL_X         = 0                    -- HEADING stators polarity
+HDG_POL_Y         = 0
+HDG_POL_Z         = 0
+BRG_POL_X         = 0                    -- BEARING stators polarity
+BRG_POL_Y         = 0
+BRG_POL_Z         = 0
+ML1_POL_X         = 0                    -- MILES units stators polarity
+ML1_POL_Y         = 0
+ML2_POL_X         = 0                    -- MILES tens stators polarity
+ML2_POL_Y         = 0
+ML3_POL_X         = 0                    -- MILES hundreds stators polarity
+ML3_POL_Y         = 0
+
+-- initialize setpoint variables
+bearingPolarityS1     = 0                -- BEARING polarity & amplitude
+bearingPolarityS2     = 0
+bearingPolarityS3     = 0
+bearingAmplitudeS1    = 0
+bearingAmplitudeS2    = 0
+bearingAmplitudeS3    = 0
+brgS1Offset           = BRG_DFLT_S1_ANGLE   --         offset values
+brgS2Offset           = BRG_DFLT_S2_ANGLE
+brgS3Offset           = BRG_DFLT_S3_ANGLE
+headingPolarityS1     = 0                -- HEADING polarity & amplitude
+headingPolarityS2     = 0
+headingPolarityS3     = 0
+headingAmplitudeS1    = 0
+headingAmplitudeS2    = 0
+headingAmplitudeS3    = 0
+hdgS1Offset           = HDG_DFLT_S1_ANGLE   --         offset values
+hdgS2Offset           = HDG_DFLT_S2_ANGLE
+hdgS3Offset           = HDG_DFLT_S3_ANGLE
+miles1PolarityX       = 0                -- MILES unit polarity and amplitude
+miles1PolarityY       = 0
+miles1AmplitudeX      = 0
+miles1AmplitudeY      = 0
+miles1OffsetX         = ML1_DFLT_X_ANGLE --       offset values for "zero"
+miles1OffsetY         = ML1_DFLT_Y_ANGLE
+miles2PolarityX       = 0                -- MILES tens polarity and amplitude
+miles2PolarityY       = 0
+miles2AmplitudeX      = 0
+miles2AmplitudeY      = 0
+miles2OffsetX         = ML2_DFLT_X_ANGLE --       offset values for "zero"
+miles2OffsetY         = ML2_DFLT_Y_ANGLE
+miles3PolarityX       = 0                -- MILES hundred polarity and amplitude
+miles3PolarityY       = 0
+miles3AmplitudeX      = 0
+miles3AmplitudeY      = 0
+miles3OffsetX         = ML3_DFLT_X_ANGLE --       offset values for "zero"
+miles3OffsetY         = ML3_DFLT_Y_ANGLE
+
+bearingNewPos         = 0                -- BEARING initial setpoint position
+headingNewPos         = 0                -- HEADING initial setpoint position
+miles1NewPos          = 0                -- MILES UNIT initial setpoint value
+miles2NewPos          = 0                -- MILES TEN initial setpoint value
+miles3NewPos          = 0                -- MILES HUNDRED initial setpoint value
+
+bearingUpdate         = FALSE            -- BEARING position update request
+headingUpdate         = FALSE            -- HEADING position update request
+miles1Update          = FALSE            -- MILES UNIT value update request
+miles2Update          = FALSE            -- MILES TEN value update request
+miles3Update          = FALSE            -- MILES HUNDRED value update request
+milesLowPowerEnabled  = TRUE             -- coils at low power when bar visible
+
+initQueueAdministration()                -- cyclic buffers adminstration
+
+
+-- set environment
+prevISRcounter    = 0
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF        = 0        ; clear SPI interrupt flag
+-- PIE1_SSPIE        = 1        ; enable SPI interrupt
+INTCON2_INTEDG2   = 1           ; external INT2 (DOA) interrupt on rising edge
+INTCON3_INT2IF    = 0           ; clear INT2 (DOA) interrupt flag
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+if (USB_DOA == USE_USB) then
+    commPort       = USE_USB
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = STARTUP_FLASHRATE
+    chkUSBconnect  = TRUE
+    wtchdogState   = WTCHDOG_DISABLED   -- USB DEFAULT watchdog state: disabled
+    INTCON3_INT2IE = 0                  -- disable INT2 (DOA) external interrupt
+else
+    commPort       = USE_DOA
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = DOA_RESET_RATE     -- indicate initial 1 sec delay
+    chkUSBconnect  = FALSE
+    wtchdogState   = WTCHDOG_ENABLED    -- DOA DEFAULT watchdog state: enabled
+    INTCON3_INT2IE = 1                  -- enable INT2 (DOA) external interrupt
+end if
+
+-- watchdog
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT    -- initialize watchdog
+commRestartWatchdog()                       -- start comm protocol watchdog
+
+initSPIcontrol()                            -- initialize DAC load state machine
+preloadDACregisters()                       -- load DAC registers: amplitude 0
+
+-- Interrupts are enabled, so we can send data via SPI to the DACs.
+-- Initial "setpoint" :: all 3 stator coils zero "energized".
+-- ########synchroSetpoint( amplitudeS1, amplitudeS2, amplitudeS3,
+-- ########                 polarityS1,  polarityS2,  polarityS3  )
+
+
+forever loop
+  -- for PHCC, the DOA communication can start immediately
+  -- for USB, there is first a check that the USB connection is made
+
+  if (chkUSBconnect == TRUE) then
+     -- periodically check for USB connection active
+     diagLEDheartBeat()                                 -- update DIAG LED state
+     if (isr_counter != prevISRcounter) then
+        -- one (or more) timer tick elapsed
+        prevISRcounter = isr_counter
+        if (VsenseIN) then                               -- check_comm_active()
+           chkUSBconnect = FALSE
+           -- USB connection established: setup USB serial library
+           usb_serial_init()
+           flashRate = USB_FLASH_RATE
+        end if
+     end if
+  else
+     -- main loop: startup phase for USB done __OR__ PHCC DOA selected
+     if (commPort == USE_USB) then
+        -- USB communication: keep checking whether USB is still connected!
+        if (VsenseIN) then
+           handleUSBcommunication()
+           if (USBcmdReceived == TRUE) then
+              USBcmdReceived = FALSE
+              commandCode = USBrxByte1
+              commandData = USBrxByte2
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        else
+           -- USB connection lost -> restart USB connection setup loop
+           chkUSBconnect  = TRUE
+           flashRate      = STARTUP_FLASHRATE
+           diagLEDuse     = DIAGLED_HEARTBEAT     -- make sure the DIAG LED flashes
+           prevISRcounter = 0
+        end if
+     else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+     end if
+
+     -- execute continuously running actions (if required)
+
+     diagLEDheartBeat()          -- update DIAG LED state if in "heart beat" mode
+     commCheckWatchdog()         -- check communication protocol watchdog
+
+     accNewBearingSetpoint()     -- store new setpoint (if one is received)
+     accNewHeadingSetpoint()
+     accNewMiles1Setpoint()
+     accNewMiles2Setpoint()
+     accNewMiles3Setpoint()
+
+     updBearingPosition()        -- move synchro axis to new setpoint
+     updHeadingPosition()
+     updMiles1Position()
+     updMiles2Position()
+     updMiles3Position()
+
+     processSPIloading()         -- send data to DACs (if active)
+
+  end if
+end loop
+
+
+-- =============================================================================
+-- Interrupt routine for the DOA serial communication and SPI processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( INTCON3_INT2IF ) then
+      processDOAinterrupt()
+  end if
+
+  -- if ( PIR1_SSPIF ) then
+  --     processSPIinterrupt()
+  -- end if
+end procedure
+

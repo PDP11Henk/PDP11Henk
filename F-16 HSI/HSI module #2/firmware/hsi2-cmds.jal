@@ -1,0 +1,342 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-cmds
+--
+--    this module contains the processing of all "HSI2" commands.
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+
+var   word loadCRSoffset
+var   word loadCRSoffsetLsb
+
+const byte PREV_DEBUG_SETTING[] = {"previous DEBUG mask = 0x!"}
+const byte CUR_DEBUG_SETTING[]  = {"  current DEBUG mask = 0x!"}
+
+
+procedure processCommand() is
+  var byte IDbyte
+  var sword delta
+
+  case (commandCode) of
+--
+-- Course Deviation Indicator
+--
+      CMD_CDI_0 : block
+                     CDInewPos = word(commandData)
+                     CDIupdate = TRUE
+          end block
+      CMD_CDI_1 : block
+                     CDInewPos = word(commandData) + 256
+                     CDIupdate = TRUE
+          end block
+      CMD_CDI_2: block
+                     CDInewPos = word(commandData) + 512
+                     CDIupdate = TRUE
+          end block
+      CMD_CDI_3: block
+                     CDInewPos = word(commandData) + 768
+                     CDIupdate = TRUE
+          end block
+--
+-- Navigation warning flag
+--
+      CMD_NAV_WARN : block
+              if (commandData == 0) then   NAV_WARN = 0   end if
+              if (commandData == 1) then   NAV_WARN = 1   end if
+          end block
+--
+-- TO/FROM indicator
+--
+      CMD_TO_FROM : block
+              --  +--7--+--6--+--5--+--4--+--3--+--2--+--1--+--0--+
+              --  |     |     |     |     |     |     |  b1 |  b0 |
+              --  +-----+-----+-----+-----+-----+-----+-----+-----+
+              --
+              -- Bits 0 and 1 define the activated indicator.
+              -- If both bits are set to the same value, NO indicator is active.
+              -- Bits 2~~7 are ignored.
+
+              IDbyte = (commandData & 0x03)
+              if (IDbyte == 1) then
+                  -- (1) : TO
+                  TO_FROM_1 = 1
+                  TO_FROM_2 = 0
+              elsif (IDbyte == 2) then
+                  -- (2) : FROM
+                  TO_FROM_1 = 0
+                  TO_FROM_2 = 1
+              else -- (0) or (3)
+                  -- no indicator active
+                  TO_FROM_1 = 0
+                  TO_FROM_2 = 0
+              end if
+          end block
+--
+-- Send data via USB method (never / always / interval)
+--
+      CMD_SEND_USB : block
+              if (commandData == 0) then
+                  sendUSBmethod = SEND_USB_NEVER
+              elsif (commandData == 1) then
+                  sendUSBmethod = SEND_USB_REQUEST
+              elsif (commandData == 2) then
+                  sendUSBmethod = SEND_USB_ALWAYS
+                  set_delay(SEND_USB_INTERVAL_SLOT, sendUSBtimeDelay)
+              elsif (commandData == 3) then
+                  sendUSBmethod = SEND_USB_CHANGE
+                  set_delay(SEND_USB_INTERVAL_SLOT, sendUSBtimeDelay)
+              else
+                  sendUSBmethod = SEND_USB_NEVER    -- reject all other
+              end if
+          end block
+--
+-- Send data interval
+--
+      CMD_SEND_DELAY : block
+              sendUSBtimeDelay = word(commandData) << 2   -- 1 tick = 4 ms
+              if (sendUSBtimeDelay == 0) then
+                  sendUSBtimeDelay = USB_DELAY_DEFAULT    -- set default
+                  sendUSBmethod = SEND_USB_NEVER
+              end if
+          end block
+--
+-- Request CRS & HDG data
+--
+      CMD_CRS_REQ : block
+              requestCourseData = TRUE
+          end block
+      CMD_HDG_REQ : block
+              requestHeadingData = TRUE
+          end block
+--
+-- HEADING parameters
+--
+      CMD_HDG_CONV : block
+              if (commandData == 0) then   hdgConvertToDegree = FALSE   end if
+              if (commandData == 1) then   hdgConvertToDegree = TRUE    end if
+          end block
+      CMD_HDG_NOISE : block
+              hdgNoiseThreshold = sword(commandData & 0x7F)
+          end block
+--
+-- COURSE parameters
+--
+      CMD_CRS_CONV : block
+              if (commandData == 0) then
+                  crsConvertToDegree = FALSE
+                  crsOutputADCPeriod = FALSE
+              end if
+              if (commandData == 1) then
+                  crsConvertToDegree = TRUE
+                  crsOutputADCPeriod = FALSE
+              end if
+              if (commandData == 2) then
+                  crsConvertToDegree = FALSE
+                  crsOutputADCPeriod = TRUE
+              end if
+          end block
+      CMD_CRS_NOISE : block
+              crsNoiseThreshold = sword(commandData & 0x7F)
+          end block
+      CMD_SINCOS_CROSS : block
+              sinCosCrossOver1 = word(commandData) << 2
+              sinCosCrossOver2 = sinCosCrossOver1 << 1
+              sinCosCrossOver4 = sinCosCrossOver1 << 2
+          end block
+--
+-- Enable/disable sin/cos signal amplitude alignment
+--
+      CMD_SINCOS_ALIGN : block
+              if (commandData == 1) then
+                  sinCosAlignActive = TRUE
+                  prevSendUSBmethod = SendUSBmethod
+                  sendUSBmethod = SEND_USB_ALWAYS
+                  set_delay(SEND_USB_INTERVAL_SLOT, sendUSBtimeDelay)
+              else
+                  sinCosAlignActive = FALSE
+                  sendUSBmethod = prevSendUSBmethod
+                  if ( (SendUSBmethod == SEND_USB_ALWAYS) |
+                       (SendUSBmethod == SEND_USB_CHANGE) ) then
+                      set_delay(SEND_USB_INTERVAL_SLOT, sendUSBtimeDelay)
+                  end if
+              end if
+          end block
+--
+-- Spare output control
+--
+      CMD_OUT_A2 : block
+              if (commandData == 0) then  USEROUTA = 0 end if
+              if (commandData == 1) then  USEROUTA = 1 end if
+          end block
+      CMD_OUT_B2 : block
+              if (commandData == 0) then  USEROUTB = 0 end if
+              if (commandData == 1) then  USEROUTB = 1 end if
+          end block
+      CMD_OUT_X24 : block
+              if (commandData == 0) then  USEROUTX = 0 end if
+              if (commandData == 1) then  USEROUTX = 1 end if
+          end block
+--
+-- Course drive synchro control
+--
+      CMD_CRS_Q1 : block
+              crsDriveNewPos = word(commandData)
+              crsDriveUpdate = TRUE
+          end block
+      CMD_CRS_Q2 : block
+              crsDriveNewPos = word(commandData) + 256
+              crsDriveUpdate = TRUE
+          end block
+      CMD_CRS_Q3 : block
+              crsDriveNewPos = word(commandData) + 512
+              crsDriveUpdate = TRUE
+          end block
+      CMD_CRS_Q4 : block
+              crsDriveNewPos = word(commandData) + 768
+              crsDriveUpdate = TRUE
+          end block
+
+      -- load course drive synchro base angle offsets (in 10-bit accuracy)
+      -- NOTE: LSB value must be set *before* MSB value!
+      CMD_CRS_OFFS_L : block
+              loadCRSoffsetLsb = word(commandData)
+          end block
+      CMD_CRS_OFFS_H : block
+              loadCRSoffset = word(commandData & 0x03) << 8
+              loadCRSoffset = loadCRSoffset + loadCRSoffsetLsb
+          end block
+      CMD_LOAD_CRS : block
+              if ((commandData & 0x01) == 0x01) then
+                  crsDriveS1Offset = loadCRSoffset
+              elsif ((commandData & 0x02) == 0x02) then
+                  crsDriveS2Offset = loadCRSoffset
+              elsif ((commandData & 0x04) == 0x04) then
+                  crsDriveS3Offset = loadCRSoffset
+              else
+                  -- reject: wrong bitmask
+              end if
+          end block
+--
+      CMD_CRS_S1 : block
+              crsDriveAmplitudeS1 = word(255 - commandData) << 2
+          end block
+      CMD_CRS_S2 : block
+              crsDriveAmplitudeS2 = word(255 - commandData) << 2
+          end block
+      CMD_CRS_S3 : block
+              crsDriveAmplitudeS3 = word(255 - commandData) << 2
+          end block
+--
+      CMD_CRS_POL : block
+              --  +--7--+--6--+--5--+--4--+--3--+--2--+--1--+--0--+
+              --  |     |     |     |     |     |  S3 |  S2 |  S1 |
+              --  +-----+-----+-----+-----+-----+-----+-----+-----+
+              --                                  pol   pol   pol
+              --
+              --  Bits 0, 1, and 2 set the polarity of S1, S2, and S3
+              --  respectively of the COURSE drive synchro.
+              --  Bits 3-4-5-6-7 are ignored.
+
+           crsDrivePolarityS1 = (commandData & 0x01)
+           crsDrivePolarityS2 = (commandData & 0x02) >> 1
+           crsDrivePolarityS3 = (commandData & 0x04) >> 2
+           storeCrsDriveValues( crsDriveAmplitudeS1, crsDriveAmplitudeS2,
+                                crsDriveAmplitudeS3, crsDrivePolarityS1,
+                                crsDrivePolarityS2,  crsDrivePolarityS3 )
+        end block
+--
+--
+-- Watchdog
+--
+      CMD_WTCHDOG_DIS : block
+              disableWatchdog()
+          end block
+      CMD_WTCHDOG_ENA : block
+              if ((commandData & 0x3F) == 0x00) then
+                  -- set default timeout value
+                  wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+              else
+                  wtchdogDelayValue = word(commandData & 0x3F)
+              end if
+              if ((commandData & 0xC0) == 0x80) then
+                  -- enable watchdog
+                  set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                  enableWatchdog()
+              end if
+              if ((commandData & 0xC0) == 0x00) then
+                  -- disable watchdog
+                  disableWatchdog()
+              end if
+          end block
+--
+-- DIAG LED
+--
+      CMD_DIAGMODE : block
+              if (flashRate != DOA_RESET_RATE) then
+                  -- do not accept DIAG commands during DOA power-up
+                  setDiagLEDmode(commandData)
+              end if
+          end block
+--
+-- USB test
+--
+      CMD_IDENTIFY  : block
+              -- double check that USB is the COM port in use!
+              if (commPort == USE_USB) then
+                  usb_serial_data = "H"
+                  usb_serial_data = "S"
+                  usb_serial_data = "I"
+                  usb_serial_data = "#"
+                  usb_serial_data = "2"
+                  usb_serial_data = " "
+                  usb_serial_data = "v"
+                  usb_serial_data = "0" + MAJOR_VERSION
+                  usb_serial_data = "."
+                  usb_serial_data = "0" + MINOR_VERSION
+                  usb_serial_data = " "
+                  usb_serial_data = "$"
+                  IDbyte = ((HSI_DEVICE_ADDR_2 >> 4) & 0x0F) + "0"
+                  if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                  usb_serial_data = IDbyte
+                  IDbyte = (HSI_DEVICE_ADDR_2 & 0x0F) + "0"
+                  if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                  usb_serial_data = IDbyte
+                  usb_serial_data = 13                        -- add CR
+                  usb_serial_data = 10                        -- add LF
+              end if
+          end block
+--
+-- USB debug
+--
+      CMD_USB_DEBUG : block
+              -- double check that USB is the COM port in use!
+              if (commPort == USE_USB) then
+                  if (commandData == "N") then
+                      USBdebugEnabled = FALSE
+                  elsif (commandData == "Y") then
+                      USBdebugEnabled = TRUE
+                  end if
+              end if
+          end block
+
+      CMD_DEBUG_MASK : block
+              sendDebugNewLine()
+              sendDebugString(PREV_DEBUG_SETTING)
+              sendDebugByteHex(debugMask)
+              sendDebugString(CUR_DEBUG_SETTING)
+              debugMask = commandData
+              sendDebugByteHex(debugMask)
+          end block
+
+      -- ignore everything else
+      otherwise block
+              ; do nothing - reject
+          end block
+  end case
+end procedure
+

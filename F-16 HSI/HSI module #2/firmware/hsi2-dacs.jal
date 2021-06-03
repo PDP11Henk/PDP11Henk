@@ -1,0 +1,391 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-dacs
+--
+--    this module contains the generation of the analog output voltages of the
+--    HEADING setting (HDG) / COURSE setting (CRS) and COURSE DEVIATION (CDI)
+--    and COURSE drive (DRV) setpoints.
+--
+--    The functions storeNewValue and storeCrsDriveValues store the values in
+--    the array SPIpacket and set a "loadflag" that a specific value is updated.
+--
+--    The procedure "loadSPIvalue" is called from main(). This procedure checks
+--    that the setpointsToDACsActive flag is not set (indicating that a load-DAC
+--    is *not* in progress), then, depending on the "loadflag", copies the value
+--    from the SPIpacket to specific locations in the array DACdata by calling
+--    one of the routines "outputXXXsetpoint", and clearing the "loadflag".
+--
+--    The "processSPIloading" function is called from main().
+--    The function loads HDG, CRS, CDI setpoint data into the DAC registers
+--    using a state machine. The state machine loads the data in the correct
+--    format and generates the correct CS* and LDAC* pulses.
+--
+--    *** NOTE:
+--    SPI hardware control sometimes seems to send "spurious" data. Therefore,
+--    SPI is software controlled. Data and successive data are sent over the SPI
+--    hardware lines, but control is managed in a state machine which is called
+--    from main(). The state machine is implemented in processSPIloading().
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+
+var   word SPIpacket[9]               -- hold current CDI, HDG, CRS output value
+var   byte SPIloadFlags               -- flags to indicate a new value is loaded
+const byte CDI_VALUE_ID       = 0     -- CDI setpoint value
+const byte HDG_VALUE_ID       = 1     -- HDG setting value
+const byte CRS_VALUE_ID       = 2     -- CRS setting value
+const byte DRV_VALUE_ID       = 3     -- CRS drive setpoint values
+
+var   byte DACdata[15]                -- DAC output values for CDI, HDG, CRS
+var   byte loadState                  -- state machine data output progress
+
+  -- output data value // Chip Select identification of correct DAC
+const byte DAC_LOAD_IDLE      = 0     -- idle state
+const byte DAC_CDI            = 1     -- initial states
+const byte DAC_HDG            = 2
+const byte DAC_CRS            = 3
+const byte DAC_CRS_S1         = 4
+const byte DAC_LOAD_CDI       = 5     -- follow-up states
+const byte DAC_LOAD_CRS       = 6
+const byte DAC_LOAD_HDG       = 7
+const byte DAC_CRS_S23        = 8
+const byte DAC_LOAD_CRS_DRV   = 9
+
+
+-- DAC CS* state
+const byte ASSERT             = 0     -- DAC CS* control pin asserted level
+const byte NEGATE             = 1     -- DAC CS* control pin negated level
+const byte DAC_A              = 0x10  -- load DAC A, gain 2x
+const byte DAC_B              = 0x90  -- load DAC B, gain 2x
+
+
+
+
+procedure initSPIhardware() is
+    CS_CDI_CRS    = 1                 -- CS* DAC CDI and COURSE
+    CS_HDG_CRSS1  = 1                 -- CS* DAC HEADING and COURSE stator S1
+    CS_CRSS3_S2   = 1                 -- CS* DAC COURSE stator S3 and stator S2
+    LD_CDI_CRS    = 1                 -- LOAD* strobe CDI/CRS
+    LD_HDG_CRSS1  = 1                 -- LOAD* strobe HDG/CRS S1
+    LD_CRSS3_S2   = 1                 -- LOAD* strobe CRS S2 / S2
+    SPI_CLK       = 0                 -- SPI clock inactive level
+end procedure
+
+
+
+procedure initSPIcontrol() is
+  var byte index
+
+    loadState = DAC_LOAD_IDLE         -- DAC output state machine IDLE
+    setpointsToDACsActive = FALSE     -- no SPI data transfer in progress
+    SPIloadFlags = 0                  -- no output data for DAC available
+    index = 0
+    while (index < 15) loop
+        DACdata[0] = 0
+        index = index + 1
+    end loop
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Store setpoint value in SPI packet.
+--   This routine is called from the primary functions to output a new Course
+--   Deviation setpoint, or Heading or Course setting to the DAC output.
+--   Only the data is stored in the "SPI data packet", which is the data buffer.
+--   No actual output action is performed by "storeNewValue".
+--   The function "loadSPIvalue" copies the SPI data packet information to a
+--   local array and initiates a DAC transfer.
+-- -----------------------------------------------------------------------------
+
+procedure storeNewValue(WORD in value, BYTE in valueID) is
+    SPIpacket[valueID] = value
+    if    (valueID == CDI_VALUE_ID) then  SPIloadFlags = SPIloadFlags | 0x01
+    elsif (valueID == HDG_VALUE_ID) then  SPIloadFlags = SPIloadFlags | 0x02
+    elsif (valueID == CRS_VALUE_ID) then  SPIloadFlags = SPIloadFlags | 0x04
+    else
+        -- bad ID: ignore (bug!)
+    end if
+end procedure
+
+procedure storeCrsDriveValues(WORD in amplitudeS1, WORD in amplitudeS2,
+                              WORD in amplitudeS3, BYTE in polarityS1,
+                              BYTE in polarityS2,  BYTE in polarityS3  ) is
+    SPIpacket[3] = amplitudeS1
+    SPIpacket[4] = amplitudeS2
+    SPIpacket[5] = amplitudeS3
+    SPIpacket[6] = word(polarityS1)
+    SPIpacket[7] = word(polarityS2)
+    SPIpacket[8] = word(polarityS3)
+    SPIloadFlags = SPIloadFlags | 0x08
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Store setpoint information in byte array for DAC loading.
+-- Initiate the transfer of the bytes to the DAC(s): start the state machine.
+-- The words are sent via processSPIloading() called from the main() loop.
+-- -----------------------------------------------------------------------------
+
+procedure outputCDIsetpoint(WORD in courseDeviation) is
+    DACdata[0] = byte((courseDeviation >> 6) & 0x000F) + DAC_A
+    DACdata[1] = byte((courseDeviation << 2) & 0x00FC)
+    setpointsToDACsActive = TRUE
+    loadState = DAC_CDI
+end procedure
+
+procedure outputHDGsetpoint(WORD in heading) is
+    DACdata[2] = byte((heading >> 6) & 0x000F) + DAC_A
+    DACdata[3] = byte((heading << 2) & 0x00FC)
+    setpointsToDACsActive = TRUE
+    loadState = DAC_HDG
+end procedure
+
+procedure outputCRSsetpoint(WORD in course) is
+    DACdata[4] = byte((course >> 6) & 0x000F) + DAC_B
+    DACdata[5] = byte((course << 2) & 0x00FC)
+    setpointsToDACsActive = TRUE
+    loadState = DAC_CRS
+end procedure
+
+procedure outputCrsDriveSetpoint(WORD in amplitudeS1, WORD in amplitudeS2,
+                                 WORD in amplitudeS3, WORD in polarityS1,
+                                 WORD in polarityS2,  WORD in polarityS3  ) is
+  ; format the values to be sent to the DACs
+    DACdata[6]  = byte((amplitudeS1 >> 6) & 0x000F) + DAC_B
+    DACdata[7]  = byte((amplitudeS1 << 2) & 0x00FC)
+    DACdata[8]  = byte((amplitudeS2 >> 6) & 0x000F) + DAC_B
+    DACdata[9]  = byte((amplitudeS2 << 2) & 0x00FC)
+    DACdata[10] = byte((amplitudeS3 >> 6) & 0x000F) + DAC_A
+    DACdata[11] = byte((amplitudeS3 << 2) & 0x00FC)
+    if (polarityS1 == 0) then  DACdata[12] = 0  else  DACdata[12] = 0  end if
+    if (polarityS2 == 0) then  DACdata[13] = 0  else  DACdata[13] = 0  end if
+    if (polarityS3 == 0) then  DACdata[14] = 0  else  DACdata[14] = 0  end if
+    setpointsToDACsActive = TRUE
+    loadState = DAC_CRS_S1
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Copy a new setpoint value, but only if DAC loading is not active.
+-- The new setpoint value is stored in DACdata and DAC output is triggered.
+-- Called from the main() loop.
+-- -----------------------------------------------------------------------------
+
+procedure loadSPIvalue() is
+    if (setpointsToDACsActive == FALSE) then
+        -- OK to copy ONE new setpoint from the SPI data packet
+        if ( (SPIloadFlags & 0x01) == 0x01) then
+            -- new CDI setpoint
+            outputCDIsetpoint( SPIpacket[CDI_VALUE_ID] )
+            SPIloadFlags = SPIloadFlags & 0xFE
+        elsif ( (SPIloadFlags & 0x02) == 0x02) then
+            -- new HEADING setting
+            outputHDGsetpoint( SPIpacket[HDG_VALUE_ID] )
+            SPIloadFlags = SPIloadFlags & 0xFD
+        elsif ( (SPIloadFlags & 0x04) == 0x04) then
+            -- new COURSE setting
+            outputCRSsetpoint( SPIpacket[CRS_VALUE_ID] )
+            SPIloadFlags = SPIloadFlags & 0xFB
+        elsif ( (SPIloadFlags & 0x08) == 0x08) then
+            -- new COURSE drive setpoint
+            outputCrsDriveSetpoint( SPIpacket[3], SPIpacket[4],
+                                    SPIpacket[5], SPIpacket[6],
+                                    SPIpacket[7], SPIpacket[8] )
+            SPIloadFlags = SPIloadFlags & 0xF7
+        else
+            -- bug!
+        end if
+    end if
+end procedure
+
+
+
+
+-- Assert or negate the correct DAC Chip Select (CS) pin
+
+procedure controlDACCS(BYTE in deviceID, BYTE in CSstate) is
+    case (deviceID) of
+        DAC_CDI     : block  CS_CDI_CRS   = CSstate   end block
+        DAC_HDG     : block  CS_HDG_CRSS1 = CSstate   end block
+        DAC_CRS     : block  CS_CDI_CRS   = CSstate   end block
+        DAC_CRS_S1  : block  CS_HDG_CRSS1 = CSstate   end block
+        DAC_CRS_S23 : block  CS_CRSS3_S2  = CSstate   end block
+    end case
+end procedure
+
+
+
+-- This routine sends the data word to the DAC using "bit-banging".
+-- It is a generic routine, starting with asserting the appropriate CS of the
+-- DAC identified by the deviceID. The data bits are subsequently loaded and
+-- clocked into the DAC. The CS of the DAC is negated after the last bit.
+
+procedure sendSPIdata(BYTE in SPIdataHI, BYTE in SPIdataLO, BYTE in deviceID) is
+  var byte bitmask
+
+    controlDACCS(deviceID, ASSERT)       -- assert appropriate DAC CS*
+    ASM nop                              -- CS settling time
+    ASM nop
+    ASM nop
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the HI data byte
+        if ((SPIdataHI & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the LO data byte
+        if ((SPIdataLO & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    ASM nop
+    ASM nop
+    controlDACCS(deviceID, NEGATE)       -- negate appropriate DAC CS*
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Preload all DAC registers for output zero signal amplitude to synchro coils
+-- (called once before main loop is entered)
+-- -----------------------------------------------------------------------------
+
+procedure preloadDACregisters() is
+  var word setValue
+
+    setValue   = 512                                       -- mid-range for CDI
+    DACdata[0] = byte((setValue >> 6) & 0x000F) + DAC_A
+    DACdata[1] = byte((setValue << 2) & 0x00FC)
+    setValue   = 0                                         -- HDG : assume 0
+    DACdata[2] = byte((setValue >> 6) & 0x000F) + DAC_A
+    DACdata[3] = byte((setValue << 2) & 0x00FC)
+    setValue   = 0                                         -- CRS : assume 0
+    DACdata[4] = byte((setValue >> 6) & 0x000F) + DAC_B
+    DACdata[5] = byte((SetValue << 2) & 0x00FC)
+
+    sendSPIdata(DACdata[0], DACdata[1], DAC_CDI)
+    sendSPIdata(DACdata[2], DACdata[3], DAC_HDG)
+    sendSPIdata(DACdata[4], DACdata[5], DAC_CRS)
+    ASM nop
+    LD_CDI_CRS = 0
+    LD_HDG_CRSS1 = 0
+    ASM nop
+    ASM nop               -- LDAC* : t > 40 ns
+    ASM nop
+    LD_CDI_CRS = 1          -- latch transfer
+    LD_HDG_CRSS1 = 1
+    ASM nop
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- SPI send data routine
+-- -----------------------------------------------------------------------------
+
+procedure processSPIloading() is
+  case (loadState) of
+      DAC_LOAD_IDLE : block
+                        -- nothing to do, no transmission active
+                      end block
+      DAC_CDI       : block
+                        sendSPIdata(DACdata[0], DACdata[1], loadState)
+                        loadState = DAC_LOAD_CDI
+                      end block
+      DAC_HDG       : block
+                        sendSPIdata(DACdata[2], DACdata[3], loadState)
+                        loadState = DAC_LOAD_HDG
+                      end block
+      DAC_CRS       : block
+                        sendSPIdata(DACdata[4], DACdata[5], loadState)
+                        loadState = DAC_LOAD_CRS
+                      end block
+      DAC_CRS_S1    : block
+                        sendSPIdata(DACdata[6], DACdata[7], loadState)
+                        loadState = DAC_CRS_S23
+                      end block
+      DAC_CRS_S23   : block
+                        sendSPIdata(DACdata[8], DACdata[9], loadState)
+                        sendSPIdata(DACdata[10], DACdata[11], loadState)
+                        loadState = DAC_LOAD_CRS_DRV
+                      end block
+--
+      DAC_LOAD_CDI  : block
+                        -- CDI setpoint loaded into DAC; transfer to output
+                        ASM nop
+                        LD_CDI_CRS = 0
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LD_CDI_CRS = 1                      -- latch transfer
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+      DAC_LOAD_CRS  : block
+                        -- CRS setpoint loaded into DAC; transfer to output
+                        ASM nop
+                        LD_CDI_CRS = 0
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LD_CDI_CRS = 1                      -- latch transfer
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+      DAC_LOAD_HDG  : block
+                        -- HDG setting loaded into DAC; transfer to output
+                        ASM nop
+                        LD_HDG_CRSS1 = 0
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LD_HDG_CRSS1 = 1                    -- latch transfer
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+      DAC_LOAD_CRS_DRV  : block
+                        -- CRS DRIVE setting loaded into DAC; transfer to output
+                        ASM nop
+                        LD_HDG_CRSS1 = 0
+                        LD_CRSS3_S2 = 0
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LD_HDG_CRSS1 = 1                    -- latch transfer
+                        LD_CRSS3_S2 = 1
+                        CRS_S1_POL = DACdata[12]            -- and set polarity
+                        CRS_S2_POL = DACdata[13]
+                        CRS_S3_POL = DACdata[14]
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+--
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

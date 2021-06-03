@@ -1,0 +1,156 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control modules (#1 and #2)
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-send2usb
+--
+--    this module contains the routines to accept and store new HDG and CRS knob
+--    settings in a packet. Depending on the specified USB send method (none,
+--    on request, change, timer interval), packet is send to the USB port.
+
+var   word USBpacket[2]               -- hold current HDG and CRS setting
+const byte USB_HDG_ID       = 0
+const byte USB_CRS_ID       = 1
+
+var   byte USBupdateFlags             -- flags to indicate a new value is loaded
+                                      -- flag set implies that the value changed
+var   byte sendNow                    -- send data *now* (overruling timer)
+
+
+procedure initUSBcontrol() is
+    USBupdateFlags = 0                -- no (new) output data for USB available
+    USBpacket[0]   = 0
+    USBpacket[1]   = 0
+    sendNow        = FALSE
+end procedure
+
+
+
+procedure sendDataToUSB(WORD in value, BYTE in valueID, BYTE in sendAction) is
+    if (valueID == HDG_VALUE_ID) then
+        if (sinCosAlignActive == FALSE) then
+            -- in SinCos alignment mode: do NOT overwrite raw sine value!
+            USBpacket[USB_HDG_ID] = value
+            USBupdateFlags = USBupdateFlags | 0x01
+        end if
+    end if
+    if (valueID == CRS_VALUE_ID) then
+        USBpacket[USB_CRS_ID] = value
+        USBupdateFlags = USBupdateFlags | 0x02
+    end if
+
+    -- see what send action is requested
+    if (sendAction == SEND_NOW) then
+        sendNow = TRUE
+    else -- (sendAction == SEND_ON_TIMER)
+        sendNow = FALSE
+    end if
+end procedure
+
+
+
+-- This routine is a bypass to send the raw sine and cosine values directly
+-- via the USB port for Sin/Cos alignment mode.
+
+procedure sendSinCosAlign(WORD in sinValue, WORD in cosValue) is
+    USBpacket[0]   = sinValue
+    USBpacket[1]   = cosValue
+    sendNow        = FALSE
+    USBupdateFlags = USBupdateFlags | 0x03
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Send word of data followed by a separator (space or newline)
+--
+-- Depending on "debugMask", the word is sent as a 16-bit value non-printable,
+-- or as 4 printable hexadecimal characters. The separator can be a space or a
+-- CR. The CR is always sent followed by a LF (thus 0x0D0A). A space between
+-- words is only sent when "printable format" is selected.
+-- -----------------------------------------------------------------------------
+
+procedure sendWord(WORD in value, BYTE in separator) is
+  var byte dataByte
+
+    if ((debugMask & PACKET_DECIMAL) == PACKET_DECIMAL) then
+        dataByte = BYTE(value >> 8)
+        usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+        usb_serial_data = nibble2hex[0x0F & (dataByte)]
+        
+        dataByte = BYTE(value & 0x00FF)
+        usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+        usb_serial_data = nibble2hex[0x0F & (dataByte)]
+        
+        if (separator == 0x20) then
+            usb_serial_data = 0x20
+        else
+            usb_serial_data = 0x0D
+            usb_serial_data = 0x0A
+        end if
+
+    else
+        -- send binary (default setting)
+        dataByte = BYTE(value >> 8)
+        usb_serial_data = dataByte
+
+        dataByte = BYTE(value & 0x00FF)
+        usb_serial_data = dataByte
+
+        if (separator == 0x0D) then
+            usb_serial_data = 0x0D
+            usb_serial_data = 0x0A
+        end if
+    end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Send data to USB port
+--
+--   parameter in : -
+--   parameter out: -
+--   description  : the USB packet is sent to the USB port.
+--                  And now it is checked whether USB is the selected COM port!
+--                  If the COM port is DOA, nothing is sent!
+--                  The packet consists (in binary mode) of 4 words:
+--                  (hex) 7777 HDG CRS 0D0A
+-- -----------------------------------------------------------------------------
+procedure sendData() is
+    if (commPort == USE_USB) then
+        -- OK: USB is the selected COM port!
+        sendWord(0x7777, 0x20)                 -- 0x7777: header word and space
+        sendWord(USBpacket[0], 0x20)           -- 0x20: space: print separator
+        sendWord(USBpacket[1], 0x0D)           -- 0x0D: CR: print CR/LF newline
+    end if
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Send setting data to USB port
+--
+--   parameter in : boolean sendNow
+--   parameter out: -
+--   description  : the CRS and HDG setting data is sent to the USB port based
+--                  on the interval timer or (overruling) the flag sendNow.
+--   called from main()
+-- -----------------------------------------------------------------------------
+procedure dataToUSB() is
+    -- first check whether a "send now" is requested.
+    if (sendNow == TRUE) then
+        sendNow = FALSE
+        sendData()
+    else
+        if (sendUSBmethod != SEND_USB_NEVER) then
+            -- check for interval expiration
+            if ( check_delay(SEND_USB_INTERVAL_SLOT) ) then
+                sendData()
+                set_delay(SEND_USB_INTERVAL_SLOT, sendUSBtimeDelay)  -- restart
+            end if
+        end if
+    end if
+end procedure
+

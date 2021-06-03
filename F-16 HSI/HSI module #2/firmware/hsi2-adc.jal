@@ -1,0 +1,659 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-adc
+--
+--    this module contains the routine to read the ADC channels for the HEADING
+--    signal and COURSE sine/cosine signals.
+--    Note that the analog inputs are only processed when the digital input 115V
+--    PWR_PRESENT is active. The analog values have no meaning when 115V is off.
+--    The read analog values are stored via the "average" routine.
+--    The "average" routine processes the values, calculates an average over the
+--    last 16 values, and stores the average in the queue.
+--    channel 0 :: HDG value
+--    channel 1 :: CRS sine
+--    channel 2 :: CRS cosine
+
+
+var   byte  getAnalogSource          -- flag: read COURSE/HEADING ADC channel(s)
+const byte  GET_COURSE_DATA   = 0
+const byte  GET_HEADING_DATA  = 1
+
+var   byte  avgHDGsampleNmbr         -- average heading A/D sample #
+var   sword HDGsetSamples[16]        -- max 16 samples (avoid possible overflow)
+var   sword prevAvgHDGvalue          -- previous averaged HDG value
+
+var   byte  avgCRSsampleNmbr         -- average course A/D sample #
+var   word  CRSsetSamples[16]        -- max 16 samples (avoid possible overflow)
+var   word  CRSsetPeriod[16]
+var   word  prevAvgCRSvalue          -- previous averaged CRS value
+var   word  prevAvgCRSperiod         -- previous "averaged" CRS period
+
+
+  -- debug output strings
+;const byte  PWR115OFF[]     = {"1","1","5","V","A","C"," ","O","F","F"," ","!"}
+;const byte  HDGPWR115ON[]   = {"1","1","5","V","A","C"," ","O","N"," ","h",
+;                               "d","g"," ","A","D","C"," ",
+;                               "v","a","l","u","e"," ","!"}
+;const byte  HDGINPHASE[]    = {" ","H","D","G","_","I","N","P","H","A","S",
+;                               "E","=","!"}
+;const byte  HDGSETVALUE[]   = {" ","H","D","G"," ","s","e","t"," ","v","a",
+;                               "l","u","e"," ","="," ","!"}
+;const byte  HDG_AVERAGE[]   = {" "," ","H","D","G","a","v","g","=","!"}
+;const byte  THRESHOLD[]     = {" ","t","h","r","e","s","h","o","l","d","=","!"}
+;const byte  THRSHOLD_FLAG[] = {" ","f","l","a","g","=","!"}
+
+;const byte  CRSPWR115ON[]   = {"1","1","5","V","A","C"," ","O","N"," ","c",
+;                               "r","s"," ","A","D","C"," ","s",
+;                               "i","n",",","c","o","s"," ","v","a","l","u",
+;                               "e"," ","!"}
+;const byte  CRSALIGN[]      = {" ","A","L","I","G","N","=","!"}
+;const byte  CRSPERIODTXT[]  = {" ","P","E","R","I","O","D","=","!"}
+;const byte  CRSQUADRNTXT[]  = {" ","Q","U","A","D","R","A","N","T","=","!"}
+;const byte  CRS_VALUE[]     = {" "," ","C","R","S","v","a","l","u","e","=","!"}
+;const byte  CRS_PERIODTXT[] = {" ","C","R","S","p","e","r","i","o","d","=","!"}
+
+-- printed debug output for heading (if request received):
+-- 115VAC OFF
+-- 115VAC ON hdg ADC value xxxx HDG_INPHASE=x HDG set value = +xxxx \
+-- HDGavg=+xxxx threshold=xxxx flag=x
+
+-- printed debug output for course (if request received):
+-- 115VAC OFF
+-- 115VAC ON crs ADC sin,cos value xxxx,xxxx ALIGN=x PERIOD=x QUADRANT=x \
+-- CRSvalue=xxxx CRSperiod=x  CRSavg=xxxx,xxxx threshold=xxxx flag=x
+
+
+
+
+procedure initAnalogSampler() is
+  var byte index
+
+    avgCRSsampleNmbr = 0
+    avgHDGsampleNmbr = 0
+    prevAvgHDGvalue  = 9999    -- impossible value will force an initial update
+    prevAvgCRSvalue  = 1000    -- possible initial "previous" CRS value
+    prevAvgCRSperiod = 0
+    index = 0
+    while (index < 16) loop
+        CRSsetSamples[index] = 0
+        CRSsetPeriod[index]  = 0
+        HDGsetSamples[index] = 0
+        index = index + 1
+    end loop
+    getAnalogSource = GET_COURSE_DATA
+end procedure
+
+
+
+
+-- =============================================================================
+-- keep an average of the COURSE and HEADING A/D samples
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- This procedure is called from readADCchannels().
+-- Input : courseValue  = 0 .. sinCosCrossOver4 representing course 000°..180°
+-- *or* 180°..360° courseperiod = 0 for course 000°..180°
+--                              = 1 for course 180°..360°.
+-- This procedure determines from the input parameters the course setting and
+-- stores the in an array.
+--
+-- one-liner debug output for CRS (if enabled):
+-- CRSavg&period=xxxx,xxxx cnt0=xx cnt1=xx
+--
+-- The values of cnt0 and cnt1 are an indication of how good the average result
+-- is. If one counter is 0 and the other is 10 (hex), the result is most likely
+-- perfect. The more the total count (16 decimal) is divided among the counters,
+-- the more the result will become erratic. This can happen when the CRS setting
+-- is almost exactly 180° or 000°. I have no solution for this behavior, it is
+-- a result of the comparators (in the hardware) that determine the relation of
+-- the phase of the sine/cosine and the reference (115V) signal. There is a zone
+-- (small, but it is there) where these comparators will flip from one state to
+-- the other. Adding (more) hysteresis might solve this behavior, but it will
+-- also lead to wrong indications, because of the hysteresis (delay).
+-- The erratic "jumping" value might be handled in some software on the PC.
+-- -----------------------------------------------------------------------------
+
+;const byte CRS_AVERAGE[] = {0x0D,0x0A,
+;                            "C","R","S","a","v","g","&",
+;                            "p","e","r","i","o","d","=","!"}
+;const byte COUNT0_TXT[]  = {" ","c","n","t","0","=","!"}
+;const byte COUNT1_TXT[]  = {" ","c","n","t","1","=","!"}
+
+
+procedure averageCRSsetting(WORD in courseValue, WORD in coursePeriod) is
+  var byte index, countPeriod1, countPeriod0, outsideThreshold
+  var word value, majorityPeriod, avg4, avgCount
+  var word testValueMin, testValueMax
+
+    CRSsetSamples[avgCRSsampleNmbr] = courseValue
+    CRSsetPeriod[avgCRSsampleNmbr]  = coursePeriod
+    avgCRSsampleNmbr = (avgCRSsampleNmbr + 1) & 0x0F  -- modulo 16
+
+    -- calculate average of the 16 stored samples.
+    -- The CRS setting can be in the full 360° range. Each octant has its "own"
+    -- range of sinCosCrossOver1 values, but each octant has also its own start
+    -- value. Thus, the value range for octant 1 is 0 .. sinCosCrossOver1, the
+    -- value range for octant 2 is sinCosCrossOver1 .. sinCosCrossOver2, etc.
+    --
+    -- When the setting is close to the "period boundary", jittering may occur.
+    -- The period boundaries are 359° -> 0° and 179° -> 180°.
+    -- In an attempt to reduce (or get rid of) jittering,
+    -- the following approach is implemented.
+    --  1. collect 16 course Value and Period samples.
+    --  2. determine the majority of coursePeriod (number of 0 and 1 values).
+    --  3. calculate the average value of 4 samples of the coursePeriod majority
+    --  4. replace "rejected" courseValue samples with the calculated average.
+    --     "rejected" samples are samples with the "non-majority" Period value.
+    --  5. calculate average of all 16 samples.
+    --
+    -- An other approach (not implemented) would be to check that each sample
+    -- value is "close" (to be determined) to all other samples. A sample that
+    -- has a significant different value will result in a wrong average!
+    -- The more samples are averaged, the less a big different value will affect
+    -- the averages result, but would require a long word (avoid overflows)!
+    -- Implementation:
+    -- (a) calculate average AVG of all samples.
+    -- (b) test for each sample (TDB is a To-Be-Determined threshold value):
+    --          if (sample < AVG - TBD) or (sample > AVG + TBD) ==> reject
+    -- (c) calculate average of accepted samples.
+
+    if (avgCRSsampleNmbr == 0) then  -- got 16 samples!
+        -- step 1 --
+        index = 0
+        countPeriod0 = 0
+        countPeriod1 = 0
+        while (index < 16) loop
+            if (CRSsetPeriod[index] == 1) then
+                countPeriod1 = countPeriod1 + 1
+            else
+                countPeriod0 = countPeriod0 + 1
+            end if
+            index = index + 1
+        end loop
+        -- step 2 --
+        if (countPeriod1 > countPeriod0) then
+            majorityPeriod = 1
+        else
+            majorityPeriod = 0
+        end if
+        -- step 3 --
+        index = 0
+        avg4  = 0
+        avgCount = 0
+        while (index < 16) loop
+            if (CRSsetPeriod[index] == majorityPeriod) then
+                if (avgCount < 4) then
+                    avg4 = avg4 + CRSsetSamples[index]
+                    avgCount = avgCount + 1
+                end if
+            end if
+            index = index + 1
+        end loop
+        avg4 = avg4 >> 2  -- average of 4 "correct" samples
+        -- step 4 & 5 --
+        index = 0
+        value = 0
+        while (index < 16) loop
+            if (CRSsetPeriod[index] == majorityPeriod) then
+                value = value + CRSsetSamples[index]
+            else
+                value = value + avg4
+            end if
+            index = index + 1
+        end loop
+        value = value >> 4    -- value range : { 0 .. sinCosCrossOver4 }
+
+        -- avoid "jitter and noise" : determine upper & lower threshold value
+        -- assume new value is almost identical (within threshold) -> no update
+
+        outsideThreshold = TRUE   -- default always update (avoid "no response")
+
+        -- Simple check which is OK for values in period 0 and in period 1.
+        -- That is the case when the previous value +/- hysteresis is still
+        -- inside the same period. As the hysteresis value can be set maximum
+        -- at 127, any value higher than 128 or lower than (sinCosCrossOver4)
+        -- minus 128 will always still be in the same period, thus no period
+        -- crossing. Thus, if the period of the previous value is not the same
+        -- as the period of the current value, always do the update.
+
+        if ( (prevAvgCRSvalue < (sinCosCrossOver4 - 128)) &
+             (prevAvgCRSvalue > 127) ) then
+            -- previous value +/- hysteresis *always* in the same period
+            testValueMin = prevAvgCRSvalue - crsNoiseThreshold
+            testValueMax = prevAvgCRSvalue + crsNoiseThreshold
+            if ( (value > testValueMin) &
+                 (value < testValueMax) &
+                 (prevAvgCRSperiod == majorityPeriod) ) then
+                outsideThreshold = FALSE
+            end if
+        end if
+
+        -- Value +/- hysteresis may cause test values to reside in other period.
+
+
+        -- Remark.
+        -- The hysteresis check implemented above covers roughly the CRS range
+        -- between 3°.. 177° and 183°..357°. The code below (commented out)
+        -- should implement hysteresis in the small range around 000° and 180°.
+        -- That code is NOT tested (and probably faulty)!
+        -- In the mentioned small region, the errors occur, so it is probably
+        -- best to send each acquired value (instead of applying the hysteresis)
+        -- which, due to the erroneous behavior, will not work anyway.
+        -- The "receiving side" (PC) may implement some clever algorithm ...
+
+
+        -- Check for possible period crossing around zero.
+;       if (value < 128) then
+            -- define upper limit
+;           testValueMax = prevAvgCRSvalue + crsNoiseThreshold
+
+            -- define lower limit; check whether period crossing is possible
+
+;           if (prevAvgCRSvalue > crsNoiseThreshold) then
+                -- period crossing will NOT occur
+;               testValueMin = prevAvgCRSvalue - crsNoiseThreshold
+;               if ( (value > testValueMin) &
+;                    (value < testValueMax) &
+;                    (prevAvgCRSperiod == majorityPeriod) ) then
+;                   outsideThreshold = FALSE
+;               end if
+;           else
+                -- period crossing occurs, minima overlap: min test not needed
+;               if (value < testValueMax) then
+;                   outsideThreshold = FALSE
+;               end if
+;           end if
+;       end if
+    
+        -- Check for possible period crossing around maximum (sinCosCrossOver4).
+;       if (prevAvgCRSvalue > (sinCosCrossOver4 - 127)) then
+            -- define lower limit -> can never cause period crossing
+;           testValueMin = prevAvgCRSvalue - crsNoiseThreshold
+
+            -- define upper limit; check whether period crossing is possible
+
+;           if ((prevAvgCRSvalue + crsNoiseThreshold) <= sinCosCrossOver4) then
+                -- period crossing will NOT occur
+;               testValueMax = prevAvgCRSvalue + crsNoiseThreshold
+;               if ( (value < testValueMax) &
+;                    (value > testValueMin) &
+;                    (prevAvgCRSperiod == majorityPeriod) ) then
+;                   outsideThreshold = FALSE
+;               end if
+;           else
+                -- period crossing occurs, maxima overlap: max test not needed
+;               if (value < testValueMin) then
+;                   outsideThreshold = FALSE
+;               end if
+;           end if
+;       end if
+
+        -- # debugging output IF enabled
+        if (USBdebugEnabled == TRUE) then
+            if (requestCourseData == TRUE) then
+;                sendDebugString(CRS_AVERAGE)
+;                sendDebugWord(value)
+;                sendDebugChar(",")
+;                sendDebugWord(majorityPeriod)
+;                sendDebugString(COUNT0_TXT)
+;                sendDebugByte(countPeriod0)
+;                sendDebugString(COUNT1_TXT)
+;                sendDebugByte(countPeriod1)
+;                sendDebugChar(" ")
+                requestCourseData = FALSE
+                -- debug trigger for COURSE.JAL (output side)
+                debugCRSoutput = TRUE
+            end if
+        end if
+        -- #
+
+        if (outsideThreshold == TRUE) then
+            prevAvgCRSvalue = value
+            prevAvgCRSperiod = majorityPeriod
+            accNewCRSsetting(value, majorityPeriod)
+        end if
+    end if  -- not yet 16 new samples
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- This procedure is called from readADCchannels().
+-- Input : HDGvalue = 10-bit (signed) sample from the ADC,
+--         thus range is -1023 (-90°) ... +1023 (+90°).
+--
+-- This function stores each analog sample as a SIGNED value in an array.
+--
+-- After each sample is stored, a "moving average" is calculated. Subsequently,
+-- some "noise cancelling" is applied. The amount of noise is defined by the
+-- parameter "hdgNoiseThreshold". If the difference between the previous
+-- averaged value and the new averaged value is less than or equal to that
+-- threshold level, the new value is ignored.
+-- If the new average value is above the threshold, this value is stored in the
+-- queue, and the previous averaged value is updated.
+--
+-- Output: Value range of an entry in the queue: -1023 (-90°) ... +1023 (+90°).
+-- -----------------------------------------------------------------------------
+procedure averageHDGsetting(SWORD in headingValue) is
+  var byte  index, outsideThreshold
+  var sword value
+  var sword testValue, maxValue
+; var word debugWord
+
+    HDGsetSamples[avgHDGsampleNmbr] = headingValue
+    avgHDGsampleNmbr = (avgHDGsampleNmbr + 1) & 0x0F    -- modulo 16
+    --
+    -- calculate "moving average" of the 16 stored samples.
+    -- The HDG setting between 0° and 90° generates an analog output value
+    -- between 0 and 1023 (increasing from 0 to max pos value). The HDG setting
+    -- between 270° and 360° generates an analog output value between -1023
+    -- and 0 (increasing from max neg value to 0). Values for the range 90° to
+    -- 270° the values are identical, but invalid. *** THIS IS NOT DETECTED! ***
+    --
+    index = 0
+    value = 0
+    while (index < 16) loop
+        value = value + HDGsetSamples[index]
+        index = index + 1
+    end loop
+    value = value >> 4    -- >> 4 for divide by 16
+    maxValue = 1023       -- Thus the maximum value is 1023.
+                          -- ### modify hsi2-heading.jal if maximum changes ###
+                          -- ### set definition HEADING_MAX_VALUE correct ! ###
+
+    -- # debugging output IF enabled
+;    if (USBdebugEnabled == TRUE) then
+;        if (requestHeadingData == TRUE) then
+;            sendDebugString(HDG_AVERAGE)
+;            if (value < 0) then
+;                sendDebugChar("-")
+;                debugWord = word(-value)
+;                sendDebugWord(debugWord)
+;            else
+;                sendDebugChar("+")
+;                debugWord = word(value)
+;                sendDebugWord(debugWord)
+;            end if
+;        end if
+;    end if
+    -- #
+
+    -- avoid "jitter and noise" : determine upper & lower threshold value
+    outsideThreshold = FALSE
+
+    -- check against upper threshold value
+    testValue = prevAvgHDGvalue + hdgNoiseThreshold
+    if (testValue > maxValue)  then  testValue = maxValue      end if
+    if (value >= testValue)    then  outsideThreshold = TRUE   end if
+
+    -- check against lower threshold value (only if upper test failed)
+    if (outsideThreshold == FALSE) then
+        testValue = prevAvgHDGvalue - hdgNoiseThreshold
+        if (testValue < (-maxValue))  then  testValue = -maxValue     end if
+        if (value <= testValue)       then  outsideThreshold = TRUE   end if
+    end if
+
+    -- ignore new setting value within +/-(threshold) of previous HDG value
+    if (outsideThreshold == TRUE) then
+        prevAvgHDGvalue = value
+        accNewHDGsetting(value)
+    end if
+
+    -- # debugging output IF enabled
+;    if (USBdebugEnabled == TRUE) then
+;        if (requestHeadingData == TRUE) then
+;            sendDebugString(THRESHOLD)
+;            sendDebugWord(word(hdgNoiseThreshold))
+;            sendDebugString(THRSHOLD_FLAG)
+;            sendDebugByte(outsideThreshold)
+;        end if
+;    end if
+    -- #
+end procedure
+
+
+
+
+-- ##################### DEBUG  OUTPUT  ####################### --
+-- one-liner for each CRS sample (called from readADCchannels): --
+-- Case-x CRSsin/CRScos=xxxx xxxx CrossOver1/2/4=xxxx xxxx xxxx --
+--        CRSvalue=xxxx CRSperiod=xxxx                          --
+--
+;const byte CASE_TXT[]    = {0x0D, 0x0A,"c","a","s","e","-","!"}
+;const byte CRS_SIN_COS[] = {" ","C","R","S","s","i","n","/","C","R","S",
+;                            "c","o","s","=","!"}
+;const byte CROSSOVERS[]  = {" ","C","r","o","s","s","O","v","e","r","1","/",
+;                            "2","/","4","=","!"}
+;
+;procedure CRSdebug(BYTE in case, WORD in CRSsin, WORD in CRScos,
+;                   WORD in CRSvalue, WORD in CRSperiod) is
+;    if (USBdebugEnabled == TRUE) then
+;        if (requestCourseData == TRUE) then
+;            sendDebugString(CASE_TXT)
+;            sendDebugChar(case)
+;            sendDebugString(CRS_SIN_COS)
+;            sendDebugWord(CRSsin)
+;            sendDebugChar("/")
+;            sendDebugWord(CRScos)
+;            sendDebugString(CROSSOVERS)
+;            sendDebugWord(sinCosCrossOver1)
+;            sendDebugChar("/")
+;            sendDebugWord(sinCosCrossOver2)
+;            sendDebugChar("/")
+;            sendDebugWord(sinCosCrossOver4)
+;            sendDebugString(CRS_VALUE)
+;            sendDebugWord(CRSvalue)
+;            sendDebugString(CRS_PERIODTXT)
+;            sendDebugWord(CRSperiod)
+;        end if
+;    end if
+;end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- read ADC channels (based on timer) - called from main()
+--   analog channel 0 : heading reference marker
+--   analog channel 1 : course SIN
+--   analog channel 2 : course COS
+--
+-- In combination with the analog signal(s), the digital signals are read.
+-- These digital signals define the phase relation of the analog signal with
+-- respect to the 115V AC reference signal (for heading and course). For the
+-- course signal the relation between the sine and cosine must also be observed.
+-- -----------------------------------------------------------------------------
+procedure readADCchannels() is
+  var word  HDGvalue, CRSsin, CRScos, CRSvalue, CRSperiod
+  var word  debugWord
+  var sword value
+
+    if ( check_delay(READ_ADC_SLOT) ) then
+        --
+        if (getAnalogSource == GET_COURSE_DATA) then
+            getAnalogSource = GET_HEADING_DATA
+            if (PWR_PRESENT == PWR_115VAC_ON) then
+                -- analog values only valid if 115V AC 400 Hz is ON
+                -- process COURSE inputs
+                CRSsin = adc_read_high_res(1)
+                CRScos = adc_read_high_res(2)
+
+                if (sinCosAlignActive == FALSE) then
+--
+--               |   [N]   [E]   |   [E]   [S]   |   [S]   [W]   |   [W]   [N]
+--               |   000°..090°  |   090°..180°  |   180°..270°  |   270°..360°
+--   ===========================================================================
+--   CRS_INPHASE | CRS_PHASE_000 | CRS_PHASE_000 | CRS_PHASE_180 | CRS_PHASE_180
+--   CRSQUADRANT | CRS_1ST_QUAD  | CRS_2ND_QUAD  | CRS_1ST_QUAD  | CRS_2ND_QUAD
+--   ---------------------------------------------------------------------------
+--   CRSperiod   |       0       |       0       |       1       |       1
+--   octant      |     1 , 2     |     3 , 4     |     5 , 6     |     7 , 8
+--   ---------------------------------------------------------------------------
+--
+                    -- To identify the range 000-180 or 180-360, CRSperiod is
+                    -- also be stored (and "averaged"). This will result in a
+                    -- possible small jitter around 000° and 180°.
+--
+                    if (CRS_INPHASE == CRS_PHASE_000) then
+                        --
+                        -- range span is 000° ... 090° ... 180°
+                        --
+                        CRSperiod = 0
+                        if (CRSQUADRNT == CRS_1ST_QUAD) then
+                            -- range span is 000° ... 090°
+                            if (CRSsin < sinCosCrossOver1) then
+                                CRSvalue = CRSsin
+                            else
+                                CRSvalue = sinCosCrossOver2 - CRScos
+                            end if
+                            ;CRSdebug("1", CRSsin, CRScos, CRSvalue, CRSperiod)
+                        else  -- CRSQUADRNT == CRS_2ND_QUAD
+                            -- range span is 090° ... 180°
+                            if (CRScos < sinCosCrossOver1) then
+                                CRSvalue = sinCosCrossOver2 + CRScos
+                            else
+                                CRSvalue = sinCosCrossOver4 - CRSsin
+                            end if
+                            ;CRSdebug("2", CRSsin, CRScos, CRSvalue, CRSperiod)
+                        end if
+                        --
+                    else  -- CRS_INPHASE == CRS_PHASE_180
+                        --
+                        -- range span is 180° ... 270° ... 360°
+                        --
+                        CRSperiod = 1
+                        if (CRSQUADRNT == CRS_1ST_QUAD) then
+                            -- range span is 180° ... 270°
+                            if (CRSsin < sinCosCrossOver1) then
+                                CRSvalue = sinCosCrossOver4 - CRSsin
+                            else
+                                CRSvalue = sinCosCrossOver2 + CRScos
+                            end if
+                            ;CRSdebug("3", CRSsin, CRScos, CRSvalue, CRSperiod)
+                        else  -- CRSQUADRNT == CRS_2ND_QUAD
+                            -- range span is 270° ... 360°
+                            if (CRScos < sinCosCrossOver1) then
+                                CRSvalue = sinCosCrossOver2 - CRScos
+                            else
+                                CRSvalue = CRSsin
+                            end if
+                            ;CRSdebug("4", CRSsin, CRScos, CRSvalue, CRSperiod)
+                        end if
+                        --
+                        -- max ADC input voltages is trimmed to 4.9V
+                        -- However, the ADC will output 1023 at 5.0V
+                        -- Thus, the max output is 4900*1023/5000=1002
+                        -- Sin/Cos cross-over (at 45°) is sqrt(2)/2 * 1002 = 708
+                        -- The value 708 is the variable sinCosCrossOver1
+                        --
+                        -- CRSvalue will be as follows:           CRSperiod
+                        --  octant 1 :    0 ...  707 (using sin)      0
+                        --  octant 2 :  708 ... 1415 (using cos)      0
+                        --  octant 3 : 1416 ... 2123 (using cos)      0
+                        --  octant 4 : 2124 ... 2832 (using sin)      0
+                        --  octant 5 : 2831 ... 2124 (using sin)      1
+                        --  octant 6 : 2123 ... 1416 (using cos)      1
+                        --  octant 7 : 1415 ...  708 (using cos)      1
+                        --  octant 8 :  707 ...    0 (using sin)      1
+                        --
+                    end if
+                    -- average setting, store in queue & turn off debug output
+                    averageCRSsetting(CRSvalue, CRSperiod)
+
+                else  --  (sinCosAlignActive == TRUE)
+                    -- store sin and cos directly in queue!
+                    accNewCRSsetting(CRSsin, CRScos)
+                end if
+
+            else  -- PWR_PRESENT != PWR_115VAC_ON
+                -- 115V AC not present => no valid reading :: set to 0
+                CRSvalue = 0
+                CRSperiod = word(CRS_PHASE_000)
+                -- # debugging output IF enabled
+                ;if (USBdebugEnabled == TRUE) then
+                ;    if (requestCourseData == TRUE) then
+                ;        sendDebugNewLine()
+                ;        sendDebugString(PWR115OFF)
+                ;    end if
+                ;end if
+                -- #
+                -- average setting, store in queue & turn off debug output
+                averageCRSsetting(CRSvalue, CRSperiod)
+            end if
+        else
+            -- process HEADING inputs
+            getAnalogSource = GET_COURSE_DATA
+            if (PWR_PRESENT == PWR_115VAC_ON) then
+                -- analog values only valid if 115V AC 400 Hz is ON
+                HDGvalue = adc_read_high_res(0)
+                if (HDG_INPHASE == HDG_PHASE_180) then
+                    value = sword(HDGvalue)
+                else
+                    value = -(sword(HDGvalue))
+                end if
+                -- # debugging output IF enabled
+                ;if (USBdebugEnabled == TRUE) then
+                ;    if (requestHeadingData == TRUE) then
+                ;        sendDebugNewLine()
+                ;        sendDebugString(HDGPWR115ON)
+                ;        sendDebugWord(HDGvalue)
+                ;        sendDebugString(HDGINPHASE)
+                ;        sendDebugByte(HDG_INPHASE)
+                ;        sendDebugString(HDGSETVALUE)
+                ;        if (HDG_INPHASE == HDG_PHASE_180) then
+                ;            sendDebugChar("+")
+                ;            debugWord = word(value)
+                ;            sendDebugWord(debugWord)
+                ;        else
+                ;            sendDebugChar("-")
+                ;            debugWord = word(-value)
+                ;            sendDebugWord(debugWord)
+                ;        end if
+                ;    end if
+                ;end if
+                -- #
+
+                -- average setting and store in queue
+                averageHDGsetting(value)
+
+                -- # debugging output IF enabled
+                ;if (USBdebugEnabled == TRUE) then
+                ;    if (requestHeadingData == TRUE) then
+                ;        requestHeadingData = FALSE
+                ;    end if
+                ;end if
+                -- # debugging output IF enabled
+
+            else  -- PWR_PRESENT != PWR_115VAC_ON
+                -- 115V AC not present => no valid reading :: set to 0
+                value = 0
+                -- # debugging output IF enabled
+                ;if (USBdebugEnabled == TRUE) then
+                ;    if (requestHeadingData == TRUE) then
+                ;        sendDebugNewLine()
+                ;        sendDebugString(PWR115OFF)
+                ;    end if
+                ;end if
+                -- #
+
+                -- average setting and store in queue
+                averageHDGsetting(value)
+
+                -- # debugging output IF enabled
+                ;if (USBdebugEnabled == TRUE) then
+                ;    if (requestHeadingData == TRUE) then
+                ;        requestHeadingData = FALSE
+                ;    end if
+                ;end if
+                -- # debugging output IF enabled
+
+            end if
+        end if
+        set_delay(READ_ADC_SLOT, 10)       -- restart timer
+    end if
+end procedure
+

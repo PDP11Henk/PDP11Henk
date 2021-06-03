@@ -1,0 +1,160 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-doa
+--
+--    this module contains the INT interrupt routine for the DOA clock and data
+--    input of the PHCC DOA protocol and the actual data reception from bit to
+--    assembled data bytes.
+--    Output: - DOAcmdReceived : flag to indicate valid data packet received
+--            - deviceAddress  : DOA_address
+--            - subaddress     : DOA_subaddr
+--            - databyte       : DOA_databyte
+
+-- The receiveDOA (interrupt) routine processes each data bit as it is received.
+-- The bits are combined to bytes, representing a device address, subaddress and
+-- databyte of a DOA packet.
+-- When a complete packet is received, the device address and subaddress are
+-- examined.
+-- If the device address is the "HSI #2" device address AND the subaddress is
+-- valid, the flag byte DOAcmdReceived is set, else this is a DOA message not
+-- specific for the HSI_2 and the flag byte DOAcmdReceived is not set.
+
+
+var byte   DOA_address             -- DOA IRQ routine device address
+var byte   DOA_subaddr             -- DOA IRQ device sub address
+var byte   DOA_databyte            -- DOA IRQ data
+var byte   bitcounter              -- DOA IRQ count for received bits
+var byte   DOA_RXstate             -- DOA IRQ protocol RX byte state
+const byte DOA_STATE_ADDRESS  = 0  -- DOA receiver state machine state
+const byte DOA_STATE_SUBADRS  = 1
+const byte DOA_STATE_DATA     = 2
+
+var byte   DOAcmdReceived          -- flag: DOA valid command received
+var byte   deviceaddress           -- DOA received device address
+var byte   subaddress              -- DOA received sub-address
+var byte   databyte                -- DOA received data byte
+
+
+procedure initDOA() is
+    DOA_address    = 0
+    DOA_subaddr    = 0
+    DOA_databyte   = 0
+    bitcounter     = 7
+    DOAcmdReceived = FALSE
+    DOA_RXstate    = DOA_STATE_ADDRESS    -- receive state machine initial state
+end procedure
+
+
+
+procedure receiveDOA() is
+   if (wtchdogState == WTCHDOG_ENABLED) then
+      set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)     -- protocol watchdog
+   end if
+
+   case DOA_RXstate of
+
+       DOA_STATE_ADDRESS :
+          block
+             if (diagLEDuse == DIAGLED_DOA_CHK) then
+                if (bitcounter == 7) then
+                  -- indicate start of DOA reception cycle
+                  DIAGLED = LED_ON
+                end if
+             end if
+             if (DOA_DATA) then
+                DOA_address = DOA_address + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_address = DOA_address >> 1
+                bitcounter = bitcounter - 1
+             else
+                bitcounter = 5
+                DOA_subaddr = 0
+                DOA_RXstate = DOA_STATE_SUBADRS
+             end if
+          end block
+
+       DOA_STATE_SUBADRS :
+          block
+             if (DOA_DATA) then
+                DOA_subaddr = DOA_subaddr + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_subaddr = DOA_subaddr >> 1
+                bitcounter = bitcounter - 1
+             else
+                DOA_subaddr = DOA_subaddr >> 2
+                bitcounter = 7
+                DOA_databyte = 0
+                DOA_RXstate = DOA_STATE_DATA
+             end if
+          end block
+
+       DOA_STATE_DATA :
+          block
+             if (DOA_DATA) then
+                DOA_databyte = DOA_databyte + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_databyte = DOA_databyte >> 1
+                bitcounter = bitcounter - 1
+             else
+                -- byte received ==> process received data packet
+                if (diagLEDuse == DIAGLED_DOA_CHK) then
+                   -- indicate end of DOA reception cycle
+                   DIAGLED = LED_OFF
+                end if
+                if (DOA_address == HSI_DEVICE_ADDR_2) then
+                   if (DOA_subaddr <= CMD_LASTVAL) then
+                      -- for HSI #2 and subaddress in valid range
+                      -- store data & accept command
+                      DOA_RXstate    = DOA_STATE_ADDRESS
+                      bitcounter     = 7
+                      deviceAddress  = DOA_address
+                      subaddress     = DOA_subaddr
+                      databyte       = DOA_databyte
+                      DOA_address    = 0
+                      DOA_subaddr    = 0
+                      DOA_databyte   = 0
+                      DOAcmdReceived = TRUE
+                   else
+                      -- for HSI #2, but subaddress not valid --> ??? reject
+                      DOA_RXstate  = DOA_STATE_ADDRESS
+                      bitcounter   = 7
+                      DOA_address  = 0
+                      DOA_subaddr  = 0
+                      DOA_databyte = 0
+                   end if
+                else
+                   -- DOA_address != HSI_DEVICE_ADDR_2 --> not for HSI #2 : skip
+                   DOA_RXstate  = DOA_STATE_ADDRESS
+                   bitcounter   = 7
+                   DOA_address  = 0
+                   DOA_subaddr  = 0
+                   DOA_databyte = 0
+                end if
+             end if
+          end block
+
+      otherwise
+          block
+             -- should never occur ...!
+             bitcounter   = 7
+             DOA_address  = 0
+             DOA_subaddr  = 0
+             DOA_databyte = 0
+             DOA_RXstate  = DOA_STATE_ADDRESS
+          end block
+   end case
+end procedure
+
+
+procedure processDOAinterrupt is
+   -- called from interrupt service routine
+   receiveDOA()
+   INTCON3_INT2IF = 0           -- clear INT2 external interrupt flag
+   INTCON3_INT2IE = 1           -- enable INT2 external interrupt
+end procedure
+

@@ -1,0 +1,196 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Horizontal Situation Indicator (HSI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-heading
+--
+--    this module contains the routines to output the heading marker setpoint,
+--    also known as the "Captain's bug", as an analog value using a DAC, and as
+--    a USB message (if enabled).
+-- -----------------------------------------------------------------------------
+
+include hsi2-arcsin
+
+var   sword prevHeadingValue
+
+const sword HEADING_MAX_VALUE = 1023        -- #### max defined in hsi2-adc.jal
+
+
+
+procedure initHDGsettingOutput() is
+    prevHeadingValue = 9999                 -- init with "impossible" HDG value
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Convert numeric signed heading value to an angle.
+-- The conversion uses an arcsin lookup table of X entries. "X" depends on the
+-- maximum defined in hsi2-adc.jal. X is 1023 (10-bits).
+-- The entry values are *words* in the range 0 .. 1023.
+-- The range 0 .. 1023 represents an angle value between 0 .. 90°.
+-- -----------------------------------------------------------------------------
+function convertHeading(SWORD in headingValue) return WORD is
+  var word value
+  var word headingAngle
+
+    if (headingValue >= 0) then
+        value = word(headingValue)
+    else
+        value = word(-headingValue)
+    end if
+
+    headingAngle = arcsin[value]   -- retrieve arcsin(10_bit_value)
+    return headingAngle
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- Output heading data to the DAC
+--
+--   parameter in : signed word heading value (-1023 .. 0 .. +1023)
+--   parameter out: -
+--
+-- Optionally, the signed heading *value* is converted to a heading *angle*.
+-- {0 .. 1023} representing -90° .. +90°.
+-- -----------------------------------------------------------------------------
+procedure outputHDGtoDAC(SWORD in headingValue) is
+  var word  hdgValueToDAC
+
+    if (hdgConvertToDegree == TRUE) then
+        hdgValueToDAC = convertHeading(headingValue)
+        -- DAC output only positive value: shift looked-up angle
+        -- if heading value is positive, angle range => 1023 .. 2046
+        if (headingValue >= 0) then
+            hdgValueToDAC = HEADING_MAX_VALUE + hdgValueToDAC
+        else
+            -- if heading range negative, invert and angle range => 1023 .. 0
+            hdgValueToDAC = HEADING_MAX_VALUE - hdgValueToDAC
+        end if
+        -- modify to 10-bit for DAC output: range 0 .. 1023
+        hdgValueToDAC = hdgValueToDAC >> 1
+
+    else
+        -- "raw" signed value (no angle look-up conversion)
+        -- convert value range (-1023 .. 0 .. +1023) to DAC value (0 .. 1023)
+        -- step 1: convert range -1023 .. +1023 to positive only: 0 .. 2046
+        -- ### test result
+        -- ### connected a trimpot to the ADC heading input (AN2)
+        -- ### with HDG_INPHASE connected to GND the trimpot range is 000 -> 3FF
+        -- ### with HDG_INPHASE connected to +5V the trimpot range is C01 -> 000
+
+        hdgValueToDAC = word(headingValue + HEADING_MAX_VALUE)
+
+        -- step 2: scale to 10-bit DAC
+        hdgValueToDAC = hdgValueToDAC >> 1        -- 0 .. 2046 => 0 .. 1023
+    end if
+    if (hdgValueToDAC > 1023) then                -- just in case I goofed up!
+        hdgValueToDAC = 1023
+    end if
+
+    storeNewValue(hdgValueToDAC, HDG_VALUE_ID)
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Send heading data to the USB port
+--
+--   parameter in : signed word heading value
+--   parameter out: -
+--
+-- Optionally, the signed heading *value* is converted to a heading angle
+-- {0 .. 1023} representing -90° .. +90°.
+-- Note. The data is not directly sent to the USB port, but to a routine that
+--       checks the "action". When the action is SEND_ON_TIMER, the data is
+--       stored in a data packet (that also contains the course setting). Based
+--       on a timer the data packet is sent to the USB port. When the action is
+--       SEND_NOW, the data is stored in the same packet, but the data packet is
+--       sent immediately (bypassing the timer).
+-- -----------------------------------------------------------------------------
+procedure sendHDGtoUSB(SWORD in headingValue, BYTE in action) is
+  var word  hdgValueToSend
+
+    if (hdgConvertToDegree == TRUE) then
+        hdgValueToSend = convertHeading(headingValue)
+        -- correct period
+        if (headingValue < 0) then
+            hdgValueToSend = word(-hdgValueToSend)
+        end if
+
+    else
+        -- "raw" signed value (no angle look-up conversion)
+
+        hdgValueToSend = word(headingValue)
+    end if
+    -- store data in USBpacket
+    sendDataToUSB(hdgValueToSend, HDG_VALUE_ID, action)
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Process heading marker setpoint ("Captain's bug")
+--
+--   parameter in : -
+--   parameter out: -
+--   description  : last heading setpoint is retrieved from the queue. Note that
+--                  the retrieved value may be identical to the previous one.
+--                  The value is optionally converted to an angle (degrees).
+--
+--                  The heading value is stored in the DAC output packet. The
+--                  DAC output handler takes care of SPI data transmission.
+--
+--                  The heading value is also sent to the USB output.
+--   called from main()
+-- -----------------------------------------------------------------------------
+procedure processHDGsetting() is
+  var sword headingValue
+
+    -- retrieve *signed* HDG value {maximum -1023 .. +1023} from queue.
+    -- the *actual* maximum +/- value is defined in hsi2-adc.jal
+    -- The heading value (negative/positive number) is converted to a DAC value
+    -- which can only be a positive (10-bit) number.
+    -- note: a heading value is always available, may be same as previous value,
+    -- in that case, the (identical) value is NOT output to the DAC. The value
+    -- is also sent to the USB port depending on the sendUSBmethod setting, even
+    -- when the value is identical to the previous value.
+
+    headingValue = getNewHDGsetting()
+
+    -- output to DAC: only when value has changed
+    if (headingValue != prevHeadingValue) then
+        outputHDGtoDAC(headingValue)
+    end if
+    
+    -- output via USB
+    case (sendUSBmethod) of
+        SEND_USB_REQUEST : block
+            if (requestHeadingData == TRUE) then
+                requestHeadingData = FALSE
+                sendHDGtoUSB(headingValue, SEND_NOW)
+            end if
+        end block
+
+        SEND_USB_CHANGE : block
+            if (prevHeadingValue != headingValue) then
+                sendHDGtoUSB(headingValue, SEND_ON_TIMER)
+            end if
+        end block
+
+        SEND_USB_ALWAYS : block
+                sendHDGtoUSB(headingValue, SEND_ON_TIMER)
+        end block
+
+        -- ignore everything else (SEND_USB_NEVER or bad value)
+        otherwise block
+            -- do nothing
+        end block
+    end case
+
+    prevHeadingValue = headingValue
+end procedure
+

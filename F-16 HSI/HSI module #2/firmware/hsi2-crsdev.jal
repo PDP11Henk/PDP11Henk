@@ -1,0 +1,29 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Horizontal Situation Indicator (HSI) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-crsdev
+--
+--    this module contains the routines for the HSI Course Deviation Indicator,
+--    CDI. The CDI is a pointer that (when not used) is in its center position.
+--    Depending on the (glide path) course deviation, the pointer moves to the
+--    left or the right, indicating how *much* the deviation is, and to which
+--    *side*. Therefore, the output signal must be able to drive "negative" and
+--    "positive". This bipolar voltage is created using an DAC followed by a
+--    a level-shift OpAmp ( 0.. 5V => -2.5 .. +2.5V), followed by an amplifier
+--    and buffer.
+
+
+-- -----------------------------------------------------------------------------
+-- update COURSE DEVIATION indication
+-- (called from main)
+-- -----------------------------------------------------------------------------
+procedure processCDIsetpoint() is
+  var word setpoint
+
+    setpoint = getNewCDIsetpoint()
+    if (setpoint != NO_NEW_SETPOINT) then
+        storeNewValue(setpoint, CDI_VALUE_ID)
+    end if
+end procedure
+

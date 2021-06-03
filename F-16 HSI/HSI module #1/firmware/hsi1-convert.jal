@@ -1,0 +1,340 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #1
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi1-convert
+--
+--    this module contains the conversion of a setpoint to synchro stator
+--    signals, and the main synchro position update routines.
+
+include hsi1-sinelog         -- sine logarithmic lookup 0° - 180° (512 entries)
+include hsi1-dacs            -- DAC analog control voltage for VCA amplitudes
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- convert an angle (10-bit sized) to a 10-bit sine value (V2164 log corrected)
+--
+-- one-liner debug output for MILES:
+-- convert angle=xxxx base=xxxx pol=xx sine=xxxx ampl=xxxx
+-- -----------------------------------------------------------------------------
+
+    -- global variables to pass angle calculation results to caller
+var word  amplitude
+var byte  polarity
+
+
+const byte CNV_ANGLE[]    = {0x0D,0x0A,
+                             "c","o","n","v","e","r","t",
+                             " ","a","n","g","l","e","=","!"}
+const byte CNV_BASE[]     = {" ","b","a","s","e","=","!"}
+const byte CNV_POLARITY[] = {" ","p","o","l","=","!"}
+const byte CNV_SINE[]     = {" ","s","i","n","e","=","!"}
+const byte CNV_AMPL[]     = {" ","a","m","p","l","=","!"}
+
+procedure convert10bitAngle(WORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 1023.
+  ; This range (0 - 1023) represents 0° to 360° rotation of the synchro.
+  ; The value is converted to a look-up value for a "half-sine" (thus 9-bit).
+  ; The first half sine period is equal to the second half, except for polarity.
+
+var word baseAngle, sineValue
+
+  -- get "base" angle :: always in first half of sine wave for table lookup
+  if (angle < 512) then
+     baseAngle = angle
+     polarity = 1                       -- sine value is positive
+  else
+     baseAngle = 512 - (1024 - angle)
+     if (baseAngle == 512) then
+        baseAngle = 0
+     end if
+     polarity = 0                       -- sine value is negative
+  end if
+
+  sineValue = sineLog[baseAngle]        -- retrieve sine value (V2164 corrected)
+
+  -- the higher the sine value, the lower the VCA control voltage must be
+  -- VCA control voltage 0V => attenuation = 0 dB  (gain = 1)
+  -- VCA control voltage 1V => attenuation ~ 30 dB (gain = 1/1000)
+  amplitude = 1023 - sineValue
+  
+  -- # debug output IF enabled
+  if (USBdebugEnabled == TRUE) then
+     sendDebugString(CNV_ANGLE)
+     sendDebugWord(angle)
+     sendDebugString(CNV_BASE)
+     sendDebugWord(baseAngle)
+     sendDebugString(CNV_POLARITY)
+     sendDebugByte(polarity)
+     sendDebugString(CNV_SINE)
+     sendDebugWord(sineValue)
+     sendDebugString(CNV_AMPL)
+     sendDebugWord(amplitude)
+  end if
+        -- #
+
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- set BEARING, HEADING, MILES[1|2|3]
+-- BEARING and HEADING
+--    accept a 10-bit setpoint angle where 0 :: 0° and 1023 :: 360°.
+--    sine lookup table is used to retrieve the individual stator amplitudes.
+--    As the angle varies from 0 to 1023 for one full sine wave, one "half"
+--    spans a range of 512 values. Therefore, the sine table has 512 entries,
+--    and returns a value between 0 and 1023 (10-bit synchro stator amplitude).
+-- MILES (1-2-3)
+--    identical to HEADING and BEARING, but the setpoint value is a byte value
+--    shifted by 2 bit positions (0 .. 255) << 2.
+-- -----------------------------------------------------------------------------
+
+procedure setBearing(WORD in setAngle) is
+  var word s1Angle, s2Angle, s3Angle
+
+  s1Angle = setAngle + brgS1Offset
+  s2Angle = setAngle + brgS2Offset
+  s3Angle = setAngle + brgS3Offset
+
+  -- normalize to base value
+  if (s1Angle >= 1024) then s1Angle = s1Angle - 1024  end if   ; 1024 == 0
+  if (s2Angle >= 1024) then s2Angle = s2Angle - 1024  end if
+  if (s3Angle >= 1024) then s3Angle = s3Angle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(s1Angle)
+  bearingAmplitudeS1 = amplitude
+  bearingPolarityS1  = polarity
+
+  convert10bitAngle(s2Angle)
+  bearingAmplitudeS2 = amplitude
+  bearingPolarityS2  = polarity
+
+  convert10bitAngle(s3Angle)
+  bearingAmplitudeS3 = amplitude
+  bearingPolarityS3  = polarity
+
+  -- output to bearing indicator
+  bearingSetpoint( bearingAmplitudeS1, bearingAmplitudeS2, bearingAmplitudeS3,
+                   bearingPolarityS1,  bearingPolarityS2,  bearingPolarityS3  )
+end procedure
+
+
+
+procedure setHeading(WORD in setAngle) is
+  var word s1Angle, s2Angle, s3Angle
+
+  s1Angle = setAngle + hdgS1Offset
+  s2Angle = setAngle + hdgS2Offset
+  s3Angle = setAngle + hdgS3Offset
+
+  -- normalize to base value
+  if (s1Angle >= 1024) then s1Angle = s1Angle - 1024  end if   ; 1024 == 0
+  if (s2Angle >= 1024) then s2Angle = s2Angle - 1024  end if
+  if (s3Angle >= 1024) then s3Angle = s3Angle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(s1Angle)
+  headingAmplitudeS1 = amplitude
+  headingPolarityS1  = polarity
+
+  convert10bitAngle(s2Angle)
+  headingAmplitudeS2 = amplitude
+  headingPolarityS2  = polarity
+
+  convert10bitAngle(s3Angle)
+  headingAmplitudeS3 = amplitude
+  headingPolarityS3  = polarity
+
+  -- output to heading indicator
+  headingSetpoint( headingAmplitudeS1, headingAmplitudeS2, headingAmplitudeS3,
+                   headingPolarityS1,  headingPolarityS2,  headingPolarityS3  )
+end procedure
+
+
+
+procedure calcMiles1(WORD in setAngle) is
+  var word sxAngle, syAngle
+
+  sxAngle = setAngle + miles1OffsetX
+  syAngle = setAngle + miles1OffsetY
+
+  -- normalize to base value
+  if (sxAngle >= 1024) then sxAngle = sxAngle - 1024  end if   ; 1024 == 0
+  if (syAngle >= 1024) then syAngle = syAngle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(sxAngle)
+  miles1AmplitudeX = amplitude
+  miles1PolarityX  = polarity
+
+  convert10bitAngle(syAngle)
+  miles1AmplitudeY = amplitude
+  miles1PolarityY  = polarity
+end procedure
+
+
+
+procedure setMiles1(WORD in setAngle) is
+  if (setAngle == MILES_LOW_POWER) then
+      miles1Setpoint( 1023, 1023, 0, 0 )
+  else
+      calcMiles1(setAngle)
+      miles1Setpoint( miles1AmplitudeX, miles1AmplitudeY,
+                      miles1PolarityX,  miles1PolarityY  )
+  end if
+end procedure
+
+
+
+procedure calcMiles2(WORD in setAngle) is
+  var word sxAngle, syAngle
+
+  sxAngle = setAngle + miles2OffsetX
+  syAngle = setAngle + miles2OffsetY
+
+  -- normalize to base value
+  if (sxAngle >= 1024) then sxAngle = sxAngle - 1024  end if   ; 1024 == 0
+  if (syAngle >= 1024) then syAngle = syAngle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(sxAngle)
+  miles2AmplitudeX = amplitude
+  miles2PolarityX  = polarity
+
+  convert10bitAngle(syAngle)
+  miles2AmplitudeY = amplitude
+  miles2PolarityY  = polarity
+end procedure
+
+
+
+procedure setMiles2(WORD in setAngle) is
+  if (setAngle == MILES_LOW_POWER) then
+      miles2Setpoint( 1023, 1023, 0, 0 )
+  else
+      calcMiles2(setAngle)
+      miles2Setpoint( miles2AmplitudeX, miles2AmplitudeY,
+                      miles2PolarityX,  miles2PolarityY  )
+  end if
+end procedure
+
+
+
+procedure calcMiles3(WORD in setAngle) is
+  var word sxAngle, syAngle
+
+  sxAngle = setAngle + miles3OffsetX
+  syAngle = setAngle + miles3OffsetY
+
+  -- normalize to base value
+  if (sxAngle >= 1024) then sxAngle = sxAngle - 1024  end if   ; 1024 == 0
+  if (syAngle >= 1024) then syAngle = syAngle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(sxAngle)
+  miles3AmplitudeX = amplitude
+  miles3PolarityX  = polarity
+
+  convert10bitAngle(syAngle)
+  miles3AmplitudeY = amplitude
+  miles3PolarityY  = polarity
+end procedure
+
+
+
+procedure setMiles3(WORD in setAngle) is
+  if (setAngle == MILES_LOW_POWER) then
+      miles3Setpoint( 1023, 1023, 0, 0 )
+  else
+      calcMiles3(setAngle)
+      miles3Setpoint( miles3AmplitudeX, miles3AmplitudeY,
+                      miles3PolarityX,  miles3PolarityY  )
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- activate (new) setpoint for BEARING, HEADING, MILES[1|2|3] from cyclic buffer
+-- called from main()
+-- output a new setpoint only if no previous setpoint output is in progress!
+-- -----------------------------------------------------------------------------
+
+procedure updBearingPosition() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewBearingSetpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setBearing(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+procedure updHeadingPosition() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewHeadingSetpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setHeading(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+procedure updMiles1Position() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewMiles1Setpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setMiles1(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+procedure updMiles2Position() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewMiles2Setpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setMiles2(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+procedure updMiles3Position() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewMiles3Setpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setMiles3(setpoint)
+      end if
+  end if
+end procedure
+

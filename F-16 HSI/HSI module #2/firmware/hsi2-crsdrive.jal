@@ -1,0 +1,114 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #2
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi2-crsdrive
+--
+--    this module contains the conversion of a setpoint to synchro stator
+--    signals for the COURSE drive synchro, and the position update routines.
+
+include hsi2-sinelog         -- sine logarithmic lookup 0° - 180° (512 entries)
+include hsi2-dacs            -- DAC analog control voltage for VCA amplitudes
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- convert a 10-bit angle to a 10-bit sine value
+-- -----------------------------------------------------------------------------
+
+    -- global variables to pass angle calculation results to caller
+var word  amplitude
+var byte  polarity
+
+
+
+procedure convert10bitAngle(WORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 1023.
+  ; This range (0 - 1023) represents 0° to 360° rotation of the synchro.
+  ; The value is converted to a look-up value for a "half-sine" (thus 9-bit).
+  ; The first half sine period is equal to the second half, except for polarity.
+
+var word baseAngle, sineValue
+
+  -- get "base" angle :: always in first half of sine wave for table lookup
+  if (angle < 512) then
+     baseAngle = angle
+     polarity = 1                       -- sine value is positive
+  else
+     baseAngle = 512 - (1024 - angle)
+     if (baseAngle == 512) then
+        baseAngle = 0
+     end if
+     polarity = 0                       -- sine value is negative
+  end if
+
+  ; sineValue = sine9bit[baseAngle]     -- will give a distorted sine wave shape
+  sineValue = sineLog[baseAngle]        -- retrieve sine value (V2164 corrected)
+
+  -- the higher the sine value, the lower the VCA control voltage must be
+  -- VCA control voltage 0V => attenuation = 0 dB  (gain = 1)
+  -- VCA control voltage 1V => attenuation ~ 30 dB (gain = 1/1000)
+  amplitude = 1023 - sineValue
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- set COURSE drive
+--    accept a 10-bit setpoint angle where 0 :: 0° and 1023 :: 360°.
+--    sine lookup table is used to retrieve the individual stator amplitudes.
+--    As the angle varies from 0 to 1023 for one full sine wave, one "half"
+--    spans a range of 512 values. Therefore, the sine table has 512 entries,
+--    and returns a value between 0 and 1023 (10-bit synchro stator amplitude).
+-- -----------------------------------------------------------------------------
+
+procedure setCrsDrive(WORD in setAngle) is
+  var word s1Angle, s2Angle, s3Angle
+
+  s1Angle = setAngle + crsDriveS1Offset
+  s2Angle = setAngle + crsDriveS2Offset
+  s3Angle = setAngle + crsDriveS3Offset
+
+  -- normalize to base value
+  if (s1Angle >= 1024) then s1Angle = s1Angle - 1024  end if   ; 1024 == 0
+  if (s2Angle >= 1024) then s2Angle = s2Angle - 1024  end if
+  if (s3Angle >= 1024) then s3Angle = s3Angle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(s1Angle)
+  crsDriveAmplitudeS1 = amplitude
+  crsDrivePolarityS1  = polarity
+
+  convert10bitAngle(s2Angle)
+  crsDriveAmplitudeS2 = amplitude
+  crsDrivePolarityS2  = polarity
+
+  convert10bitAngle(s3Angle)
+  crsDriveAmplitudeS3 = amplitude
+  crsDrivePolarityS3  = polarity
+
+  -- output to course drive synchro
+  storeCrsDriveValues( crsDriveAmplitudeS1, crsDriveAmplitudeS2,
+                       crsDriveAmplitudeS3, crsDrivePolarityS1,
+                       crsDrivePolarityS2,  crsDrivePolarityS3  )
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- activate (new) setpoint for COURSE drive synchro from cyclic buffer
+-- called from main()
+-- output a new setpoint only if no previous setpoint output is in progress!
+-- -----------------------------------------------------------------------------
+
+procedure updCrsDrivePosition() is
+  var word setpoint
+
+    setpoint = getNewCrsDriveSetpoint()
+    if (setpoint != NO_NEW_SETPOINT) then
+        setCrsDrive(setpoint)
+    end if
+end procedure
+

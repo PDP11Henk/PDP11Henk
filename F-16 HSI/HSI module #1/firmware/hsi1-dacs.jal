@@ -1,0 +1,481 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #1
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi1-dacs
+--
+--    this module contains the actual requested setpoint execution for BEARING,
+--    HEADING and MILES (RANGE) UNIT, TEN, and HUNDRED drumcounters.
+--
+--    The "setpoint" function has input parameters for the stator amplitude
+--    settings and their polarity with respect to the rotor (reference) signal.
+--    This data is formatted and stored in an array and then "startXxxxDAC" is
+--    called.  This routine sends the 1st data to the DAC and enables the SPI
+--    interrupt. The SPI interrupt routine takes care of the successive bytes
+--    that must be sent to the DAC, and correct CS and LDAC pulse generation.
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+--    *** NOTE:
+--    SPI hardware control sometimes seems to send "spurious" data. Therefore,
+--    SPI is software controlled. Data and successive data are sent over the SPI
+--    hardware lines, but control is managed in a state machine which is called
+--    from main(). The state machine is implemented in processSPIloading().
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+
+var byte   statorData[36]     -- holds amplitude and polarity data for stators
+var byte   loadState          -- state machine data transmission progress
+var byte   setIndicator       -- identify for which indication setpoint is
+
+const byte DAC_LOAD_IDLE      = 0
+
+  -- output stator coil setting // Chip Select identification  of correct DAC
+const byte OUTPUT_BRG_S1      = 1
+const byte OUTPUT_BRG_S2      = 2
+const byte OUTPUT_BRG_S3      = 3
+const byte OUTPUT_HDG_S1      = 4
+const byte OUTPUT_HDG_S2      = 5
+const byte OUTPUT_HDG_S3      = 6
+const byte OUTPUT_M1_X        = 7
+const byte OUTPUT_M1_Y        = 8
+const byte OUTPUT_M2_X        = 9
+const byte OUTPUT_M2_Y        = 10
+const byte OUTPUT_M3_X        = 11
+const byte OUTPUT_M3_Y        = 12
+const byte OUTPUT_LATCH       = 13
+
+-- DAC CS* state
+const byte ASSERT             = 0     -- DAC CS* control pin asserted level
+const byte NEGATE             = 1     -- DAC CS* control pin negated level
+
+const byte SET_BEARING        = 0
+const byte SET_HEADING        = 1
+const byte SET_MILES_1        = 2
+const byte SET_MILES_2        = 3
+const byte SET_MILES_3        = 4
+
+const byte DAC_A              = 0x30  -- load DAC A, gain 1x
+const byte DAC_B              = 0xB0  -- load DAC B, gain 1x
+
+
+
+procedure initSPIhardware() is
+    BRG_DAC_ZX        = 1          -- CS* DAC BEARING S1 and S3
+    HDG_DAC_ZY        = 1          -- CS* DAC HEADING S2 and S3
+    BY_HX_DAC         = 1          -- CS* DAC HEADING S1 and BEARING S2
+    ML1_DAC_XY        = 1          -- CS* DAC MILES unit drumcounter X and Y
+    ML2_DAC_YX        = 1          -- CS* DAC MILES tens drumcounter X and Y
+    ML3_DAC_YX        = 1          -- CS* DAC MILES hundreds drumcounter X and Y
+    LOADDACS          = 1          -- LOAD* strobe
+    SPI_CLK           = 0          -- SPI clock inactive level
+end procedure
+
+
+
+procedure initSPIcontrol() is
+  loadState = DAC_LOAD_IDLE
+  setpointsToDACsActive = FALSE    -- no SPI transmission in progress
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Initiate the transfer of the bytes to the DAC(s): start the state machine.
+-- The words are sent via processSPIloading() called from the main() loop.
+-- -----------------------------------------------------------------------------
+
+procedure startBearingDAC() is
+    loadState = OUTPUT_BRG_S1
+end procedure
+
+
+procedure startHeadingDAC() is
+    loadState = OUTPUT_HDG_S1
+end procedure
+
+
+procedure startMilesUnitDAC() is
+    loadState = OUTPUT_M1_X
+end procedure
+
+
+procedure startMilesTenDAC() is
+    loadState = OUTPUT_M2_X
+end procedure
+
+
+procedure startMilesHundredDAC() is
+    loadState = OUTPUT_M3_X
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Store setpoint information in byte array for DAC loading.
+-- Initiate data transfer to DAC.
+-- -----------------------------------------------------------------------------
+
+procedure bearingSetpoint(WORD in amplitudeS1, WORD in amplitudeS2,
+                          WORD in amplitudeS3, BYTE in polarityS1,
+                          BYTE in polarityS2,  BYTE in polarityS3  ) is
+
+  ; format the values to be sent to the DACs
+  statorData[0] = byte((amplitudeS1 >> 6) & 0x000F) + DAC_B
+  statorData[1] = byte((amplitudeS1 << 2) & 0x00FC)
+  statorData[2] = byte((amplitudeS2 >> 6) & 0x000F) + DAC_A
+  statorData[3] = byte((amplitudeS2 << 2) & 0x00FC)
+  statorData[4] = byte((amplitudeS3 >> 6) & 0x000F) + DAC_A
+  statorData[5] = byte((amplitudeS3 << 2) & 0x00FC)
+  statorData[6] = polarityS1
+  statorData[7] = polarityS2
+  statorData[8] = polarityS3
+  startBearingDAC()              -- trigger DAC load sequence
+end procedure
+
+
+
+procedure headingSetpoint(WORD in amplitudeS1, WORD in amplitudeS2,
+                          WORD in amplitudeS3, BYTE in polarityS1,
+                          BYTE in polarityS2,  BYTE in polarityS3  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[9]  = byte((amplitudeS1 >> 6) & 0x000F) + DAC_B
+  statorData[10] = byte((amplitudeS1 << 2) & 0x00FC)
+  statorData[11] = byte((amplitudeS2 >> 6) & 0x000F) + DAC_B
+  statorData[12] = byte((amplitudeS2 << 2) & 0x00FC)
+  statorData[13] = byte((amplitudeS3 >> 6) & 0x000F) + DAC_A
+  statorData[14] = byte((amplitudeS3 << 2) & 0x00FC)
+  statorData[15] = polarityS1
+  statorData[16] = polarityS2
+  statorData[17] = polarityS3
+  startHeadingDAC()              -- trigger DAC load sequence
+end procedure
+
+
+
+procedure miles1Setpoint(WORD in amplitudeX, WORD in amplitudeY,
+                         BYTE in polarityX,  BYTE in polarityY  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[18] = byte((amplitudeX >> 6) & 0x000F) + DAC_A
+  statorData[19] = byte((amplitudeX << 2) & 0x00FC)
+  statorData[20] = byte((amplitudeY >> 6) & 0x000F) + DAC_B
+  statorData[21] = byte((amplitudeY << 2) & 0x00FC)
+  statorData[22] = polarityX
+  statorData[23] = polarityY
+  startMilesUnitDAC()            -- trigger DAC load sequence
+end procedure
+
+
+
+procedure miles2Setpoint(WORD in amplitudeX, WORD in amplitudeY,
+                         BYTE in polarityX,  BYTE in polarityY  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[24] = byte((amplitudeX >> 6) & 0x000F) + DAC_B
+  statorData[25] = byte((amplitudeX << 2) & 0x00FC)
+  statorData[26] = byte((amplitudeY >> 6) & 0x000F) + DAC_A
+  statorData[27] = byte((amplitudeY << 2) & 0x00FC)
+  statorData[28] = polarityX
+  statorData[29] = polarityY
+  startMilesTenDAC()             -- trigger DAC load sequence
+end procedure
+
+
+
+procedure miles3Setpoint(WORD in amplitudeX, WORD in amplitudeY,
+                         BYTE in polarityX,  BYTE in polarityY  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[30] = byte((amplitudeX >> 6) & 0x000F) + DAC_B
+  statorData[31] = byte((amplitudeX << 2) & 0x00FC)
+  statorData[32] = byte((amplitudeY >> 6) & 0x000F) + DAC_A
+  statorData[33] = byte((amplitudeY << 2) & 0x00FC)
+  statorData[34] = polarityX
+  statorData[35] = polarityY
+  startMilesHundredDAC()         -- trigger DAC load sequence
+end procedure
+
+
+
+
+-- Assert or negate the correct DAC Chip Select (CS) pin
+
+procedure controlDACCS(BYTE in statorID, BYTE in CSstate) is
+  case (statorID) of
+      OUTPUT_BRG_S1 : block   BRG_DAC_ZX = CSstate   end block
+      OUTPUT_BRG_S2 : block   BY_HX_DAC  = CSstate   end block
+      OUTPUT_BRG_S3 : block   BRG_DAC_ZX = CSstate   end block
+      OUTPUT_HDG_S1 : block   BY_HX_DAC  = CSstate   end block
+      OUTPUT_HDG_S2 : block   HDG_DAC_ZY = CSstate   end block
+      OUTPUT_HDG_S3 : block   HDG_DAC_ZY = CSstate   end block
+      OUTPUT_M1_X   : block   ML1_DAC_XY = CSstate   end block
+      OUTPUT_M1_Y   : block   ML1_DAC_XY = CSstate   end block
+      OUTPUT_M2_X   : block   ML2_DAC_YX = CSstate   end block
+      OUTPUT_M2_Y   : block   ML2_DAC_YX = CSstate   end block
+      OUTPUT_M3_X   : block   ML3_DAC_YX = CSstate   end block
+      OUTPUT_M3_Y   : block   ML3_DAC_YX = CSstate   end block
+
+      otherwise block
+            -- ignore everything else  -- reject
+      end block
+  end case
+end procedure
+
+
+
+
+-- This routine sends the data word to the DAC using "bit-banging".
+-- It is a generic routine, starting with asserting the appropriate CS of the
+-- DAC identified by the statorID. The data bits are subsequently loaded and
+-- clocked into the DAC. The CS of the DAC is negated after the last bit.
+
+procedure sendSPIdata(BYTE in SPIdataHI, BYTE in SPIdataLO, BYTE in statorID) is
+  var byte bitmask
+
+    controlDACCS(statorID, ASSERT)       -- assert appropriate DAC CS*
+    ASM nop                              -- CS settling time
+    ASM nop
+    ASM nop
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the HI data byte
+        if ((SPIdataHI & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the LO data byte
+        if ((SPIdataLO & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    ASM nop
+    ASM nop
+    controlDACCS(statorID, NEGATE)       -- negate appropriate DAC CS*
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Preload all DAC registers for output zero signal amplitude to synchro coils
+-- (called once before main loop is entered)
+-- -----------------------------------------------------------------------------
+
+procedure preloadDACregisters() is
+  var word setpoint
+--  var byte hiByte, loByte
+
+    setpoint = 1023
+--  bearing
+    statorData[0] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[1] = byte((setpoint << 2) & 0x00FC)
+    statorData[2] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[3] = byte((setpoint << 2) & 0x00FC)
+    statorData[4] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[5] = byte((setpoint << 2) & 0x00FC)
+    statorData[6] = 0
+    statorData[7] = 0
+    statorData[8] = 0
+-- heading
+    statorData[9]  = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[10] = byte((setpoint << 2) & 0x00FC)
+    statorData[11] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[12] = byte((setpoint << 2) & 0x00FC)
+    statorData[13] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[14] = byte((setpoint << 2) & 0x00FC)
+    statorData[15] = 0
+    statorData[16] = 0
+    statorData[17] = 0
+-- MILES 1
+    statorData[18] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[19] = byte((setpoint << 2) & 0x00FC)
+    statorData[20] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[21] = byte((setpoint << 2) & 0x00FC)
+    statorData[22] = 0
+    statorData[23] = 0
+-- MILES 10
+    statorData[24] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[25] = byte((setpoint << 2) & 0x00FC)
+    statorData[26] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[27] = byte((setpoint << 2) & 0x00FC)
+    statorData[28] = 0
+    statorData[29] = 0
+-- MILES 100
+    statorData[30] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[31] = byte((setpoint << 2) & 0x00FC)
+    statorData[32] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[33] = byte((setpoint << 2) & 0x00FC)
+    statorData[34] = 0
+    statorData[35] = 0
+--
+    sendSPIdata(statorData[0], statorData[1], OUTPUT_BRG_S1)
+    sendSPIdata(statorData[2], statorData[3], OUTPUT_BRG_S2)
+    sendSPIdata(statorData[4], statorData[5], OUTPUT_BRG_S3)
+
+    sendSPIdata(statorData[9], statorData[10], OUTPUT_HDG_S1)
+    sendSPIdata(statorData[11], statorData[12], OUTPUT_HDG_S2)
+    sendSPIdata(statorData[13], statorData[14], OUTPUT_HDG_S3)
+
+    sendSPIdata(statorData[18], statorData[19], OUTPUT_M1_X)
+    sendSPIdata(statorData[20], statorData[21], OUTPUT_M1_Y)
+
+    sendSPIdata(statorData[24], statorData[25], OUTPUT_M2_X)
+    sendSPIdata(statorData[26], statorData[27], OUTPUT_M2_Y)
+
+    sendSPIdata(statorData[30], statorData[31], OUTPUT_M3_X)
+    sendSPIdata(statorData[32], statorData[33], OUTPUT_M3_Y)
+    ASM nop
+    LOADDACS = 0
+    ASM nop
+    ASM nop               -- LDAC* : t > 40 ns
+    ASM nop
+    LOADDACS = 1          -- latch transfer
+    ASM nop
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Set current through all RANGE synchro coils at minimum.
+-- This function is called when the "RANGE LOW POWER" feature is enabled and
+-- the "RANGE INVALID" bar is changed to "visible".
+-- -----------------------------------------------------------------------------
+procedure setMilesSynchrosLowPower() is
+    miles1NewPos = MILES_LOW_POWER
+    miles1Update = TRUE
+    miles2NewPos = MILES_LOW_POWER
+    miles2Update = TRUE
+    miles3NewPos = MILES_LOW_POWER
+    miles3Update = TRUE
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- SPI send data routine
+-- -----------------------------------------------------------------------------
+
+procedure processSPIloading() is
+  case (loadState) of
+      DAC_LOAD_IDLE : block
+                        -- nothing to do, no transmission active
+                      end block
+--
+      OUTPUT_BRG_S1 : block
+                        sendSPIdata(statorData[0], statorData[1], loadState)
+                        loadState = OUTPUT_BRG_S2
+                      end block
+      OUTPUT_BRG_S2 : block
+                        sendSPIdata(statorData[2], statorData[3], loadState)
+                        loadState = OUTPUT_BRG_S3
+                      end block
+      OUTPUT_BRG_S3 : block
+                        sendSPIdata(statorData[4], statorData[5], loadState)
+                        setIndicator = SET_BEARING
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_HDG_S1 : block
+                        sendSPIdata(statorData[9], statorData[10], loadState)
+                        loadState = OUTPUT_HDG_S2
+                      end block
+      OUTPUT_HDG_S2 : block
+                        sendSPIdata(statorData[11], statorData[12], loadState)
+                        loadState = OUTPUT_HDG_S3
+                      end block
+      OUTPUT_HDG_S3 : block
+                        sendSPIdata(statorData[13], statorData[14], loadState)
+                        setIndicator = SET_HEADING
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_M1_X   : block
+                        sendSPIdata(statorData[18], statorData[19], loadState)
+                        loadState = OUTPUT_M1_Y
+                      end block
+      OUTPUT_M1_Y   : block
+                        sendSPIdata(statorData[20], statorData[21], loadState)
+                        setIndicator = SET_MILES_1
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_M2_X   : block
+                        sendSPIdata(statorData[24], statorData[25], loadState)
+                        loadState = OUTPUT_M2_Y
+                      end block
+      OUTPUT_M2_Y   : block
+                        sendSPIdata(statorData[26], statorData[27], loadState)
+                        setIndicator = SET_MILES_2
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_M3_X   : block
+                        sendSPIdata(statorData[30], statorData[31], loadState)
+                        loadState = OUTPUT_M3_Y
+                      end block
+      OUTPUT_M3_Y   : block
+                        sendSPIdata(statorData[32], statorData[33], loadState)
+                        setIndicator = SET_MILES_3
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_LATCH  : block
+                        -- stator setpoints loaded into DACs
+                        -- transfer DAC analog values to DAC outputs
+                        -- and set signal polarity
+                        ASM nop
+                        LOADDACS = 0
+                        if (setIndicator == SET_BEARING) then
+                            BRG_POL_X = statorData[6]
+                            BRG_POL_Y = statorData[7]
+                            BRG_POL_Z = statorData[8]
+                        elsif (setIndicator == SET_HEADING) then
+                            HDG_POL_X = statorData[15]
+                            HDG_POL_Y = statorData[16]
+                            HDG_POL_Z = statorData[17]
+                        elsif (setIndicator == SET_MILES_1) then
+                            ML1_POL_X = statorData[22]
+                            ML1_POL_Y = statorData[23]
+                        elsif (setIndicator == SET_MILES_2) then
+                            ML2_POL_X = statorData[28]
+                            ML2_POL_Y = statorData[29]
+                        elsif (setIndicator == SET_MILES_3) then
+                            ML3_POL_X = statorData[34]
+                            ML3_POL_Y = statorData[35]
+                        else
+                            -- code error, wrong!
+                        end if
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LOADDACS = 1                        -- latch transfer
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

@@ -1,0 +1,252 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #1
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi1-debug
+--
+--    this module contains routines to output debug information.
+--      - print routines that output information via the USB port
+--      - show data on 3 hexadecimal HP displays (requires 7 outputs!)
+-- -----------------------------------------------------------------------------
+
+
+
+
+-- ##############  DEVELOPMENT DEBUGGING USB OUTPUT ROUTINES  ##################
+
+
+-- Debug routines can always be called, but will only operate if USB is active.
+
+-- sendDebugChar(byte in token)       : print one ASCII character
+-- sendDebugString(byte in string[])  : print ASCII string, ! terminated
+-- sendDebugByteHex(byte in dataByte) : print byte as 2 hex
+-- sendDebugByte(byte in dataByte)    : print byte as 2 hex OR 3 decimal
+-- sendDebugWord(word in dataWord)    : print word as 4 hex OR 5 decimal
+-- sendDebugNewLine()                 : print CR / LF
+
+
+procedure sendDebugChar(byte in token) is
+    if (commPort == USE_USB) then
+        usb_serial_data = token        -- print ASCII character
+    end if
+end procedure
+
+
+procedure sendDebugNewLine() is
+    if (commPort == USE_USB) then
+        usb_serial_data = 0x0D  -- CR
+        usb_serial_data = 0x0A  -- LF
+    end if
+end procedure
+
+
+
+procedure sendDebugString(byte in string[]) is
+  var byte index
+
+    -- print string terminated by "!" character
+    if (commPort == USE_USB) then
+        index = 0
+        while (string[index] != "!") loop
+            usb_serial_data = string[index]
+            index = index + 1
+        end loop
+    end if
+end procedure
+
+
+
+procedure sendDebugByteHex(byte in dataByte) is
+    if (commPort == USE_USB) then
+        -- print 2 hexadecimal characters
+        usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+        usb_serial_data = nibble2hex[0x0F & (dataByte)]
+    end if
+end procedure
+
+
+
+procedure sendDebugByte(byte in dataByte) is
+  var byte value, dig3, dig2, dig1
+
+    if (commPort == USE_USB) then
+        if ((debugMask & PRINT_DECIMAL) == PRINT_DECIMAL) then
+            -- print 3 decimal characters
+            value = dataByte
+            dig3 = "0"
+            dig2 = "0"
+            dig1 = "0"
+            while (value >= 100) loop
+                value = value - 100
+                dig3 = dig3 + 1
+            end loop
+            while (value >= 10) loop
+                value = value - 10
+                dig2 = dig2 + 1
+            end loop
+            dig1 = dig1 + value
+            usb_serial_data = dig3
+            usb_serial_data = dig2
+            usb_serial_data = dig1
+        else
+            -- print 2 hexadecimal characters
+            usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+            usb_serial_data = nibble2hex[0x0F & (dataByte)]
+        end if
+    end if
+end procedure
+
+
+
+procedure sendDebugWord(word in dataWord) is
+  var byte splitByte, dig5, dig4, dig3, dig2, dig1
+  var word value
+
+    if (commPort == USE_USB) then
+        if ((debugMask & PRINT_DECIMAL) == PRINT_DECIMAL) then
+            -- print 5 decimal characters
+            value = dataWord
+            dig5 = "0"
+            dig4 = "0"
+            dig3 = "0"
+            dig2 = "0"
+            dig1 = "0"
+            -- brute force binary to BCD conversion
+            while (value >= 10000) loop
+                value = value - 10000
+                dig5 = dig5 + 1
+            end loop
+            while (value >= 1000) loop
+                value = value - 1000
+                dig4 = dig4 + 1
+            end loop
+            while (value >= 100) loop
+                value = value - 100
+                dig3 = dig3 + 1
+            end loop
+            while (value >= 10) loop
+                value = value - 10
+                dig2 = dig2 + 1
+            end loop
+            dig1 = dig1 + byte(value)
+            sendDebugChar(dig5)
+            sendDebugChar(dig4)
+            sendDebugChar(dig3)
+            sendDebugChar(dig2)
+            sendDebugChar(dig1)
+        else
+            -- print 4 hexadecimal characters
+            splitByte = byte(dataWord >> 8)
+            sendDebugByte(splitByte)
+            splitByte = byte(dataWord & 0x00FF)
+            sendDebugByte(splitByte)
+        end if
+    end if
+end procedure
+
+
+
+
+-- #############################################################################
+-- if (defined(DEVELOPMENT_DEBUG) == true) then
+-- end if
+-- #############################################################################
+
+
+
+-- -----------------------------------------------------------------------------
+-- Show data on the hexadecimal Hewlett-Packard 5082-7340 displays.
+--
+--   parameter in : word of data. Note: only lower 12 bits are displayed.
+--   parameter out: -
+--
+--   Routine requires 7 dedicated output pins: HPDISP_D[0123] and HPDISP_L{123].
+--
+--   At compile time you can set whether the output is decimal or hex.
+--   Hexadecimal output $000 .. $FFF , deciaml output 000 .. 999.
+--
+--   ===================================
+--   |    HP 5082-7340 display data    |
+--   ===================================
+--   |  pin    use     |  pin     use  |      blanking: active high
+--   ------------------+----------------                0 :: display LEDs on
+--   |   1      B      |   5     latch |                1 :: display LEDs off
+--   |   2      C      |   6      GND  |
+--   |   3      D      |   7      +5V  |      latch   : active high
+--   |   4   blanking  |   8       A   |                0 :: transparant, load
+--   ===================================                1 :: input data latched
+--
+-- -----------------------------------------------------------------------------
+
+
+--  set all HP display outputs to defined state (called from main() once)
+;procedure initDebugDisplay() is
+;    HPDISP_L1  = 1
+;    HPDISP_L2  = 1
+;    HPDISP_L3  = 1
+;    HPDISP_D0  = 0
+;    HPDISP_D1  = 0
+;    HPDISP_D2  = 0
+;    HPDISP_D3  = 0
+;end procedure
+
+
+;const byte DEBUG_DISPLAY_HEX  = 0
+;const byte DEBUG_DISPLAY_DEC  = 1
+
+;procedure debugDisplayData(WORD in info) is
+;  var byte mode, dig3, dig2, dig1
+;  var word value
+
+  -- select display mode
+;  mode  = DEBUG_DISPLAY_HEX       -- << DEBUG_DISPLAY_HEX  or  DEBUG_DISPLAY_DEC
+;  value = info
+
+;  if (mode == DEBUG_DISPLAY_HEX) then
+;      dig3 = byte((value >> 8) & 0x000F)
+;      dig2 = byte((value >> 4) & 0x000F)
+;      dig1 = byte(value & 0x000F)
+;  else
+;      dig3 = 0
+;      dig2 = 0
+      -- brute force binary to BCD conversion
+;      while (value >= 100) loop
+;          value = value - 100
+;          dig3 = dig3 + 1
+;      end loop
+;      while (value >= 10) loop
+;          value = value - 10
+;          dig2 = dig2 + 1
+;      end loop
+;      dig1 = byte(value & 0x000f)
+;  end if
+
+  -- output to HP displays
+;  if ((dig3 & 0x01) == 0x01) then  HPDISP_D0 = 1  else  HPDISP_D0 = 0  end if
+;  if ((dig3 & 0x02) == 0x02) then  HPDISP_D1 = 1  else  HPDISP_D1 = 0  end if
+;  if ((dig3 & 0x04) == 0x04) then  HPDISP_D2 = 1  else  HPDISP_D2 = 0  end if
+;  if ((dig3 & 0x08) == 0x08) then  HPDISP_D3 = 1  else  HPDISP_D3 = 0  end if
+;  _usec_delay(10)
+;  HPDISP_L3 = 0
+;  _usec_delay(10)
+;  HPDISP_L3 = 1
+
+;  if ((dig2 & 0x01) == 0x01) then  HPDISP_D0 = 1  else  HPDISP_D0 = 0  end if
+;  if ((dig2 & 0x02) == 0x02) then  HPDISP_D1 = 1  else  HPDISP_D1 = 0  end if
+;  if ((dig2 & 0x04) == 0x04) then  HPDISP_D2 = 1  else  HPDISP_D2 = 0  end if
+;  if ((dig2 & 0x08) == 0x08) then  HPDISP_D3 = 1  else  HPDISP_D3 = 0  end if
+;  _usec_delay(10)
+;  HPDISP_L2 = 0
+;  _usec_delay(10)
+;  HPDISP_L2 = 1
+
+;  if ((dig1 & 0x01) == 0x01) then  HPDISP_D0 = 1  else  HPDISP_D0 = 0  end if
+;  if ((dig1 & 0x02) == 0x02) then  HPDISP_D1 = 1  else  HPDISP_D1 = 0  end if
+;  if ((dig1 & 0x04) == 0x04) then  HPDISP_D2 = 1  else  HPDISP_D2 = 0  end if
+;  if ((dig1 & 0x08) == 0x08) then  HPDISP_D3 = 1  else  HPDISP_D3 = 0  end if
+;  _usec_delay(10)
+;  HPDISP_L1 = 0
+;  _usec_delay(10)
+;  HPDISP_L1 = 1
+;end procedure
+

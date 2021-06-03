@@ -1,0 +1,137 @@
+
+procedure calcAvgSynchro1Values(byte in sinValue, byte in cosValue) is
+
+-- input data : measured SIN (synchro1) and COS (synchro1) value
+-- output data: average value of last 4 measured ADC values (global variables
+--              "sinAverage" and "cosAverage")
+--        NOTE: the average is valid after the 4th measured ADC value
+
+  var word sumSinValues, sumCosValues
+
+  s1SinAvgValues[avgIndex] = sinValue
+  s1CosAvgValues[avgIndex] = cosValue
+  avgIndex = avgIndex + 1
+  if (avgIndex == 4) then
+      avgIndex = 0
+  end if
+  sumSinValues = word(s1SinAvgValues[0]) + word(s1SinAvgValues[1]) +
+                 word(s1SinAvgValues[2]) + word(s1SinAvgValues[3])
+  sumCosValues = word(s1CosAvgValues[0]) + word(s1CosAvgValues[1]) +
+                 word(s1CosAvgValues[2]) + word(s1CosAvgValues[3])
+  sinAverage = byte(sumSinValues >> 2)
+  cosAverage = byte(sumCosValues >> 2)
+end procedure
+
+
+
+
+procedure calcAngle(byte in sinValue, byte in cosValue, byte in synchroId) is
+
+-- input data  : * sinValue and cosValue of synchro voltage levels from ADC
+--               * period and quadrant signal to identify correct quadrant
+-- output data : actual angle setting in degrees (global variable "angle")
+
+  var word  base, prevAngle
+  var byte  quadrantSignal, periodSignal, crossOver
+
+    -- the inverse sine table returns angles between 0° and 90°
+    -- for ADC digital values 0 and 255 (respectively). The accuracy is best
+    -- when the angle is < 45°. Thus, for angles between 0° and 45° the sine is
+    -- used and for 45° to 90° the cosine is used. The quadrant signal indicates
+    -- whether the 0° to 90° or 90° to 180° range applies.
+    -- Further, the Scott-T transformer generates identical signals for the span
+    -- 0° to 180° and 180° to 360°. The period signal identifies these 2 ranges.
+    if (synchroId == PITCH_SYNCHRO) then
+        quadrantSignal = S1_QUADRT
+        periodSignal   = S1_PERIOD
+        crossOver      = s1CrossOver
+        prevAngle      = measuredPitchAngle
+    else
+        quadrantSignal = S2_QUADRT
+        periodSignal   = S2_PERIOD
+        crossOver      = s2CrossOver
+        prevAngle      = measuredRollAngle
+    end if
+    
+    if (sinValue <= crossOver) then
+        -- use the sine value for lookup
+        base = word(arcSine[sinValue])
+    else
+        base = word(90) - word(arcSine[cosValue])
+    end if
+
+    -- adjust base angle using QUADRANT and PERIOD signals
+    if (quadrantSignal == 1) then   base = 180 - base    end if
+    if (periodSignal == 1)   then   base = base + 180    end if
+    if (base < 360) then  angle = base  else angle = 0   end if
+    
+    -- transition artifact corrections
+    -- At 180°/180° (P=0 and Q=1 / P=1 and Q=0) transition and at the 360°/0°
+    -- (P=1 and Q=0 / P=1 and Q=1) transition *both* signals change. If these
+    -- signals do not change at exactly the same moment, an incorrect angle
+    -- will be determined. This must be prevented.
+    -- Note that at the 90°/90° (P=0 and Q=0 / P=0 and Q=1) transition and the
+    -- 270°/270° (P=1 and Q=0 / P=1 and Q=1) transition the problem does not
+    -- exist, because only one signal changes state.
+    -- ** at 180°, false read-outs of 0° might occur (actually seen!)
+    -- ** at 359°/0°, false read-outs of 180° might occur (not seen!)
+    if ( (angle == 0) & (prevAngle == 180) ) then   angle = prevAngle  end if
+    if ( (angle == 180) & (prevAngle == 0) ) then   angle = prevAngle  end if
+end procedure
+
+
+
+procedure displayAngle() is
+
+  var byte dig100, dig10, dig1
+  var word value
+
+--  if (TESTBUTTON == 1) then                   -- TEST CODE
+      value = measuredPitchAngle
+--  else
+--      value = baseAngle
+--  end if
+
+  dig100 = 0
+  dig10  = 0
+
+  -- binary to BCD conversion (brute force)
+  while (value >= 100) loop
+      value = value - 100
+      dig100 = dig100 + 1
+  end loop
+  while (value >= 10) loop
+      value = value - 10
+      dig10 = dig10 + 1
+  end loop
+  dig1 = byte(value & 0x000f)
+
+  -- output to displays
+  if ((dig100 & 0x01) == 0x01) then  DSP_DAT0 = 1  else  DSP_DAT0 = 0  end if
+  if ((dig100 & 0x02) == 0x02) then  DSP_DAT1 = 1  else  DSP_DAT1 = 0  end if
+  if ((dig100 & 0x04) == 0x04) then  DSP_DAT2 = 1  else  DSP_DAT2 = 0  end if
+  if ((dig100 & 0x08) == 0x08) then  DSP_DAT3 = 1  else  DSP_DAT3 = 0  end if
+  _usec_delay(10)
+  DSP_LATCH3 = 0
+  _usec_delay(10)
+  DSP_LATCH3 = 1
+
+  if ((dig10 & 0x01) == 0x01) then  DSP_DAT0 = 1  else  DSP_DAT0 = 0  end if
+  if ((dig10 & 0x02) == 0x02) then  DSP_DAT1 = 1  else  DSP_DAT1 = 0  end if
+  if ((dig10 & 0x04) == 0x04) then  DSP_DAT2 = 1  else  DSP_DAT2 = 0  end if
+  if ((dig10 & 0x08) == 0x08) then  DSP_DAT3 = 1  else  DSP_DAT3 = 0  end if
+  _usec_delay(10)
+  DSP_LATCH2 = 0
+  _usec_delay(10)
+  DSP_LATCH2 = 1
+
+  if ((dig1 & 0x01) == 0x01) then  DSP_DAT0 = 1  else  DSP_DAT0 = 0  end if
+  if ((dig1 & 0x02) == 0x02) then  DSP_DAT1 = 1  else  DSP_DAT1 = 0  end if
+  if ((dig1 & 0x04) == 0x04) then  DSP_DAT2 = 1  else  DSP_DAT2 = 0  end if
+  if ((dig1 & 0x08) == 0x08) then  DSP_DAT3 = 1  else  DSP_DAT3 = 0  end if
+  _usec_delay(10)
+  DSP_LATCH1 = 0
+  _usec_delay(10)
+  DSP_LATCH1 = 1
+end procedure
+

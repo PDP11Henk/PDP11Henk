@@ -1,0 +1,253 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DOA_SYNCHRO using the Microchip PIC18F252
+-- Author: Henk Gooijen, Copyright (c) 2014, all rights reserved
+--
+-- Compiler: 2.4o
+-- Released under the GPL license
+--          (http://www.opensource.org/licenses/bsd-license.php)
+--
+-- Description:
+--         Firmware for interfacing a synchro resolver.
+--         This is test code, to investigate the feasibility of controlling a
+--         *real* SAI (Standby Attitude Indicator).
+--
+-- Notes:
+--         - 06.03.2014 : File creation date/time.
+--                        Process two resolver signals, convert the axis
+--                        position to degrees and show angle on HP displays.
+-- -----------------------------------------------------------------------------
+
+include 18f252                          -- target PICmicro
+
+
+-- The program assumes that a 10 MHz crystal is connected to pins OSC1 and OSC2.
+
+pragma target clock 40_000_000          -- OSC frequency
+
+
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+
+pragma target OSC           HS_PLL
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VOLTAGE       V42         -- brown out voltage
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDT           DISABLED    -- no watchdog
+pragma target CCP2MUX       DISABLED    -- CCP2 pin
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table write block 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+--  The A/D converter is used to read the induced stator voltages.
+--  The ADC set to low resolution, 8 bits, keeps lookup table small.
+--  For the 18F252:
+--       * Using 2 analog inputs, the 3rd (and optionally 4th) analog input must
+--         be configured for Vref+ (and Vref-).
+--       * Using 4 analog inputs, the 5th analog input must be Vref+.
+
+const bit   ADC_HIGH_RESOLUTION = FALSE
+const byte  ADC_NCHANNEL        = 2                ; 2 analog inputs (AN0, AN1)
+const byte  ADC_NVREF           = ADC_VREF_POS     ; requires AN3 to be Vref+
+
+
+-- -----------------------------------------------------------------------------
+-- ** hardware definition
+-- -----------------------------------------------------------------------------
+
+  -- Manual Trim analog inputs and digital outputs
+  -- DOA communication inputs
+
+alias  S1_SIN      is pin_A0    -- analog input synchro #1 sine
+alias  S1_COS      is pin_A1    -- analog input synchro #1 cosine
+alias  SPARE_X1    is pin_A2    -- spare I/O
+alias  VREF_PLUS   is pin_A3    -- analog Vref+
+alias  SPARE_X2    is pin_A4    -- spare I/O
+alias  DIAG_LED    is pin_A5    -- status/diagnostic LED
+
+alias  DOA_CLK     is pin_B0    -- DOA communication CLOCK line
+alias  S1_PERIOD   is pin_B1    -- synchro #1 half period signal
+alias  S1_QUADRT   is pin_B2    -- synchro #1 quadrant signal
+alias  S2_PERIOD   is pin_B3    -- synchro #2 half period signal
+alias  S2_QUADRT   is pin_B4    -- synchro #2 quadrant signal
+alias  SPARE_X3    is pin_B5    -- spare I/O
+alias  TESTBUTTON  is pin_B6    -- spare I/O
+alias  DOA_DATA    is pin_B7    -- DOA communication DATA line
+
+alias  DSP_DAT1    is pin_C0    -- data output D1
+alias  DSP_DAT2    is pin_C1    -- data output D2
+alias  SPARE_X4    is pin_C2    -- spare I/O
+alias  DSP_DAT3    is pin_C3    -- data output D3
+alias  DSP_DAT0    is pin_C4    -- data output D0
+alias  DSP_LATCH1  is pin_C5    -- latch signal display #1 (lsb)
+alias  DSP_LATCH2  is pin_C6    -- latch signal display #2
+alias  DSP_LATCH3  is pin_C7    -- latch signal display #3 (msb)
+
+const  LED_ON        = 0        -- LED connected to common +5,
+const  LED_OFF       = 1        -- thus: inverted logic: 0::on // 1::off
+
+const  PITCH_SYNCHRO = 0        -- synchro #1 is for pitch
+const  ROLL_SYNCHRO  = 1        -- synchro #2 is for roll
+
+
+--  set the I/O direction
+
+pin_A0_direction = input
+pin_A1_direction = input
+pin_A2_direction = input
+pin_A3_direction = input
+pin_A4_direction = input
+pin_A5_direction = output
+
+pin_B0_direction = input
+pin_B1_direction = input
+pin_B2_direction = input
+pin_B3_direction = input
+pin_B4_direction = input
+pin_B5_direction = input
+pin_B6_direction = input
+pin_B7_direction = input
+
+pin_C0_direction = output
+pin_C1_direction = output
+pin_C2_direction = output
+pin_C3_direction = output
+pin_C4_direction = output
+pin_C5_direction = output
+pin_C6_direction = output
+pin_C7_direction = output
+
+
+-- resolver (synchro) variables, actual indicator PITCH and ROLL position
+
+var byte s1SinValue                   -- synchro #1 sin ADC voltage (0 .. 255)
+var byte s1CosValue                   -- synchro #1 cos ADC voltage (0 .. 255)
+var byte s2SinValue                   -- synchro #2 sin ADC voltage (0 .. 255)
+var byte s2CosValue                   -- synchro #2 cos ADC voltage (0 .. 255)
+var byte s1SinAvgValues[4]            -- last 4 measured synchro #1 SIN values
+var byte s1CosAvgValues[4]            -- last 4 measured synchro #1 COS values
+var byte s2SinAvgValues[4]            -- last 4 measured synchro #2 SIN values
+var byte s2CosAvgValues[4]            -- last 4 measured synchro #2 COS values
+var byte avgIndex                     -- array index for last 4 measured values
+var byte sinAverage                   -- averaged synchro SIN value
+var byte cosAverage                   -- averaged synchro COS value
+var byte s1CrossOver                  -- ADC value for 45° cross-over point
+var byte s2CrossOver
+var word angle                        -- lookup & calculated angle
+
+var word measuredPitchAngle           -- the measured actual PITCH indication
+var word measuredRollAngle            -- the measured actual ROLL indication
+
+
+include  delay
+include  timer0_isr_interval
+include  doa-diag-led
+include  doa-synchro-arcsin
+include  doa-synchro-code
+--       include  doa-synchro-phcc
+
+
+-- =============================================================================
+-- ** main program
+-- -----------------------------------------------------------------------------
+
+BSR = 0                  ; set bank select register to default
+INTCON_GIE = 0           ; disable all interrupts
+
+-- setup_environment
+
+enable_digital_io()      ; first, all I/O pins set to digital
+include  adc
+adc_init()               ; initialize the A/D converter
+
+--  initialize DOA variables
+
+DOA_address      = 0
+DOA_subaddr      = 0
+DOA_databyte     = 0
+bitcounter       = 7
+DOA_RX_state     = DOA_STATE_ADDRESS
+command_received = 0
+
+--  set all outputs to defined state
+
+DSP_LATCH1      = 0
+DSP_LATCH2      = 0
+DSP_LATCH3      = 0
+DSP_DAT0        = 0
+DSP_DAT1        = 0
+DSP_DAT2        = 0
+DSP_DAT3        = 0
+
+diagLED_use     = DIAGLED_HEARTBEAT
+heartbeat_state = LED_OFF
+DIAG_LED        = LED_OFF                  -- on-board DIAG LED OFF
+set_delay(HEARTBEAT_SLOT, HEARTBEAT_RATE)
+
+INTCON2_INTEDG0 = 1      -- external INT0 interrupt on rising edge
+INTCON_INT0IF   = 0      -- clear INT0 interrupt flag
+INTCON_INT0IE   = 1      -- enable INT0 external interrupt
+RCON_IPEN       = 0      -- disable priority levels
+timer0_isr_init()        -- initialize timer0 (also enables interrupts)
+INTCON_GIE      = 1      -- (IPEN=0) enable all unmasked interrupts
+INTCON_PEIE     = 1      -- (IPEN=0) enable all unmasked peripheral interrupts
+
+
+-- TEST application initialization: read stator signals S1 and S2
+
+s1SinValue   = adc_read_low_res(0)
+s1CosValue   = adc_read_low_res(1)
+s1CrossOver  = 180                         -- set default cross-over ADC value
+s2CrossOver  = 180
+_usec_delay(100_000)
+
+
+avgIndex = 0
+while (avgIndex < 4) loop                  -- initialize moving average arrays
+  s1SinAvgValues[avgIndex] = 128
+  s1CosAvgValues[avgIndex] = 128
+  s2SinAvgValues[avgIndex] = 128
+  s2CosAvgValues[avgIndex] = 128
+  avgIndex = avgIndex + 1
+end loop
+avgIndex = 0
+
+forever loop
+
+  s1SinValue = adc_read_low_res(0)                   ; get synchro #1 data
+  s1CosValue = adc_read_low_res(1)
+
+  -- process resolver signals
+
+  calcAvgSynchro1Values(s1SinValue, s1CosValue)
+  calcAngle(sinAverage, cosAverage, PITCH_SYNCHRO)
+  measuredPitchAngle = angle
+  --  calcAvgSynchro2Values(s2SinValue, s2CosValue)
+  --  calcAngle(sinAverage, cosAverage, ROLL_SYNCHRO)
+  measuredRollAngle = angle
+  
+  displayAngle()
+  _usec_delay(500_000)
+
+end loop
+

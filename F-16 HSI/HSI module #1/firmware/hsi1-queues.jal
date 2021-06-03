@@ -1,0 +1,250 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HSI (Horizontal Situation Indicator) control module #1
+--         with USB and PHCC DOA connection using the Microchip PIC18F4550
+--
+-- Submodule: hsi1-queues
+--
+--    this module contains the circular buffer to store/retrieve setpoints.
+
+
+-- -----------------------------------------------------------------------------
+-- accept new setpoint for BEARING, HEADING, MILES[1|2|3]
+-- -----------------------------------------------------------------------------
+
+procedure initQueueAdministration() is
+    bearingHeadIndex      = 0
+    bearingTailIndex      = 0
+    headingHeadIndex      = 0
+    headingTailIndex      = 0
+    miles1HeadIndex       = 0
+    miles1TailIndex       = 0
+    miles2HeadIndex       = 0
+    miles2TailIndex       = 0
+    miles3HeadIndex       = 0
+    miles3TailIndex       = 0
+end procedure
+
+
+
+procedure accNewBearingSetpoint() is
+  var byte nextIndex
+
+  if (bearingUpdate == TRUE) then
+     nextIndex = bearingHeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != bearingTailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        bearingBuffer[bearingHeadIndex] = bearingNewPos
+        bearingHeadIndex = nextIndex
+     end if
+     bearingUpdate = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewHeadingSetpoint() is
+  var byte nextIndex
+
+  if (headingUpdate == TRUE) then
+     nextIndex = headingHeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != headingTailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        headingBuffer[headingHeadIndex] = headingNewPos
+        headingHeadIndex = nextIndex
+     end if
+     headingUpdate = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewMiles1Setpoint() is
+  var byte nextIndex
+
+  if (miles1Update == TRUE) then
+     nextIndex = miles1HeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != miles1TailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        miles1Buffer[miles1HeadIndex] = miles1NewPos
+        miles1HeadIndex = nextIndex
+     end if
+     miles1Update = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewMiles2Setpoint() is
+  var byte nextIndex
+
+  if (miles2Update == TRUE) then
+     nextIndex = miles2HeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != miles2TailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        miles2Buffer[miles2HeadIndex] = miles2NewPos
+        miles2HeadIndex = nextIndex
+     end if
+     miles2Update = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewMiles3Setpoint() is
+  var byte nextIndex
+
+  if (miles3Update == TRUE) then
+     nextIndex = miles3HeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != miles3TailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        miles3Buffer[miles3HeadIndex] = miles3NewPos
+        miles3HeadIndex = nextIndex
+     end if
+     miles3Update = FALSE
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new setpoint for BEARING, HEADING, MILES[1|2|3] from cyclic buffer
+-- -----------------------------------------------------------------------------
+
+function getNewBearingSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (bearingHeadIndex == bearingTailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = bearingBuffer[bearingTailIndex]
+      nextIndex = bearingTailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      bearingTailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewHeadingSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (headingHeadIndex == headingTailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = headingBuffer[headingTailIndex]
+      nextIndex = headingTailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      headingTailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewMiles1Setpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (miles1HeadIndex == miles1TailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = miles1Buffer[miles1TailIndex]
+      nextIndex = miles1TailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      miles1TailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewMiles2Setpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (miles2HeadIndex == miles2TailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = miles2Buffer[miles2TailIndex]
+      nextIndex = miles2TailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      miles2TailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewMiles3Setpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (miles3HeadIndex == miles3TailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = miles3Buffer[miles3TailIndex]
+      nextIndex = miles3TailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          -- This makes identification of "buffer full" and "buffer empty" easy.
+          nextIndex = 0
+      end if
+      miles3TailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
