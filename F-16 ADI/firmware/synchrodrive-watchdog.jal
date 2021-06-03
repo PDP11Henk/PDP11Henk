@@ -1,0 +1,37 @@
+-- communication watchdog routines
+
+procedure commRestartWatchdog() is
+   if (wtchdogEnabled == TRUE) then
+      set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+   end if
+end procedure
+
+
+procedure commCheckWatchdog() is
+   if (wtchdogEnabled == TRUE) then
+      if ( check_delay(COMM_WATCHDOG_SLOT) ) then
+         -- try to avoid spurious interrupt processing: state machine in "idle"
+         USB_RXstate = USB_STATE_RESET
+         -- watchdog enabled and time out occurred.
+         -- OK to reset DOA & USB protocol state machine and reset variables.
+         -- Note that USB reception is based on polling, thus a reset is safe
+         -- to execute (on a single-processor system). However, DOA is based on
+         -- an interrupt, so the interrupt must be disabled before the update
+         -- is executed, to prevent corruption.
+         INTCON_INT0IE = 0                           -- disable DOA interrupt
+                                                     -- (USB: already disabled)
+         if (commPort == USE_DOA) then
+               bitcounter     = 7
+               DOA_address    = 0
+               DOA_subaddr    = 0
+               DOA_databyte   = 0
+               DOA_RXstate    = DOA_STATE_ADDRESS
+               INTCON_INT0IE  = 1                    -- enable DOA interrupt
+         else  -- commPort == USE_USB
+               USB_RXstate    = USB_STATE_IDLE
+         end if
+         set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+      end if
+   end if
+end procedure
+

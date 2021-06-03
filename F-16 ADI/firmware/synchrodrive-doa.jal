@@ -1,0 +1,148 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-doa
+--
+--    this module contains the INT interrupt routine for the DOA clock and data
+--    input of the PHCC DOA protocol and the actual data reception from bit to
+--    assembled data bytes.
+--    Output: - DOAcmdReceived : flag to indicate valid data packet received
+--            - deviceAddress  : DOA_address
+--            - subaddress     : DOA_subaddr
+--            - databyte       : DOA_databyte
+
+-- The receiveDOA (interrupt) routine processes each data bit as it is received.
+-- The bits are combined to bytes, representing a device address, subaddress and
+-- databyte of a DOA packet.
+-- When a complete packet is received, the device address and subaddress are
+-- examined.
+-- If the device address is the "SDI" device address AND the subaddress is
+-- valid, the flag byte DOAcmdReceived is set, else this is a DOA message not
+-- specific for the SDI and the flag byte DOAcmdReceived is not set.
+
+procedure receiveDOA is
+   if (wtchdogEnabled == TRUE) then
+      set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)     -- protocol watchdog
+   end if
+   case DOA_RXstate of
+
+       DOA_STATE_ADDRESS :
+          block
+             if (DOA_DATA) then
+                DOA_address = DOA_address + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_address = DOA_address >> 1
+                bitcounter = bitcounter - 1
+             else
+                bitcounter = 5
+                DOA_subaddr = 0
+                DOA_RXstate = DOA_STATE_SUBADRS
+             end if
+          end block
+
+       DOA_STATE_SUBADRS :
+          block
+             if (DOA_DATA) then
+                DOA_subaddr = DOA_subaddr + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_subaddr = DOA_subaddr >> 1
+                bitcounter = bitcounter - 1
+             else
+                DOA_subaddr = DOA_subaddr >> 2
+                bitcounter = 7
+                DOA_databyte = 0
+                DOA_RXstate = DOA_STATE_DATA
+                -- sub-address data received
+                -- check special case: disable watchdog
+  --            if (DOA_address == SYNCHRO_ADDR) then
+  --               if (DOA_subaddr == CMD_WTCHDOG_DIS) then
+  --                  -- NO data byte will follow!
+  --                  wtchdogEnabled = FALSE
+  --                  DOA_RXstate    = DOA_STATE_ADDRESS
+  --                  bitcounter     = 7
+  --                  DOA_address    = 0
+  --                  DOA_subaddr    = 0
+  --                  DOA_databyte   = 0
+  --               end if
+  --            end if
+             end if
+          end block
+
+       DOA_STATE_DATA :
+          block
+             if (DOA_DATA) then
+                DOA_databyte = DOA_databyte + 128
+             end if
+             if (bitcounter != 0) then
+                DOA_databyte = DOA_databyte >> 1
+                bitcounter = bitcounter - 1
+             else
+                -- byte received ==> process received data packet
+                if (DOA_address == SYNCHRO_ADDR) then
+                   if (DOA_subaddr <= CMD_LASTVAL) then
+                      -- for SDI and subaddress in valid range
+                      -- store data & accept command
+                      DOA_RXstate    = DOA_STATE_ADDRESS
+                      bitcounter     = 7
+                      deviceAddress  = DOA_address
+                      subaddress     = DOA_subaddr
+                      databyte       = DOA_databyte
+                      DOA_address    = 0
+                      DOA_subaddr    = 0
+                      DOA_databyte   = 0
+                      -- debug help: toggle output 5 when packet received
+                      -- not documented, but an LED can be connected to check
+                      ; if (DIGPWM5 == 0) then
+                      ;    DIGPWM5 = 1
+                      ; else
+                      ;    DIGPWM5 = 0
+                      ; end if
+                      DOAcmdReceived = TRUE
+                   else
+                      -- for SDI, but subaddress not valid --> ???  --> reject
+                      DOA_RXstate  = DOA_STATE_ADDRESS
+                      bitcounter   = 7
+                      DOA_address  = 0
+                      DOA_subaddr  = 0
+                      DOA_databyte = 0
+                   end if
+                else
+                   -- DOA_address != SYNCHRO_ADDR  --> not for SDI :: skip
+                   DOA_RXstate  = DOA_STATE_ADDRESS
+                   bitcounter   = 7
+                   DOA_address  = 0
+                   DOA_subaddr  = 0
+                   DOA_databyte = 0
+                end if
+             end if
+          end block
+
+ --   DOA_STATE_RESET :
+ --       block
+ --          -- this state could be reached if the watchdog is expired and an
+ --          -- interrupt is received while the watchdog resets variables.
+ --       end block
+
+      otherwise
+          block
+             -- should never occur ...!
+             bitcounter   = 7
+             DOA_address  = 0
+             DOA_subaddr  = 0
+             DOA_databyte = 0
+             DOA_RXstate  = DOA_STATE_ADDRESS
+          end block
+   end case
+end procedure
+
+
+procedure processDOAinterrupt is
+   -- called from DOA interrupt service routine
+   receiveDOA()
+   INTCON_INT0IF = 0
+   INTCON_INT0IE = 1
+end procedure
+

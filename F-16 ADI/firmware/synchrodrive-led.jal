@@ -1,0 +1,75 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-led
+--
+--    this module contains the routines for control of the DIAG LED.
+--    Routine "diagLEDheartBeat" maintains the flashing of the LED at the
+--       currently defined heartbeat rate.
+--    Routine "setDiagLEDmode" processes the received command for the DIAG LED.
+--       The LED can be permanently OFF or ON, flash at a set heartbeat rate,
+--       and can toggle state (ON / OFF) per received (and acknowledged) DOA
+--       command.
+
+
+procedure setDiagLEDmode(BYTE in databyte) is
+    case databyte of
+      DIAGLED_OFF       : block
+                             diagLED_use = DIAGLED_OFF
+                             DIAGLED = LED_OFF
+                          end block
+      DIAGLED_ON        : block
+                             diagLED_use = DIAGLED_ON
+                             DIAGLED = LED_ON
+                          end block
+      DIAGLED_HEARTBEAT : block
+                             -- start timer for 1st time
+                             set_delay(HEARTBEAT_SLOT, flashRate)
+                             diagLED_use = DIAGLED_HEARTBEAT
+                             heartbeat_state = LED_OFF
+                             DIAGLED = LED_OFF
+                          end block
+      DIAGLED_MSG_ACK   : block
+                             diagLED_use = DIAGLED_MSG_ACK
+                             DIAGLED = !DIAGLED
+                          end block
+      otherwise block
+                   -- ignore all other values
+                end block
+    end case
+end procedure
+
+
+
+procedure diagLEDheartBeat() is
+    if (diagLED_use == DIAGLED_HEARTBEAT) then
+       if ( check_delay(HEARTBEAT_SLOT) ) then
+          -- first check if in initial 1 second start-up delay
+          if (flashRate == DOA_RESET_RATE) then
+             -- it is: count the flashes as a delay
+             if (resetFlashCount < 30) then
+                resetFlashCount = resetFlashCount + 1
+             else
+                -- end of DOA power-up delay cycle: reset DOA variables
+                INTCON_INT0IE = 0                   -- disable DOA interrupt
+                bitcounter    = 7
+                DOA_address   = 0
+                DOA_subaddr   = 0
+                DOA_databyte  = 0
+                DOA_RXstate   = DOA_STATE_ADDRESS
+                flashRate     = DOA_FLASH_RATE
+                INTCON_INT0IE = 1                   -- enable DOA interrupt
+             end if
+          end if
+          set_delay(HEARTBEAT_SLOT, flashRate)      -- restart timer
+          if (heartbeat_state == LED_OFF) then      -- change DIAG LED state
+             heartbeat_state = LED_ON
+             DIAGLED = LED_ON
+          else
+             heartbeat_state = LED_OFF
+             DIAGLED = LED_OFF
+          end if
+       end if
+    end if
+end procedure

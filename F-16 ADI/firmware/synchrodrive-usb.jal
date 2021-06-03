@@ -1,0 +1,124 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-usb
+--
+--    this module contains the (polling) USB data byte reception and the state
+--    machine to process a complete USB "message".
+--    Output: - USBcmdReceived : flag to indicate valid data packet received
+--            - USBrxByte1     : first data byte
+--            - USBrxByte2     : second data byte
+
+include usb_serial
+
+-- -----------------------------------------------------------------------------
+-- USBmsgStateControl - determine action based on received USB data byte
+-- -----------------------------------------------------------------------------
+-- State machine states:
+--   IDLE : awaiting command code: the received byte is the first data byte
+--   DATA : awaiting command data: the received byte is the second data byte
+-- -----------------------------------------------------------------------------
+
+
+
+-- "!" : USB receive data state machine in illegal state (should never occur)
+-- "#" : invalid command number
+-- "x" : "disable watchdog" command received
+-- "-" : following 2 characters are hexadecimal command (first byte)
+-- "=" : following 2 characters are hexadecimal data (second byte)
+
+
+procedure sendUSBdebugToken(byte in token) is
+    usb_serial_data = token
+end procedure
+
+
+
+procedure sendUSBdata(byte in dataByte) is
+
+  const byte nibble2hex[] = "0123456789ABCDEF"
+
+  usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+  usb_serial_data = nibble2hex[0x0F & (dataByte)]
+end procedure
+
+
+
+procedure USBmsgStateControl(byte in rxbyte) is
+  set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)          -- protocol watchdog
+  case (USB_RXstate) of
+     USB_STATE_IDLE :
+        block
+           if (rxbyte <= CMD_USB_DEBUG) then
+              USBrxByte1 = rxbyte
+              if (USBrxByte1 == CMD_WTCHDOG_DIS) then
+                 -- special case: NO data byte will follow!
+                 wtchdogEnabled = FALSE
+                 if (USBdebugEnabled == TRUE) then
+                    sendUSBdebugToken("x")
+                 end if
+              else
+                 USB_RXstate = USB_STATE_DATA
+                 if (USBdebugEnabled == TRUE) then
+                    sendUSBdebugToken("-")
+                    sendUSBdata(USBrxByte1)
+                 end if
+              end if
+           else
+              if (USBdebugEnabled == TRUE) then
+                 sendUSBdebugToken("#")
+                 sendUSBdata(USBrxByte1)
+              end if
+           end if
+        end block
+
+     USB_STATE_DATA :
+        block
+           -- store data & accept command
+           USBrxByte2     = rxbyte
+           USBcmdReceived = TRUE
+           USB_RXstate    = USB_STATE_IDLE
+           if (USBdebugEnabled == TRUE) then
+              sendUSBdebugToken("=")
+              sendUSBdata(USBrxByte2)
+           end if
+        end block
+
+    USB_STATE_RESET :
+          block
+             -- this state could be reached if the watchdog is expired and an
+             -- interrupt is received while the watchdog resets variables.
+          end block
+
+    otherwise
+        block
+           USB_RXstate = USB_STATE_IDLE   -- ?? --> reset
+           if (USBdebugEnabled == TRUE) then
+              sendUSBdebugToken("!")
+           end if
+        end block
+  end case
+end procedure
+
+
+-- -----------------------------------------------------------------------------
+-- handleUSBcommunication - await (non-blocking) for character received
+--                          then process it in state machine
+-- -----------------------------------------------------------------------------
+-- The USB interrupt service routine is polled and checked if a character is
+-- received. When a character is received the LED is toggled. As the received
+-- character can be a command character or a data character belonging to a
+-- command, a state machine decides what to do.
+-- -----------------------------------------------------------------------------
+procedure handleUSBcommunication is
+
+var byte msgByte
+
+  msgByte = 0
+  usb_serial_flush()                 ; poll USB ISR function, serve USB requests
+  if (usb_serial_read(msgByte)) then       ; check received data & process it
+    USBmsgStateControl(msgByte)            ; let state machine decide what to do
+  end if
+end procedure
+

@@ -1,0 +1,124 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-pwm
+--
+--    this module contains the generation of the PWM signals needed for the
+--    stator coils, the PWM signals for the glide slope and localizer command
+--    bars (depending on the SDI usage), and the optional user-defined PWM.
+--    The PWM signal generation uses the free-running timer3 and the compare
+--    register #2 to generate a stable almost jitter-free PWM.
+--    T_PWM is the time between two PWM updates, thus the compare register
+--    "increment", and is calculated T_PWM = F_OSC / (PWM_FREQ * PWM_STEPS)
+--    F_OSC/4 is the PIC crystal frequency 20 MHz/4 = 5 MHz.
+--    PWM_FREQ is the PWM frequency, selected 100 Hz ("flicker-free")
+--    PWM_STEPS is the duty-cycle resolution, 8-bit, thus 256 steps.
+--    Thus, T_PWM = 5000000 / (100 * 256 ) => 195.
+--    ##### However, this causes an impossible interrupt frequency of 25 kHz!
+
+-- variables used in interrupt routine
+var byte setS1amp, setS2amp, setS3amp
+var byte setpoint0, setpoint1, setpoint2, setpoint3
+var byte setpoint4, setpoint5, setpoint6, setpoint7
+var byte pwmCount
+
+
+procedure initPWM() is
+    pwmCount    = 0
+    setS1amp    = 0
+    setS2amp    = 0
+    setS3amp    = 0
+    setpoint0   = 0
+    setpoint1   = 0
+    setpoint2   = 0
+    setpoint3   = 0
+    setpoint4   = 0
+    setpoint5   = 0
+    setpoint6   = 0
+    setpoint7   = 0
+    PIE2_TMR3IE = 0       ; configure timer3: free-running, no interrupt
+    PIR2_TMR3IF = 0       ; clear Timer3 interrupt
+    PIE2_TMR3IE = 0       ; disable Timer3 interrupt
+    T3CON       = 0xC5    ; timer3: 16-bit R/W, CCP for both, Fosc/4, ENABLED
+    CCP2CON     = 0x0A    ; CCP2 compare, SW IRQ on match, no I/O pin assigned
+    PIR2_CCP2IF = 0       ; clear CCP2 interrupt
+    PIE2_CCP2IE = 1       ; enable CCP2 interrupt
+end procedure
+
+
+-- Compare update value: this determines the PWM frequency and CPU load!!
+const word RELOAD_DELAY = 300
+      ; 500 results in PWM frequency  62 Hz.
+      ; 400 results in PWM frequency  78 Hz.
+      ; 300 results in PWM frequency 104 Hz.
+      ; 200 results in 156 Hz, but not always stable "oscillation" around the
+      ; setpoint, a bit depending on the setpoint. The PWM frequnecy then drops
+      ; to 146 Hz. For example, PITCH setting to 322 causes oscillation of +/-
+      ; 5 "millimeter" movement. Definitely *NOT* accesptable!
+
+procedure compare2Interrupt is
+pragma INTERRUPT
+  -- interrupt was for me (CCP2) ?
+  if (PIR2_CCP2IF == 1) then
+      -- yes: reload capture register with next "moment"
+      PIR2_CCP2IF = 0
+      CCPR2 = CCPR2 + RELOAD_DELAY
+
+      -- update pwm state for stator coils and on-board PWM output
+      if (setS1amp > pwmCount) then S1AMPLITUDE = 1 else S1AMPLITUDE = 0 end if
+      if (setS2amp > pwmCount) then S2AMPLITUDE = 1 else S2AMPLITUDE = 0 end if
+      if (setS3amp > pwmCount) then S3AMPLITUDE = 1 else S3AMPLITUDE = 0 end if
+if (defined(ROLL) == true) then
+      if (setpoint0 > pwmCount) then PWMOUT     = 1 else PWMOUT      = 0 end if
+end if
+      -- update pwm state for each DIGITAL output selected as PWM output
+--      if (userOutMode1 == PWM_OUTPUT) then
+--          if (setpoint1 > pwmCount) then DIGPWM1 = 1 else DIGPWM1 = 0 end if
+--      end if
+--      if (userOutMode2 == PWM_OUTPUT) then
+--          if (setpoint2 > pwmCount) then DIGPWM2 = 1 else DIGPWM2 = 0 end if
+--      end if
+if (defined(PITCH) == true) then
+      -- if (userOutMode3 == PWM_OUTPUT) then
+          if (setpoint3 > pwmCount) then DIGPWM3 = 1 else DIGPWM3 = 0 end if
+      -- end if
+      -- if (userOutMode4 == PWM_OUTPUT) then
+          if (setpoint4 > pwmCount) then DIGPWM4 = 1 else DIGPWM4 = 0 end if
+      -- end if
+end if
+--      if (userOutMode5 == PWM_OUTPUT) then
+--          if (setpoint5 > pwmCount) then DIGPWM5 = 1 else DIGPWM5 = 0 end if
+--      end if
+--      if (userOutMode6 == PWM_OUTPUT) then
+--          if (setpoint6 > pwmCount) then DIGPWM6 = 1 else DIGPWM6 = 0 end if
+--      end if
+--      if (userOutMode7 == PWM_OUTPUT) then
+--          if (setpoint7 > pwmCount) then DIGPWM7 = 1 else DIGPWM7 = 0 end if
+--      end if
+
+      -- one duty-cycle run completed?
+      if (pwmCount == 255) then
+          pwmCount = 0
+          -- reload PWM settings
+          setS1amp  = actualS1Ampl
+          setS2amp  = actualS2Ampl
+          setS3amp  = actualS3Ampl
+if (defined(ROLL) == true) then
+          setpoint0 = userOutputPWM0
+end if
+--          setpoint1 = userOutputPWM1
+--          setpoint2 = userOutputPWM2
+if (defined(PITCH) == true) then
+          setpoint3 = userOutputPWM3
+          setpoint4 = userOutputPWM4
+end if
+--          setpoint5 = userOutputPWM5
+--          setpoint6 = userOutputPWM6
+--          setpoint7 = userOutputPWM7
+      else
+          pwmCount = pwmCount + 1
+      end if
+  end if
+end procedure
+

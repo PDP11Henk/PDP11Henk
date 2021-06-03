@@ -1,0 +1,557 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-update
+--
+--    this module contains the routines for the update rate of a synchro.
+--    Update-rate takes care of two conditions (when activated):
+--    1. limit the maximum movement from current to new setpoint position
+--    2. smoothen the movement to the new setpoint position.
+--    Both conditions prevent a big and fast movement of the synchro if the
+--    movement is executed in one update. By breaking up the big movement in
+--    a number of smaller updates which are subsequently time-delayed executed
+--    the movement is smoothed and damped. The drawback is that a fast movement
+--    is damped :-) and that some lag in the position update will occur.
+--    An other usage of "update rate control" is the possibility to decrease the
+--    amount of data sent to the SDI to realize a smooth movement. However, this
+--    is at the cost of some lag behind on the indicator shown position.
+--    Update-rate is controlled by one command. The upper 2 bits of the command
+--    data byte determine the meaning of the lower 6 bits.
+
+
+procedure updRateInitialize() is
+  -- initialize all "update rate" variables with defaults.
+
+  updRateCommand     = 0                            -- update-rate disabled
+  updRateMode        = UPD_RATE_NOT_USED
+  updRateLimitValue  = 0
+  updRateSmoothMin   = 4                            -- multiple of 2 (not 0)
+  updRateTimerTick   = 32                           -- minimum value
+  timerTick          = updRateTimerTick             -- and its default usage
+  updRateShortPath   = TRUE                         -- move via shortest path
+  updRateState       = UPD_RATE_IDLE
+  posUpdateReceived  = FALSE
+  updRateCurrentPos  = LEVELPOSVALUE                -- power-up ASSUMPTION !!!
+end procedure
+
+
+
+-- calcURdifference calculates the difference (signed and absolute) between
+-- the new setpoint position and the current position, making sure the movement
+-- will use the shortest path (rotation smaller than 180°). This routine is only
+-- called when the flag posUpdateReceived is set. As the new setpoint position
+-- is copied, the flag posUpdateReceived is cleared.
+
+procedure calcURdifference() is
+  posUpdateReceived = FALSE
+  updRateDifference = updRateNewPos - updRateCurrentPos
+  -- determine the shortest path if selected
+  if (updRateShortPath == TRUE) then
+     -- move via shortest path
+     if (updRateDifference < -512) then
+        updRateDifference = 1024 - updRateCurrentPos + updRateNewPos
+     end if
+     if (updRateDifference > 512) then
+        updRateDifference = updRateNewPos - updRateCurrentPos - 1024
+     end if
+  end if
+  -- get absolute value of difference
+  if (updRateDifference >= 0) then
+     updRateDiffAbs = word(updRateDifference)
+  else
+     updRateDiffAbs = word(-updRateDifference)
+  end if
+end procedure
+
+
+
+-- checkBoundaryCrossing checks that the argument did not cross the boundary
+-- value (1023 -> 0 or 0 -> 1023). If it did cross, the value is corrected.
+
+procedure checkBoundaryCrossing(SWORD IN OUT value) is
+  if (value < 0) then
+     -- crossed 000 -> 1023
+     value = sword(1024) + value
+  elsif (value > 1023) then
+     --- crossed 1023 -> 000
+     value = value - sword(1024)
+  end if
+end procedure
+
+
+
+const NORMAL_SPEED     = 0
+const DOUBLE_SPEED     = 1
+const HALF_SPEED       = 2
+
+procedure setUpdateSpeed(BYTE in speedSetting) is
+  case speedSetting of
+    NORMAL_SPEED : block
+                     timerTick = updRateTimerTick
+                   end block
+    DOUBLE_SPEED : block
+                     if (updRateTimerTick > 8) then
+                        -- OK, not already at maximum speed
+                        timerTick = (updRateTimerTick >> 1)
+                     end if
+                   end block
+    HALF_SPEED   : block
+                     timerTick = (updRateTimerTick << 1)
+                   end block
+    otherwise
+       timerTick = updRateTimerTick
+  end case
+end procedure
+
+
+
+procedure calcSubStepPositions(BYTE in numberOfSteps, SWORD in startPos) is
+  var sword increment, correction
+  var word  applyCorrection
+
+  -- if a correction is needed on a substep, apply it in the correct "direction"
+  if (updRateDifference >= 0) then
+     correction = 1
+  else
+     correction = -1
+  end if
+
+  -- NOTE: the substep increment must be smaller than the limit value!
+
+  case numberOfSteps of
+    2  : block
+           increment = updRateDifference >> 1
+           -- check if LimitValue is not violated
+           if ( (updRateDiffAbs >> 1) > updRateLimitValue) then
+              increment = SWORD(updRateLimitValue)
+              if (updRateDifference < 0) then
+                 increment = -increment
+              end if
+           end if
+           updRateValues[0] = startPos + increment
+           updRateValues[1] = updRateValues[0] + increment
+           if ((updRateDiffAbs & 0x0001) != 0) then
+              updRateValues[1] = updRateValues[1] + correction
+           end if
+           checkBoundaryCrossing( updRateValues[0] )
+           checkBoundaryCrossing( updRateValues[1] )
+           updRateStepCount = 1
+         end block
+
+    4  : block
+           increment = (updRateDifference >> 2)
+           applyCorrection = updRateDiffAbs & 0x0003
+           -- check if LimitValue is not violated
+           if ( (updRateDiffAbs >> 2) > updRateLimitValue) then
+              increment = SWORD(updRateLimitValue)
+              applyCorrection = 0
+              if (updRateDifference < 0) then
+                 increment = -increment
+              end if
+           end if
+           -- first set the correction step values
+           updRateValues[0] = 0
+           updRateValues[1] = 0
+           updRateValues[2] = 0
+           case applyCorrection of
+             0x00 : block
+                    end block
+             0x01 : block
+                       updRateValues[1] = correction
+                    end block
+             0x02 : block
+                       updRateValues[1] = correction
+                       updRateValues[2] = correction
+                    end block
+             0x03 : block
+                       updRateValues[0] = correction
+                       updRateValues[1] = correction
+                       updRateValues[2] = correction
+                    end block
+           end case
+           updRateValues[0] = startPos + increment + updRateValues[0]
+           updRateValues[1] = updRateValues[0] + increment + updRateValues[1]
+           updRateValues[2] = updRateValues[1] + increment + updRateValues[2]
+           updRateValues[3] = updRateValues[2] + increment
+           checkBoundaryCrossing( updRateValues[0] )
+           checkBoundaryCrossing( updRateValues[1] )
+           checkBoundaryCrossing( updRateValues[2] )
+           checkBoundaryCrossing( updRateValues[3] )
+           updRateStepCount = 3
+         end block
+
+    8  : block
+           increment = (updRateDifference >> 3)
+           applyCorrection = updRateDiffAbs & 0x0007
+           -- check if LimitValue is not violated
+           if ( (updRateDiffAbs >> 3) > updRateLimitValue) then
+              increment = SWORD(updRateLimitValue)
+              applyCorrection = 0
+              if (updRateDifference < 0) then
+                 increment = -increment
+              end if
+           end if
+           -- first set the correction step values
+           updRateValues[0] = 0
+           updRateValues[1] = 0
+           updRateValues[2] = 0
+           updRateValues[3] = 0
+           updRateValues[4] = 0
+           updRateValues[5] = 0
+           updRateValues[6] = 0
+           case applyCorrection of
+             0x00 : block
+                    end block
+             0x01 : block
+                       updRateValues[1] = correction
+                    end block
+             0x02 : block
+                       updRateValues[1] = correction
+                       updRateValues[4] = correction
+                    end block
+             0x03 : block
+                       updRateValues[1] = correction
+                       updRateValues[3] = correction
+                       updRateValues[5] = correction
+                    end block
+             0x04 : block
+                       updRateValues[1] = correction
+                       updRateValues[3] = correction
+                       updRateValues[4] = correction
+                       updRateValues[6] = correction
+                    end block
+             0x05 : block
+                       updRateValues[1] = correction
+                       updRateValues[2] = correction
+                       updRateValues[4] = correction
+                       updRateValues[5] = correction
+                       updRateValues[6] = correction
+                    end block
+             0x06 : block
+                       updRateValues[1] = correction
+                       updRateValues[2] = correction
+                       updRateValues[3] = correction
+                       updRateValues[4] = correction
+                       updRateValues[5] = correction
+                       updRateValues[6] = correction
+                    end block
+             0x07 : block
+                       updRateValues[0] = correction
+                       updRateValues[1] = correction
+                       updRateValues[2] = correction
+                       updRateValues[3] = correction
+                       updRateValues[4] = correction
+                       updRateValues[5] = correction
+                       updRateValues[6] = correction
+                    end block
+           end case
+           updRateValues[0] = startPos + increment + updRateValues[0]
+           updRateValues[1] = updRateValues[0] + increment + updRateValues[1]
+           updRateValues[2] = updRateValues[1] + increment + updRateValues[2]
+           updRateValues[3] = updRateValues[2] + increment + updRateValues[3]
+           updRateValues[4] = updRateValues[3] + increment + updRateValues[4]
+           updRateValues[5] = updRateValues[4] + increment + updRateValues[5]
+           updRateValues[6] = updRateValues[5] + increment + updRateValues[6]
+           updRateValues[7] = updRateValues[6] + increment
+           checkBoundaryCrossing( updRateValues[0] )
+           checkBoundaryCrossing( updRateValues[1] )
+           checkBoundaryCrossing( updRateValues[2] )
+           checkBoundaryCrossing( updRateValues[3] )
+           checkBoundaryCrossing( updRateValues[4] )
+           checkBoundaryCrossing( updRateValues[5] )
+           checkBoundaryCrossing( updRateValues[6] )
+           checkBoundaryCrossing( updRateValues[7] )
+           updRateStepCount = 7
+         end block
+  end case
+end procedure
+
+
+-- calcUpdateData determines the update positions for each update step and
+-- sets the initial new current setpoint.
+-- The used algorithm depends on the updRateMode.
+
+procedure calcUpdateData() is
+  var byte  ix
+  var sword nextPosition, remainder, increment, swap, difference, halfWayPos
+  var word  diffAbs
+
+  ix = 0
+  if (updRateMode == UPD_RATE_LIMIT) then
+     -- calculate update values using "threshold" increments
+     -- NOTE: the number of update steps is limited to 8. If the 8 threshold
+     --       "increments" are executed and the new requested setpoint is not
+     --       reached, the indicator will lag behind, possibly corrected with
+     --       the next position update.
+     setUpdateSpeed(NORMAL_SPEED)
+     if (updRateDifference >= 0) then
+        increment = sword(updRateLimitValue)
+     else
+        increment = sword(-updRateLimitValue)
+     end if
+     -- set initial "next" position, prepare for repeat loop
+     nextPosition = updRateCurrentPos + increment
+     checkBoundaryCrossing(nextPosition)
+     remainder = sword(updRateDiffAbs) - sword(updRateLimitValue)
+     repeat
+        updRateValues[ix] = nextPosition
+        -- check whether new setpoint would be reached
+        if (remainder <= 0) then
+           -- apply correction, then we're done!
+           updRateValues[ix] = updRateNewPos
+           ix = ix + 1       ; alignment for loop exit
+           exit loop
+        end if
+        ix = ix + 1
+        nextPosition = nextPosition + increment
+        checkBoundaryCrossing(nextPosition)
+        remainder = remainder - sword(updRateLimitValue)
+     until (ix > 7)
+     updRateStepCount = ix - 1
+
+  else
+     -- calculate update values using "smoothing" information
+     case updRateSmoothMode of
+       UPD_RATE_SMOOTH_STEP2 :
+         block
+           setUpdateSpeed(NORMAL_SPEED)
+           calcSubStepPositions(2, updRateCurrentPos)
+         end block
+
+       UPD_RATE_SMOOTH_STEP4 :
+         block
+           setUpdateSpeed(NORMAL_SPEED)
+           calcSubStepPositions(4, updRateCurrentPos)
+         end block
+
+       UPD_RATE_SMOOTH_STEP8 :
+         block
+           setUpdateSpeed(NORMAL_SPEED)
+           calcSubStepPositions(8, updRateCurrentPos)
+         end block
+
+       UPD_RATE_SMOOTH_ADAPT :
+         block
+           -- try to do the movement to the new setpoint within 256 ms, and as
+           -- smooth as possible.
+           -- "as smooth as possible" ==> 8 small update movements
+           -- 8 updates within 256 ms ==> update rate is 256/8 = 32 ms
+           -- Constraints: 1. updRateLimitValue
+           --              2. updRateTimerTick
+           -- Implementation: delta = newSetpoint - CurrentSetpoint
+           -- 1. if delta > (updRateLimitValue * 8)
+           --    => new setpoint cannot be reached in 8 small update steps
+           --       without violating limit value. Do the movement at twice the
+           --       set update rate. As a result, after 8 steps half the time is
+           --       used. Therefore, using twice the update rate, there are 16
+           --       smaller steps. The chance that there is lag after the
+           --       movement is done, becomes smaller.
+           --       Also, this approach is more realistic as the movement of the
+           --       sphere is faster when the delta is bigger.
+           -- 2. if delta < (updRateLimitValue * 4)
+           --    => new setpoint can be reached with 4 updates. So, it can also
+           --       be reached with 8 updates (smaller steps) but at half speed.
+           --       This makes the movement also more realistic as the movement
+           --       of the sphere is slower when the delta is smaller.
+           --       Constraint: update rate is always >= 8 ms (minimum value).
+           -- 3. not condition 1 or 2.
+           --    => new setpoint can be reached in 8 updates at set update rate.
+           --
+           if (updRateDiffAbs > (updRateLimitValue << 3)) then
+              -- condition 1 : 16 steps at "double speed"
+              setUpdateSpeed(DOUBLE_SPEED)
+              difference = updRateDifference              -- preserve difference
+              diffAbs = updRateDiffAbs                    -- calcSubStepPosition
+              updRateDifference = difference >> 1         -- uses "updRate" vars
+              updRateDiffAbs = diffAbs >> 1
+              halfWayPos = updRateCurrentPos + updRateDifference
+              calcSubStepPositions(8, updRateCurrentPos)
+              ix = 0
+              repeat
+                 updRateValues[ix+8] = updRateValues[ix]  -- preserve positions
+                 ix = ix + 1
+              until (ix > 7)
+              updRateDifference = difference - updRateDifference
+              updRateDiffAbs = diffAbs - updRateDiffAbs
+              calcSubStepPositions(8, halfWayPos)
+              ix = 0
+              repeat
+                 swap = updRateValues[ix+8]
+                 updRateValues[ix+8] = updRateValues[ix]
+                 updRateValues[ix] = swap
+                 ix = ix + 1
+              until (ix > 7)
+              updRateStepCount = 15
+           elsif ( updRateDiffAbs < (updRateLimitValue << 2)) then
+              -- condition 2 : 8 steps at "half speed"
+              setUpdateSpeed(HALF_SPEED)
+              calcSubStepPositions(8, updRateCurrentPos)
+           else
+              -- condition 3 : 8 steps at "normal speed"
+              setUpdateSpeed(NORMAL_SPEED)
+              calcSubStepPositions(8, updRateCurrentPos)
+           end if
+         end block
+     end case
+  end if
+  -- set first update position value and index for next update
+  updRateCurrentPos = updRateValues[0]
+  updRateValueIx = 1
+end procedure
+
+
+
+-- updSynchroPosition is continuously called from the main loop.
+-- The routine executes the actions needed for each update rate mode.
+-- Update-rate "not used" is straight-forward, but "limit" and "smooth" both use
+-- a state machine. The state machine variable is the same, because "limit" and
+-- "smooth" are mutual exclusive modes.
+
+procedure updSynchroPosition() is
+  case updRateMode of
+    UPD_RATE_NOT_USED :
+      block
+        -- no update rate control
+        -- IF a new setpoint is issued, just load synchro with new setpoint
+        if (posUpdateReceived == TRUE) then
+          posUpdateReceived = FALSE           -- reset "RECEIVED" flag
+          updRateCurrentPos = updRateNewPos   -- update current position
+          setUpdateSpeed(NORMAL_SPEED)        -- update at defined speed
+          setIndicator(updRateCurrentPos)     -- load position to synchro
+        end if
+      end block
+
+    UPD_RATE_LIMIT :
+      block
+        -- update rate control checking maximum (limited) movement.
+        -- Immediate movement to new setpoint if the difference between current
+        -- position and new setpoint is smaller than / equal to limit threshold.
+        -- Otherwise, the position update is split in movements each limited to
+        -- the set threshold limit value.
+        case updRateState of                   -- LIMIT upd controller state
+          UPD_RATE_IDLE :
+            block
+              if (posUpdateReceived == TRUE) then
+                -- new setpoint: calculate delta and clear flag
+                calcURdifference()
+                -- check if delta > limit threshold
+                if (updRateDiffAbs <= updRateLimitValue) then
+                  -- delta <= limit threshold: new setpoint direct to synchro
+                  updRateCurrentPos = updRateNewPos   -- update position
+                  setUpdateSpeed(NORMAL_SPEED)        -- update at defined speed
+                  setIndicator(updRateCurrentPos)     -- load synchro
+                else
+                  -- delta > limit threshold: update synchro in threshold steps
+                  calcUpdateData()
+                  updRateState = UPD_RATE_ACTIVE
+                  setIndicator(updRateCurrentPos)
+                  set_delay(UPDATE_RATE_SLOT, timerTick)
+                end if
+              end if
+            end block
+          UPD_RATE_ACTIVE :
+            block
+              if (posUpdateReceived == TRUE) then
+                -- new setpoint: calculate delta and clear flag
+                calcURdifference()
+                -- check if delta > limit threshold
+                if (updRateDiffAbs <= updRateLimitValue) then
+                  -- delta <= limit threshold: new setpoint direct to synchro
+                  updRateCurrentPos = updRateNewPos   -- update position
+                  setUpdateSpeed(NORMAL_SPEED)        -- update at defined speed
+                  setIndicator(updRateCurrentPos)     -- load synchro
+                  updRateState = UPD_RATE_IDLE
+                else
+                  -- delta > limit threshold: update synchro in threshold steps
+                  calcUpdateData()
+                  setIndicator(updRateCurrentPos)
+                  set_delay(UPDATE_RATE_SLOT, timerTick) -- restart timer
+                end if
+              else
+                -- no new position setpoint specified
+                -- check whether the update rate timer expired
+                if (check_delay(UPDATE_RATE_SLOT)) then
+                  -- time out occurred: load next update setpoint
+                  updRateCurrentPos = updRateValues[updRateValueIx]
+                  setIndicator(updRateCurrentPos)
+                  -- check if more updates available
+                  if (updRateValueIx < updRateStepCount) then
+                    -- more update values
+                    updRateValueIx = updRateValueIx + 1
+                    set_delay(UPDATE_RATE_SLOT, timerTick)
+                  else
+                    -- last update value loaded: return to IDLE
+                    updRateState = UPD_RATE_IDLE
+                  end if
+                end if
+              end if
+            end block
+        end case
+      end block
+
+    UPD_RATE_SMOOTH :
+      block
+        case updRateState of                   -- SMOOTH upd controller state
+          UPD_RATE_IDLE :
+            block
+              if (posUpdateReceived == TRUE) then
+                -- new setpoint: calculate delta and clear flag
+                calcURdifference()
+                -- check if delta > smoothing minimum threshold
+                if (updRateDiffAbs <= updRateSmoothMin) then
+                  -- delta <= smoothing minimum: new setpoint direct to synchro
+                  updRateCurrentPos = updRateNewPos   -- update position
+                  setUpdateSpeed(NORMAL_SPEED)        -- update at defined speed
+                  setIndicator(updRateCurrentPos)     -- load synchro
+                else
+                  -- delta > smoothing minimum: update synchro in small steps
+                  calcUpdateData()
+                  updRateState = UPD_RATE_ACTIVE
+                  setIndicator(updRateCurrentPos)
+                  set_delay(UPDATE_RATE_SLOT, timerTick)
+                end if
+              end if
+            end block
+          UPD_RATE_ACTIVE :
+            block
+              if (posUpdateReceived == TRUE) then
+                -- new setpoint: calculate delta and clear flag
+                calcURdifference()
+                -- check if delta > smoothing minimum threshold
+                if (updRateDiffAbs <= updRateSmoothMin) then
+                  -- delta <= smoothing minimum: new setpoint direct to synchro
+                  updRateCurrentPos = updRateNewPos   -- update position
+                  setIndicator(updRateCurrentPos)     -- load synchro
+                  updRateState = UPD_RATE_IDLE
+                else
+                  -- delta > smoothing minimum: update synchro in small steps
+                  calcUpdateData()
+                  setIndicator(updRateCurrentPos)
+                  set_delay(UPDATE_RATE_SLOT, timerTick) -- restart timer
+                end if
+              else
+                -- no new position setpoint specified
+                -- check whether the update rate timer expired
+                if (check_delay(UPDATE_RATE_SLOT)) then
+                  -- time out occurred: load next update setpoint
+                  updRateCurrentPos = updRateValues[updRateValueIx]
+                  setIndicator(updRateCurrentPos)
+                  -- check if more updates available
+                  if (updRateValueIx < updRateStepCount) then
+                    -- more update values
+                    updRateValueIx = updRateValueIx + 1
+                    set_delay(UPDATE_RATE_SLOT, timerTick)
+                  else
+                    -- last update value loaded: return to IDLE
+                    updRateState = UPD_RATE_IDLE
+                  end if
+                end if
+              end if
+            end block
+        end case
+      end block
+
+  end case
+end procedure
+

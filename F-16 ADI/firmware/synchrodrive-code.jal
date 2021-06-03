@@ -1,0 +1,663 @@
+const byte sine[] = {   0,   2,   3,   5,   6,   8,   9,  11,
+                       13,  14,  16,  17,  19,  20,  22,  23,
+                       25,  27,  28,  30,  31,  33,  34,  36,
+                       37,  39,  41,  42,  44,  45,  47,  48,
+                       50,  51,  53,  54,  56,  57,  59,  60,
+                       62,  63,  65,  67,  68,  70,  71,  73,
+                       74,  76,  77,  79,  80,  81,  83,  84,
+                       86,  87,  89,  90,  92,  93,  95,  96,
+                       98,  99, 100, 102, 103, 105, 106, 108,
+                      109, 110, 112, 113, 115, 116, 117, 119,
+                      120, 122, 123, 124, 126, 127, 128, 130,
+                      131, 132, 134, 135, 136, 138, 139, 140,
+                      142, 143, 144, 146, 147, 148, 149, 151,
+                      152, 153, 154, 156, 157, 158, 159, 161,
+                      162, 163, 164, 165, 167, 168, 169, 170,
+                      171, 172, 174, 175, 176, 177, 178, 179,
+                      180, 181, 183, 184, 185, 186, 187, 188,
+                      189, 190, 191, 192, 193, 194, 195, 196,
+                      197, 198, 199, 200, 201, 202, 203, 204,
+                      205, 206, 207, 208, 208, 209, 210, 211,
+                      212, 213, 214, 215, 215, 216, 217, 218,
+                      219, 220, 220, 221, 222, 223, 223, 224,
+                      225, 226, 226, 227, 228, 228, 229, 230,
+                      231, 231, 232, 232, 233, 234, 234, 235,
+                      236, 236, 237, 237, 238, 238, 239, 240,
+                      240, 241, 241, 242, 242, 243, 243, 244,
+                      244, 244, 245, 245, 246, 246, 247, 247,
+                      247, 248, 248, 248, 249, 249, 249, 250,
+                      250, 250, 251, 251, 251, 252, 252, 252,
+                      252, 252, 253, 253, 253, 253, 253, 254,
+                      254, 254, 254, 254, 254, 254, 254, 255,
+                      255, 255, 255, 255, 255, 255, 255, 255 }
+
+
+-- power down routine
+-- every time setIndicator() is called to move the sphere to a new position, the
+-- powerdown timer is started, if the powerdown feature is enabled.
+-- If the feature is enabled and the timer expires, the amplitude of the voltage
+-- on the stator coils is set to half value of the current set value ==> the
+-- magnetic forces that try to establish a force field equilibrium with magnetic
+-- field of the rotor is lowered to reduce "humming".
+-- Note that setting the stator coil voltages to zero (value 255 in the code!),
+-- does not work as the sphere will make a small movement, no longer at the
+-- correct position. Some "holding" force is required.
+-- Update: even half voltage level is not sufficient to hold without humming!
+--         For my ADI it does not work, but I leave the code here.
+
+procedure chkPowerDown() is
+   if ((usePowerDown == TRUE) & (pwrDownValid == TRUE)) then
+      if ( check_delay(POWER_DOWN_SLOT) ) then
+         if (pwrDownLevel == POWER_DOWN_MAX) then
+            actualS1Ampl = 255                       -- 255 :: coil voltage 0V
+            actualS2Ampl = 255                       -- 255 :: coil voltage 0V
+            actualS3Ampl = 255                       -- 255 :: coil voltage 0V
+         else
+            actualS1Ampl = pwrDownS1Ampl             -- set in setIndicator()
+            actualS2Ampl = pwrDownS2Ampl
+            actualS3Ampl = pwrDownS3Ampl
+         end if
+      end if
+   end if
+end procedure
+
+
+
+procedure convertAngle(SWORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 1023.
+  ; The value is converted to a look-up value for a "quadrant". The first
+  ; half sine period is equal to the second half, except for the polarity.
+
+var byte baseAngle
+
+  if (angle < 256) then
+    baseAngle = byte(angle)
+    polarity = 0
+  elsif (angle < 512) then
+    baseAngle = byte(255 - (angle - 256))
+    polarity = 0
+  elsif (angle < 768) then
+    baseAngle = byte(angle - 512)
+    polarity = 1
+  else
+    baseAngle = byte(1023 - angle)
+    polarity = 1
+  end if
+  
+  amplitude = sine[baseAngle]
+end procedure
+
+
+procedure setIndicator(SWORD in setAngle) is
+  ; setAngle is the 10-bit setpoint angle where 0 :: 0° and 0x3FF :: 359°
+  ; sine lookup table is used to retrieve the individual stator amplitudes.
+  ; As the angle varies from 0 to 1023 for one full sine wave, one "quadrant"
+  ; spans a range of 256 values. Therefore, the sine table thus has 256 entries,
+  ; and returns a value between 0 and 255 (the amplitude).
+
+var sword s1Angle, S2Angle, s3Angle
+
+  ; first check whether the specified angle is within the physical position
+  ; range. For the ROLL position there is no limit, but for the PITCH position
+  ; there is a limit. Setting a position beyond the limit value will SLAM the
+  ; sphere against an internal endstop. You don't want that to happen too often!
+
+  if (setAngle < angleLimitMin) then setAngle = angleLimitMin  end if
+  if (setAngle > angleLimitMax) then setAngle = angleLimitMax  end if
+
+  s1Angle = setAngle + s1BaseAngle
+  s2Angle = setAngle + s2BaseAngle
+  s3Angle = setAngle + s3BaseAngle
+
+  -- norm to base value
+  if (s1Angle > 1023) then s1Angle = s1Angle - 1024  end if
+  if (s2Angle > 1023) then s2Angle = s2Angle - 1024  end if
+  if (s3Angle > 1023) then s3Angle = s3Angle - 1024  end if
+
+  -- retrieve amplitude and polarity and LOAD "deferred variables"
+  convertAngle(s1Angle)
+  deferredS1Ampl = 255 - amplitude
+  deferredS1Pol  = polarity
+  ;
+  convertAngle(s2Angle)
+  deferredS2Ampl = 255 - amplitude
+  deferredS2Pol  = polarity
+  ;
+  convertAngle(s3Angle)
+  deferredS3Ampl = 255 - amplitude
+  deferredS3Pol  = polarity
+
+  -- output to indicator
+  actualS1Ampl = deferredS1Ampl
+  actualS2Ampl = deferredS2Ampl
+  actualS3Ampl = deferredS3Ampl
+  S1POLARITY   = deferredS1Pol
+  S2POLARITY   = deferredS2Pol
+  S3POLARITY   = deferredS3Pol
+
+  -- start power down timer if feature is enabled (stop "humming at position")
+  if (usePowerDown == TRUE) then
+     pwrDownS1Ampl = actualS1Ampl >> 1
+     pwrDownS2Ampl = actualS2Ampl >> 1
+     pwrDownS3Ampl = actualS3Ampl >> 1
+     pwrDownValid  = TRUE
+     set_delay(POWER_DOWN_SLOT, powerDownTime)
+  end if
+end procedure
+
+
+procedure demo() is
+var byte  endOfMovement
+var sword delta, swapLimitValue
+
+   -- when initially started demoAngle = start position
+   if (demoActive == TRUE) then
+      if ( check_delay(DEMO_UPD_SLOT) ) then
+         set_delay(DEMO_UPD_SLOT, demoSpeed)
+         setIndicator(demoAngle)
+         -- determine next position
+         endOfmovement = FALSE
+         if (demoDirection == DEMO_SWEEP_INC) then
+            demoAngle = demoAngle + demoStepSize
+            if (demoAngle > 1023) then
+               demoAngle = demoAngle - 1024
+            end if
+            delta = demoLimitValue1 - demoAngle
+            if ( (delta < 512) & (delta > -512) ) then
+               if (demoAngle >= demoLimitValue1) then
+                  endOfmovement = TRUE
+               end if
+            else
+               if (demoAngle <= demoLimitValue1) then
+                  endOfmovement = TRUE
+               end if
+            end if
+         else
+            -- decrement : cannot go negative!
+            if (demoStepSize <= demoAngle) then
+               demoAngle = demoAngle - demoStepSize
+            else
+               demoAngle = demoAngle + 1024
+               demoAngle = demoAngle - demoStepSize
+            end if
+            delta = demoLimitValue1 - demoAngle
+            if ( (delta < 512) & (delta > -512) ) then
+               if (demoAngle <= demoLimitValue1) then
+                  endOfmovement = TRUE
+               end if
+            else
+               if (demoAngle >= demoLimitValue1) then
+                  endOfmovement = TRUE
+               end if
+            end if
+         end if
+         -- end of movement, what next?
+         if (endOfMovement == TRUE) then
+            if (demoModus == DEMO_MODE_INC_RST) then
+               demoAngle = demoLimitValue2
+            else
+               demoAngle = demoLimitValue1
+               if (demoDirection == DEMO_SWEEP_INC) then
+                  demoDirection = DEMO_SWEEP_DEC
+               else
+                  demoDirection = DEMO_SWEEP_INC
+               end if
+               swapLimitValue  = demoLimitValue1
+               demoLimitValue1 = demoLimitValue2
+               demoLimitValue2 = swapLimitValue
+            end if
+         end if
+      end if
+   end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte IDbyte
+  var sword delta
+
+  case (commandCode) of
+      CMD_SSYNQ1   : block
+                         updRateNewPos = sword(word(commandData))
+                         posUpdateReceived  = TRUE
+                     end block
+      CMD_SSYNQ2   : block
+                         updRateNewPos = sword(word(commandData) + 256)
+                         posUpdateReceived  = TRUE
+                     end block
+      CMD_SSYNQ3   : block
+                         updRateNewPos = sword(word(commandData) + 512)
+                         posUpdateReceived  = TRUE
+                     end block
+      CMD_SSYNQ4   : block
+                         updRateNewPos = sword(word(commandData) + 768)
+                         posUpdateReceived  = TRUE
+                     end block
+
+      CMD_LIMIT_MIN : block
+                          angleLimitMin = sword((word(commandData)) << 2)
+                      end block
+      CMD_LIMIT_MAX : block
+                          angleLimitMax = sword((word(commandData)) << 2)
+                          if (angleLimitMax == 1020) then
+                             -- 0xFF (255) to 10-bit equals 1020. Correct to max
+                             angleLimitMax = 1023
+                          end if
+                      end block
+
+      CMD_SET8BIT  : block
+                         updRateNewPos = sword((word(commandData)) << 2)
+                         posUpdateReceived  = TRUE
+                     end block
+
+      CMD_S1AMPLD  : block
+                         deferredS1Ampl = 255 - commandData
+                     end block
+      CMD_S2AMPLD  : block
+                         deferredS2Ampl = 255 - commandData
+                     end block
+      CMD_S3AMPLD  : block
+                         deferredS3Ampl = 255 - commandData
+                     end block
+      CMD_SxPOLD   : block
+                         if ((commandData & 0x01) == 0x00) then
+                             deferredS1Pol = 0
+                         else
+                             deferredS1Pol = 1
+                         end if
+                         if ((commandData & 0x02) == 0x00) then
+                             deferredS2Pol = 0
+                         else
+                             deferredS2Pol = 1
+                         end if
+                         if ((commandData & 0x04) == 0x00) then
+                             deferredS3Pol = 0
+                         else
+                             deferredS3Pol = 1
+                         end if
+                         -- now load all "synchronously"
+                         actualS1Pol  = deferredS1Pol
+                         actualS2Pol  = deferredS2Pol
+                         actualS1Pol  = deferredS1Pol
+                         actualS1Ampl = deferredS1Ampl
+                         actualS2Ampl = deferredS2Ampl
+                         actualS3Ampl = deferredS3Ampl
+                         S1POLARITY   = deferredS1Pol
+                         S2POLARITY   = deferredS2Pol
+                         S3POLARITY   = deferredS3Pol
+                     end block
+
+      -- WATCHDOG
+      CMD_WTCHDOG_DIS : block
+                            wtchdogEnabled = FALSE
+                        end block
+      CMD_WTCHDOG_ENA : block
+                            if ((commandData & 0x3F) == 0x00) then
+                                -- set default timeout value
+                                wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+                            else
+                                wtchdogDelayValue = word(commandData & 0x3F)
+                            end if
+                            if ((commandData & 0xC0) == 0x80) then
+                                -- enable watchdog
+                                wtchdogEnabled = TRUE
+                                set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                            end if
+                            if ((commandData & 0xC0) == 0x00) then
+                                -- disable watchdog
+                                wtchdogEnabled = FALSE
+                            end if
+                        end block
+
+      -- PowerDown
+      CMD_PWR_DOWN : block
+                         if ((commandData & 0x3F) == 0x00) then
+                             -- set default power down time
+                             powerDownTime = PWR_DOWN_DEFAULT
+                                             << PWR_DOWN_TICK_SCALE
+                         else
+                             powerDownTime = (word(commandData & 0x3F))
+                                             << PWR_DOWN_TICK_SCALE
+                         end if
+                         if ((commandData & 0x40) == 0x40) then
+                             -- power down "full"
+                             pwrDownLevel = POWER_DOWN_MAX
+                         else
+                             pwrDownLevel = POWER_DOWN_HALF
+                         end if
+                         if ((commandData & 0x80) == 0x80) then
+                             -- enable power down feature
+                             pwrDownValid = FALSE  -- values not valid
+                             usePowerDown = TRUE
+                         else
+                             -- disable power down feature
+                             pwrDownValid = FALSE  -- values not valid
+                             usePowerDown = FALSE
+                         end if
+                     end block
+
+      -- PWM outputs
+      CMD_DEFOUT   : block
+                         if ((commandData & 0x02) == 0x02) then
+                             userOutMode1 = PWM_OUTPUT
+                             userOutputPWM1 = 0
+                         else
+                             userOutMode1 = DIG_OUTPUT
+                             DIGPWM1 = 0
+                         end if
+                         if ((commandData & 0x04) == 0x04) then
+                             userOutMode2 = PWM_OUTPUT
+                             userOutputPWM2 = 0
+                         else
+                             userOutMode2 = DIG_OUTPUT
+                             DIGPWM2 = 0
+                         end if
+if (defined(PITCH) == true) then
+                         -- overrule user-defined command: OUT3 always PWM
+                         userOutMode3 = PWM_OUTPUT
+                         userOutputPWM3 = 0
+else
+                         if ((commandData & 0x08) == 0x08) then
+                             userOutMode3 = PWM_OUTPUT
+                             userOutputPWM3 = 0
+                         else
+                             userOutMode3 = DIG_OUTPUT
+                             DIGPWM3 = 0
+                         end if
+end if
+if (defined(PITCH) == true) then
+                         -- overrule user-defined command: OUT4 always PWM
+                         userOutMode4 = PWM_OUTPUT
+                         userOutputPWM4 = 0
+else
+                         if ((commandData & 0x10) == 0x10) then
+                             userOutMode4 = PWM_OUTPUT
+                             userOutputPWM4 = 0
+                         else
+                             userOutMode4 = DIG_OUTPUT
+                             DIGPWM4 = 0
+                         end if
+end if
+                         if ((commandData & 0x20) == 0x20) then
+                             userOutMode5 = PWM_OUTPUT
+                             userOutputPWM5 = 0
+                         else
+                             userOutMode5 = DIG_OUTPUT
+                             DIGPWM5 = 0
+                         end if
+                         if ((commandData & 0x40) == 0x40) then
+                             userOutMode6 = PWM_OUTPUT
+                             userOutputPWM6 = 0
+                         else
+                             userOutMode6 = DIG_OUTPUT
+                             DIGPWM6 = 0
+                         end if
+                         if ((commandData & 0x80) == 0x80) then
+                             userOutMode7 = PWM_OUTPUT
+                             userOutputPWM7 = 0
+                         else
+                             userOutMode7 = DIG_OUTPUT
+                             DIGPWM7 = 0
+                         end if
+                     end block
+      CMD_USROUT1  : block
+                         if (userOutMode1 == PWM_OUTPUT) then
+                           userOutputPWM1 = commandData
+                         else
+                           -- simple digital output
+                           if (commandData == 0) then  DIGPWM1 = 0 end if
+                           if (commandData == 1) then  DIGPWM1 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT2  : block
+                         if (userOutMode2 == PWM_OUTPUT) then
+                           userOutputPWM2 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM2 = 0 end if
+                           if (commandData == 1) then  DIGPWM2 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT3  : block
+                         if (userOutMode3 == PWM_OUTPUT) then
+                           userOutputPWM3 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM3 = 0 end if
+                           if (commandData == 1) then  DIGPWM3 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT4  : block
+                         if (userOutMode4 == PWM_OUTPUT) then
+                           userOutputPWM4 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM4 = 0 end if
+                           if (commandData == 1) then  DIGPWM4 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT5  : block
+                         if (userOutMode5 == PWM_OUTPUT) then
+                           userOutputPWM5 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM5 = 0 end if
+                           if (commandData == 1) then  DIGPWM5 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT6  : block
+                         if (userOutMode6 == PWM_OUTPUT) then
+                           userOutputPWM6 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM6 = 0 end if
+                           if (commandData == 1) then  DIGPWM6 = 1 end if
+                         end if
+                     end block
+      CMD_USROUT7  : block
+                         if (userOutMode7 == PWM_OUTPUT) then
+                           userOutputPWM7 = commandData
+                         else
+                           if (commandData == 0) then  DIGPWM7 = 0 end if
+                           if (commandData == 1) then  DIGPWM7 = 1 end if
+                         end if
+                     end block
+
+      -- miscelleanous
+      CMD_PWMOUT   : block
+                         userOutputPWM0 = commandData
+                     end block
+
+      CMD_UPDRATE  : block
+                         setUpdateRate(commandData)
+                     end block
+
+      CMD_DIAGMODE : block
+                         setDiagLEDmode(commandData)
+                     end block
+
+      -- base angle offsets
+      -- NOTE: LSB value must be set *before* MSB value!
+      CMD_S1BASE_L : block
+                         s1BaseAngleLsb = sword(word(commandData))
+                     end block
+      CMD_S1BASE_H : block
+                         s1BaseAngle = sword((word(commandData)) << 8)
+                         s1BaseAngle = s1BaseAngle + s1BaseAngleLsb
+                     end block
+      CMD_S2BASE_L : block
+                         s2BaseAngleLsb = sword(word(commandData))
+                     end block
+      CMD_S2BASE_H : block
+                         s2BaseAngle = sword((word(commandData)) << 8)
+                         s2BaseAngle = s2BaseAngle + s2BaseAngleLsb
+                     end block
+      CMD_S3BASE_L : block
+                         s3BaseAngleLsb = sword(word(commandData))
+                     end block
+      CMD_S3BASE_H : block
+                         s3BaseAngle = sword((word(commandData)) << 8)
+                         s3BaseAngle = s3BaseAngle + s3BaseAngleLsb
+                     end block
+
+      -- DEMO mode
+      CMD_DEMO_CTRL : block
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --  |     .     |     .     .     .     |     |     |
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --    step speed     set size            modus start
+                        --
+                        --                                             0 = stop
+                        --                                             1 = start
+                        --                                         0 = INC/DEC
+                        --                                         1 = INC/RST
+                        --                 0000 = increment of 1
+                        --                 ssss = increment of "ssss" x 2
+                        --                 0001 = increment of 2
+                        --                 1111 = increment of 30
+                        --     00 = DEMO_UPD_RATE_0 (100 ms)
+                        --     01 = DEMO_UPD_RATE_1 (500 ms)
+                        --     10 = DEMO_UPD_RATE_2  (1 sec)
+                        --     11 = DEMO_UPD_RATE_3  (2 sec)
+                        --
+                        -- first check start/stop flag
+                        if ((commandData & 0x01) == 0x01) then
+                           -- START: get movement type, speed and stepsize first
+                           if ((commandData & 0x02) == 0x02) then
+                              demoModus = DEMO_MODE_INC_RST  -- sweep / reset
+                           else
+                              demoModus = DEMO_MODE_INC_DEC  -- sweep up / down
+                           end if
+                           demoLimitValue1 = demoStopPos
+                           demoLimitValue2 = demoStartPos
+                           -- movement speed
+                           if ((commandData & 0xC0) == 0x40) then
+                              demoSpeed = DEMO_UPD_RATE_1
+                           elsif ((commandData & 0xC0) == 0x80) then
+                              demoSpeed = DEMO_UPD_RATE_2
+                           elsif ((commandData & 0xC0) == 0xC0) then
+                              demoSpeed = DEMO_UPD_RATE_3
+                           else
+                              demoSpeed = DEMO_UPD_RATE_0
+                           end if
+                           -- step size
+                           if ((commandData & 0x3C) == 0x00) then
+                              demoStepSize = DEMO_DFLT_STEPSIZE  -- most smooth
+                           else
+                              demoStepSize = sword(word((commandData & 0x3C) >> 1))
+                           end if
+                           -- prepare and start demo movement
+                           if (demoStartPos < demoStopPos) then
+                              delta = demoStopPos - demoStartPos
+                              demoDirection = DEMO_SWEEP_INC
+                           else
+                              delta = demoStartPos - demoStopPos
+                              demoDirection = DEMO_SWEEP_DEC
+                           end if
+                           -- shortest movement path correction
+                           if ( delta > 512) then
+                              if (demoDirection == DEMO_SWEEP_INC) then
+                                 demoDirection = DEMO_SWEEP_DEC
+                              else
+                                 demoDirection = DEMO_SWEEP_INC
+                              end if
+                           end if
+                           demoAngle  = demoStartPos
+                           demoActive = TRUE
+                           set_delay(DEMO_UPD_SLOT, demoSpeed)
+                        else
+                           -- STOP
+                           demoActive = FALSE                    -- just stop
+                        end if
+                      end block
+
+      CMD_DEMO_STRT : block
+                          demoStartPos = sword((word(commandData)) << 2)
+                      end block
+
+      CMD_DEMO_STOP : block
+                          demoStopPos = sword((word(commandData)) << 2)
+                      end block
+
+      CMD_S1AMPL   : block
+                         actualS1Ampl = 255 - commandData
+                     end block
+      CMD_S2AMPL   : block
+                         actualS2Ampl = 255 - commandData
+                     end block
+      CMD_S3AMPL   : block
+                         actualS3Ampl = 255 - commandData
+                     end block
+      CMD_SxPOL    : block
+                         if ((commandData & 0x01) == 0x00) then
+                             actualS1Pol = 0
+                             S1POLARITY  = 0
+                         else
+                             actualS1Pol = 1
+                             S1POLARITY  = 1
+                         end if
+                         if ((commandData & 0x02) == 0x00) then
+                             actualS2Pol = 0
+                             S2POLARITY  = 0
+                         else
+                             actualS2Pol = 1
+                             S2POLARITY  = 1
+                         end if
+                         if ((commandData & 0x04) == 0x00) then
+                             actualS3Pol = 0
+                             S3POLARITY  = 0
+                         else
+                             actualS3Pol = 1
+                             S3POLARITY  = 1
+                         end if
+                     end block
+
+      -- USB test
+      CMD_IDENTIFY  : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            usb_serial_data = "S"
+                            usb_serial_data = "D"
+                            usb_serial_data = "I"
+                            usb_serial_data = " "
+                            usb_serial_data = "v"
+                            usb_serial_data = "0" + MAJOR_VERSION
+                            usb_serial_data = "."
+                            usb_serial_data = "0" + MINOR_VERSION
+                            usb_serial_data = " "
+                            usb_serial_data = "$"
+                            IDbyte = ((SYNCHRO_ADDR >> 4) & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            IDbyte = (SYNCHRO_ADDR & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            usb_serial_data = 13                        ; add CR
+                            usb_serial_data = 10                        ; add LF
+                         end if
+                      end block
+      -- USB debug
+      CMD_USB_DEBUG : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            if (commandData == "N") then
+                               USBdebugEnabled = FALSE
+                            elsif (commandData == "Y") then
+                               USBdebugEnabled = TRUE
+                            end if
+                         end if
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                    ; do nothing - reject
+  -- debug help: toggle output 7 when we get here (unexpected!!)
+  -- not documented, but an LED can be connected to check correct software flow
+                    ; if (DIGPWM7 == 0) then
+                    ;     DIGPWM7 = 1
+                    ; else
+                    ;     DIGPWM7 = 0
+                    ; end if
+                end block
+  end case
+end procedure
+

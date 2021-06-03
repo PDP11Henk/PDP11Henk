@@ -1,0 +1,140 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: synchrodrive-upd-defs
+--
+--    this module contains the defines and variables used for the update rate.
+
+var byte updRateCommand                           -- update-rate command byte
+var byte updRateMode                              -- update operation mode
+
+const byte UPD_RATE_NOT_USED       = 0
+const byte UPD_RATE_LIMIT          = 1            -- LIMIT mode
+const byte UPD_RATE_SMOOTH         = 2            -- SMOOTH mode
+
+var word updRateLimitValue                        -- limit value
+var byte updRateSmoothMode                        -- smoothing mode
+
+const byte UPD_RATE_SMOOTH_ADAPT   = 0                 -- smoothing adaptive
+const byte UPD_RATE_SMOOTH_STEP2   = 1                 -- smoothing in 2 steps
+const byte UPD_RATE_SMOOTH_STEP4   = 2                 -- smoothing in 4 steps
+const byte UPD_RATE_SMOOTH_STEP8   = 3                 -- smoothing in 8 steps
+
+var word updRateSmoothMin                         -- smoothing minimum threshold
+var word updRateTimerTick                         -- defined timer count value
+var word timerTick                                -- used timer count value
+var byte updRateState                             -- controller state
+
+const byte UPD_RATE_IDLE           = 0            -- controller IDLE
+const byte UPD_RATE_ACTIVE         = 1            -- controller ACTIVE
+
+var byte posUpdateReceived                        -- new position received flg
+var sword updRateCurrentPos                       -- current position setpoint
+var sword updRateNewPos                           -- new specified setpoint
+var sword updRateDifference                       -- (new - current) setpoint
+var word updRateDiffAbs                           -- absolute difference
+var sword updRateValues[16]                       -- calculated upd positions
+var byte updRateValueIx                           -- index in value array
+var byte updRateStepCount                         -- number of steps in update
+var byte updRateShortPath                         -- movement via shortest path
+
+
+--    -- 7 --+-- 6 --+-- 5 --+-- 4 --+-- 3 --+-- 2 --+-- 1 --+-- 0 --+
+--    |    modus     |                                               |
+--    -------.-------+-------.-------.-------.-------.-------.--------
+--
+--       0       0      LIMIT: set update-rate limit threshold
+--                             If the difference between the current setpoint
+--                             and the new setpoint is larger than the specified
+--                             threshold value (bits 5~0), the big movement is
+--                             split in movements of max the threshold value.
+--                             As 6 bits represent 22.5° rotation, this is the
+--                             maximum limit value when update-rate is enabled.
+--                        [00.000000] -> disable update-rate
+--
+--       0       1      SMOOTH: break-up in small updates.
+--                        bit [1 0]
+--                             0 0  - smoothing adaptive (2,4 or 8 steps
+--                                                      depending on difference)
+--                             0 1  - smoothing in 2 steps
+--                             1 0  - smoothing in 4 steps
+--                             1 1  - smoothing in 8 steps
+--                        bit 5432  - smoothing minimum threshold
+--                                    0000 - threshold difference of 4
+--                                    0001 - threshold difference of 8
+--                                    0010 - threshold difference of 12
+--                                     ::
+--                                    1111 - threshold difference of 64
+--
+--       1       0      SPEED: the delay time between update-rate steps.
+--                        bit 43210 - step update in 8ms increments
+--                                    minimum is 00000 ::   8 ms
+--                                    maximum is 11111 :: 256 ms
+--
+--       1       1      MISCELLEANOUS settings
+--                        bit [0]   - enable/disable position update movement
+--                                    via shortest path to next position.
+--                                    "0" - disabled
+--                                    "1" - enabled (default setting)
+--                        bit [1-7] - not used
+--
+--
+--    The major difference between LIMIT mode and SMOOTH mode is that in LIMIT
+--    mode the update steps are of "size" defined by the threshold value,
+--    whereas in SMOOTH mode the step"size" depends on the difference between
+--    the current position and new setpoint position *and* the number of steps.
+--    When smoothing is set to "adaptive" the number of update steps depends on
+--    the difference between the current position and new setpoint position.
+--    SPEED sets the delay between consecutive updates to move to the new
+--    setpoint position. This can also be useful in LIMIT mode, for example when
+--    the threshold value is rather large, but the new setpoint is even larger.
+--    In that case the "big" movement update might need more time than 8ms ...
+
+
+-- setUpdateRate is called when an "UPDATE RATE" command is received.
+-- This procedure is the interface between the synchrodrive-code module that
+-- accepts commands and synchrodrive-upd-code module for update rate control.
+-- The data byte of the command is processed and information is stored/updated.
+
+procedure setUpdateRate(BYTE in commandData) is
+  var byte rateMode, info
+
+  updRateCommand = commandData                         -- get UpdateRate command
+
+  -- process Update_Rate command
+  rateMode = (commandData & 0xC0)                      -- isolate modus bits
+  case rateMode of
+    0x00 : block
+             -- LIMIT
+             updRateLimitValue = word(commandData & 0x3F)
+             if (updRateLimitValue == 0) then
+               updRateMode = UPD_RATE_NOT_USED
+             else
+               updRateMode = UPD_RATE_LIMIT
+             end if
+           end block
+    0x40 : block
+             -- SMOOTH
+             updRateSmoothMode = (commandData & 0x03)      -- smooth mode bits
+             updRateSmoothMin = word(commandData & 0x3C)   -- threshold
+             updRateSmoothMin = updRateSmoothMin + 4
+             updRateMode = UPD_RATE_SMOOTH
+           end block
+    0x80 : block
+             -- SPEED
+             info = (commandData & 0x1F)               -- isolate speed bits
+             info = info + 1
+             updRateTimerTick = (word(info)) << 3      -- *8 :: 8 ms ticks
+           end block
+    0xC0 : block
+             -- enable/disable "position update movement via shortest path"
+             if ((commandData & 0x01) == 1) then
+               updRateShortPath = TRUE
+             else
+               updRateShortPath = FALSE
+             end if
+           end block
+  end case
+end procedure
+

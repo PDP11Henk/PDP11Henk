@@ -1,0 +1,777 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Synchro Drive Interface (SDI)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Author: Henk Gooijen, Copyright (c) 2014-2015-2016, all rights reserved
+--
+-- Compiler: 2.4q5
+--
+-- Released under the GPL license
+--         (http://www.opensource.org/licenses/bsd-license.php)
+--
+-- Description:
+--         Firmware to control a synchro (3 coils in Y configuration) as found
+--         in many (older) aircraft instruments.
+--         The firmware uses a jumper-selectable USB or PHCC-DOA interface. The
+--         communication is one-way only: from PC to SDI.
+--         Further, one PWM output is fixed allocated, and 7 more outputs are
+--         available, which can be configured as "simple digital" output or PWM
+--         output, all 7 independently of each other.
+--
+-- Notes:
+--         - File creation date/time: 08 aug 2014.
+--         - Initial working version: 27 sep 2014.
+--         - v0.1 30-09-2014: PWM output is hardware-wise for a "center"-zero
+--                indicator. Set PWM to mid-value (128) for 50% duty cycle.
+--         - v0.2 21-06-2015: first test on real ADI. Bug in angle lookup in 3rd
+--                and 4th quadrant. Typo (textual) corrections.
+--         - v0.3 22-06-2015: added demo mode. One command byte to start the
+--                demo, one command byte to stop the demo.
+--         - v0.4 23-06-2015: added 3 commands to preset an "offset" for each
+--                stator coil. Default is OK for F-16 ADI ROLL :: "horizontal".
+--         - v0.5 23-06-2015: changed "setpoint angle" command (sub-address 0)
+--                to a 10-bit value => 2 subsequent received bytes are required.
+--         - v0.6 27-06-2015: demo mode is useful. Made it more generic: added
+--                3 commands: "define startpos", "define stoppos", and "mode
+--                control". "mode control" incorporates movement modus, update
+--                speed, step size and activate/de-activate flag.
+--         - v0.7 28-06-2015: added a DOA protocol watchdog.
+--                At power-up random "clock pulses" may be detected by the DOA
+--                bit reception routine. If this happens, the DOA protocol
+--                bitstream reception state machine will never return to a
+--                correct state. As a result, all subsequent messages will be
+--                wrong. This problem is solved by a watchdog timer. Initially
+--                the timer is started. Every time a DOA clock pulse is detected
+--                the timer is restarted. If the timer expires (time out), there
+--                has been a time out time period of inactivity on the DOA bus.
+--                This inactivity is used to synchronize the DOA data reception
+--                state machine: return to initial state. The mechanism is also
+--                used for the USB connection.
+--         - v0.8 19-08-2015: the implemented DOA protocol watchdog mechanism is
+--                also used for the USB connection. For testing using DOA the
+--                PHCC TestTool is used, for testing USB the PuTTY program is
+--                used. However, the data bytes are entered manually via PuTTY,
+--                and there is significant time between the two USB data bytes.
+--                Thus, the watchdag effectively kills all (manually entered)
+--                USB commands. ==> Watchdog must be configurable.
+--                There are no sub-addresses left, but at least one sub-address
+--                is needed. The commands S1POL, S2POL, S3POL are combined to a
+--                single SxPOL command. To keep the interface consistent S1POLD,
+--                S2POLD, S3POLD are also changed to a single SxPOLD command.
+--                As a result, all command code numbers for the synchro control
+--                have changed!
+--         - v0.9 27-08-2015: the 10-bit "high resolution" setpoint (v0.5), is
+--                great, but cannot be used with the PHCC TestTool. A command is
+--                added that accepts the 8 bit data from the TestTool. Internal
+--                this data is simply converted to 10-bit (2 least significant
+--                bits are 0).
+--         - RC1  Release Candidate #1
+--                Bug fix after defining test cases. High-resolution command is
+--                not working, redesign needed in DOA and USB receive routines!
+--                If setpoint angle > 1023 then a correction of 1023 is applied.
+--                That is wrong, correction must be 1024.
+--                Added a new "feature": power-down after a definable time. With
+--                this command you can stop the ADI "at position humming".
+--                Update: "power-down" does not work, but I leave the code in.
+--         - RC2  Release Candidate #2
+--                Added extra command to enable debugging of USB data. The extra
+--                command is invalid in PHCC DOA communication mode. See the USB
+--                module for an explanation of the debug output. Default debug
+--                is disabled.
+--                Added 2 exra commands to make the limit value a parameter. The
+--                associated variables (angleLimitMin and angleLimitMax) are set
+--                with default values at power-up.
+--                The special GETSYN 10-bit command (two consecutive 5-bit data
+--                bytes) is removed. Instead are 4 commands added allowing to
+--                set data in range 0-255, but each command adds a quadrant base
+--                offset (0, 256, 512, or 768).
+--         - 1.2  Released and programmed into 8 "roll" PICs and 8 "pitch" PICs
+--
+--         - xxx  testversion occasional deaf, declare some variables "volatile"
+--                commented out "BSR = 0". Let the compiler do the workz.
+--                Also using new compiler version 2.4q5 (instead of 2.4o).
+--                DIGPWM5, DIGPWM6 and DIGPWM7 enabled.
+--                Timer3 interrupt routine "removed". Why is that there anyway?
+--                Problem solved! Spurious interrupts! 100k from DOAclk to GND!
+--
+--   DEBUGGING    Use DIGPWM5, DIGPWM6, DIGPWM7 for LED output in routines.
+--                DIGPWM5 toggles in IRQ routine per received 1st command bit
+--                DIGPWM6 toggles in IRQ routine when CMD accepted id set
+--                DIGPWM7 toggles in processCommand() case "otherwise" branch
+--
+--         - V1.3 The glide slope and localizer bars and PITCH synchro position
+--                affect each other. For example, when the glide slope bar is
+--                exactly "level", and the localizer bar position is moved, the
+--                glide slope bar also makes a small but very visible "move".
+--                This also occurs when the PITCH sphere position is changed.
+--                Most likely, the variable timing of the PWM generation is the
+--                cause. The hard-coded 2 µs wait per update is neither a very
+--                nice solution, thus an improved PWM generation is needed!
+--                To avoid interference with the primary ADI tasks, the user-
+--                definable output are no longer configurable as PWM output.
+--                They can only be simple digital ON/OFF outputs, although all
+--                commands (configure outputs, set PWM value) still exist; they
+--                just will not produce a PWM signal.
+--
+--                The "spurious DOA interrupt" issue is also addressed. When the
+--                USB connection is used, and the DOA connection is no used, it
+--                is possible that spurious interrupts occur on the DOA clock
+--                input. The solution was a jumper on the DOA header to connect
+--                the DOA clock input to GND. With this Release, the interrupt
+--                is disabled if the USB port is selected.
+--
+--                Updated PRAGMA definitions for new compiler 2.4q5.
+--
+--                Added 1 second power-up delay if DOA communication is used.
+--                During that delay the DIAG LED flashes fast. After 1 second
+--                the DOA variables are initialized (again) effectively removing
+--                "garbage" data and eliminating a possible DOA receive state
+--                "out of sync".
+--                After time-out of the watchdog, the administration of the USB
+--                and PHCC communication reception routines is reset. USB comm.
+--                is based on polling, so it is safe to clear the administration
+--                when the watchdog times out. However, PHCC comm. is interrupt-
+--                based, so it is possible that after a watchdog time-out, in
+--                the midst of the PHCC administration reset, an interrupt can
+--                occur. This will corrupt the message and break all PHCC comm.
+--                until another (successful) watchdog time-out operation has
+--                been executed. The solution for this issue is to disable the
+--                PHCC interrupt during the PHCC administration update.
+-- -----------------------------------------------------------------------------
+const byte MAJOR_VERSION = 1
+const byte MINOR_VERSION = 3
+
+
+include 18f2550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- defines for compiler version 2.4n
+-- pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+-- pragma target WDT           DISABLED    -- no watchdog
+-- pragma target XINST         ENABLED     -- extended instruction set
+--
+-- defines for compiler version 2.4q5
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+pragma target XINST         DISABLED    -- extended instruction set (not JAL V2)
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+-- -----------------------------------------------------------------------------
+-- ** Declarations
+-- -----------------------------------------------------------------------------
+--
+--  I/O pin definitions
+
+alias  DIGPWM1     is pin_A0    -- DIG_PWM output #1
+alias  DIGPWM2     is pin_A1    -- DIG_PWM output #2
+alias  DIGPWM3     is pin_A2    -- DIG_PWM output #3
+alias  DIGPWM4     is pin_A3    -- DIG_PWM output #4
+alias  DIAGLED     is pin_A4    -- diagnostic on-board LED
+alias  DIGPWM5     is pin_A5    -- DIG_PWM output #5
+
+alias  DOA_CLOCK   is pin_B0    -- PHCC DOA bus clock signal
+alias  DOA_DATA    is pin_B1    -- PHCC DOA bus data signal
+alias  S3POLARITY  is pin_B2    -- stator S3 polarity output
+alias  S2POLARITY  is pin_B3    -- stator S2 polarity output
+alias  S1POLARITY  is pin_B4    -- stator S1 polarity output
+alias  S2AMPLITUDE is pin_B5    -- stator S2 amplitude output
+alias  S1AMPLITUDE is pin_B6    -- stator S1 amplitude output
+alias  S3AMPLITUDE is pin_B7    -- stator S3 amplitude output
+
+alias  DIGPWM6     is pin_C0    -- DIG_PWM output #6
+alias  DIGPWM7     is pin_C1    -- DIG_PWM output #7
+alias  VsenseIN    is pin_C2    -- USB host voltage sense
+--     USBvoltRef  is pin_C3    -- USB voltage reference
+--     USBdataN    is pin_C4    -- USB data -
+--     USBdataP    is pin_C5    -- USB data +
+alias  PWMOUT      is pin_C6    -- PWM output
+alias  USB_DOA     is pin_C7    -- USB/DOA selection jumper
+
+--  set the I/O direction
+
+pin_A0_direction = output
+pin_A1_direction = output
+pin_A2_direction = output
+pin_A3_direction = output
+pin_A4_direction = output
+pin_A5_direction = output
+
+pin_B0_direction = input
+pin_B1_direction = input
+pin_B2_direction = output
+pin_B3_direction = output
+pin_B4_direction = output
+pin_B5_direction = output
+pin_B6_direction = output
+pin_B7_direction = output
+
+pin_C0_direction = output
+pin_C1_direction = output
+pin_C2_direction = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction = output
+pin_C7_direction = input
+
+
+-- variables used in the DOA and USB protocol receiver routines
+
+-- #############################################################################
+--
+--  This firmware is used for the ROLL and the PITCH synchro of the F-16 ADI.
+--
+--  Some defines are different for the ROLL / PITCH synchro.
+--     1. base angle values for the synchro stator coils S1, S2, and S3
+--     2. digital output 3 & 4 (on PITCH they are PWM, on ROLL they are digital)
+--
+-- #############################################################################
+
+-- ## PITCH base angle default values
+-- const byte PITCH           = 1     -- definition for PITCH synchro
+-- const byte SYNCHRO_ADDR    = 0x30  -- DOA SDI ADDRESS for PITCH SYNCHRO
+-- const sword S1DEFAULTANGLE = 682   -- PITCH synchro coil offsets
+-- const sword S2DEFAULTANGLE = 0     --
+-- const sword S3DEFAULTANGLE = 341   --
+-- const sword LEVELPOSVALUE  = 424   -- pitch at "level", knob at center dot
+-- const byte OUT3MODE        = 0     -- Output 3 and 4 are PWM for the PITCH
+-- const byte OUT4MODE        = 0     -- SDI module PWM_OUTPUT value
+-- const byte OUT3VAL         = 128   -- Output 3 at PWM "mid-range" value
+-- const byte OUT4VAL         = 128   -- Output 4 at PWM "mid-range" value
+-- const sword POS_ANGLE_MIN  = 140   -- limiting position angle of sphere
+-- const sword POS_ANGLE_MAX  = 700   -- limiting position angle of sphere
+
+-- =============================================================================
+
+-- ## ROLL base angle default values
+const byte ROLL            = 1     -- definition for ROLL synchro
+const byte SYNCHRO_ADDR    = 0x32  -- DOA SDI ADDRESS for ROLL SYNCHRO
+const sword S1DEFAULTANGLE = 597   -- ROLL synchro coil offsets
+const sword S2DEFAULTANGLE = 938   --
+const sword S3DEFAULTANGLE = 256   --
+const sword LEVELPOSVALUE  = 512   -- roll on horizontal level
+const byte OUT3MODE        = 1     -- Output 3 and 4 are DIG for the ROLL
+const byte OUT4MODE        = 1     -- SDI module DIG_OUTPUT value
+const byte OUT3VAL         = 0     -- Output 3 "OFF"
+const byte OUT4VAL         = 0     -- Output 4 "OFF"
+const sword POS_ANGLE_MIN  = 0     -- limiting position angle of sphere
+const sword POS_ANGLE_MAX  = 1023  -- limiting position angle of sphere
+
+-- =============================================================================
+-- #############################################################################
+
+
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var volatile byte  DOA_address        -- DOA IRQ routine device address
+var volatile byte  DOA_subaddr        -- DOA IRQ device sub address
+var volatile byte  DOA_databyte       -- DOA IRQ data
+var volatile byte  bitcounter         -- DOA IRQ count for received bits
+var volatile byte  DOA_RXstate        -- DOA IRQ protocol RX byte state
+const byte DOA_STATE_ADDRESS  = 0     -- DOA receiver state machine state
+const byte DOA_STATE_SUBADRS  = 1
+const byte DOA_STATE_DATA     = 2
+
+var volatile byte  DOAcmdReceived     -- flag: DOA valid command received
+var volatile byte  deviceaddress      -- DOA received device address
+var volatile byte  subaddress         -- DOA received sub-address
+var volatile byte  databyte           -- DOA received data byte
+
+var volatile byte  USB_RXstate        -- USB protocol RX byte state
+const byte USB_STATE_IDLE     = 0     -- USB receiver state machine state
+const byte USB_STATE_DATA     = 1
+const byte USB_STATE_RESET    = 2
+var volatile byte  USBrxByte1         -- USB first received byte
+var volatile byte  USBrxByte2         -- USB second received byte
+var volatile byte  USBcmdReceived     -- flag: USB valid command received
+var volatile byte  USBdebugEnabled    -- flag: output USB debug info
+
+var volatile byte  commandCode        -- received command code (DOA / USB) sub
+var volatile byte  commandData        -- received command data (DOA / USB) sub
+
+        
+-- diagnostic LED
+
+const byte LED_ON  = 0             -- LED connected to common +5, so:
+const byte LED_OFF = 1             -- inverted logic: 0::on // 1::off
+
+ -- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const DEMO_UPD_SLOT        = 1     -- time slot for DEMO mode update rate
+const COMM_WATCHDOG_SLOT   = 2     -- DOA & USB communication watchdog timer
+const UPDATE_RATE_SLOT     = 3     -- position update_rate timer slot
+const POWER_DOWN_SLOT      = 4     -- stop "humming at position" timer slot
+const DELAY_SLOTS          = 5     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+ -- DIAG LED
+var byte  diagLEDstate             -- current state (LED_ON|LED_OFF)
+var word  flashRate                -- selected current flash frequency
+var byte  diagLED_use              -- current usage mode for the DIAG LED
+var byte  heartbeat_state          -- heartbeat mode LED state (LED_ON|LED_OFF)
+var byte  resetFlashCount          -- # times flash during DOA reset @ power up
+
+const byte DIAGLED_OFF       = 0   -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1   -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2   -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3   -- DIAG LED ON/OFF per received message
+
+const word DOA_FLASH_RATE    = 1000   -- DOA selected: blink at approx 0.5 Hz
+const word DOA_RESET_RATE    = 40     -- DOA selected: initial 1 sec reset time
+const word USB_FLASH_RATE    = 500    -- USB selected: blink at approx 1 Hz
+const word STARTUP_FLASHRATE = 200    -- LED flash rate during (USB) startup
+
+ -- demo mode
+const byte DEMO_UPD_RATE_0   = 100    -- DEMO position update rate speed "0"
+const byte DEMO_UPD_RATE_1   = 500    -- DEMO position update rate speed "1"
+const byte DEMO_UPD_RATE_2   = 1000   -- DEMO position update rate speed "2"
+const byte DEMO_UPD_RATE_3   = 2000   -- DEMO position update rate speed "3"
+
+var byte  demoActive                  -- executing DEMO mode flag
+var word  demoSpeed                   -- position update speed
+var sword demoStepSize                -- update position step size
+var byte  demoModus                   -- movement modus: INC/DEC or INC/RST
+var byte  demoDirection               -- IN/DEC mode: current sweep direction
+var sword demoStartPos                -- demo setpoint angle start position
+var sword demoStopPos                 -- demo setpoint angle start position
+var sword demoLimitValue1             -- demo limit value #1 used in demo()
+var sword demoLimitValue2             -- demo limit value #2 used in demo()
+var sword demoAngle                   -- demo current setpoint angle
+
+const byte DEMO_MODE_INC_DEC   = 0    -- sweep up / sweep down
+const byte DEMO_MODE_INC_RST   = 1    -- sweep up / jump back
+const byte DEMO_SWEEP_INC      = 0    -- sweep up/down - now incrementing
+const byte DEMO_SWEEP_DEC      = 1    -- sweep up/down - new decrementing
+const sword DEMO_DFLT_STEPSIZE = 1    -- default is smooth movement
+
+-- DOA communication watchdog
+--     Bit time is set by Motherboard and is 500 us. As the timer granularity
+--     of SDI is 1 ms, it means that 2 bits, thus 2 clock pulses, occur the
+--     watchdog resolution is 2 bits of the DOA data bitstream.
+--     Initially the timer is started. Every time a DOA clock pulse is detected
+--     the timer is restarted. If the timer expires (time out) there has been
+--     a time out time period of inactivity on the DOA bus. This inactivity is
+--     used as a synchronization: the DOA data reception state machine is reset.
+
+const WTCHDOG_DFLT_TIMEOUT = 8     -- default watchdog timeout
+var word wtchdogDelayValue         -- set watchdog timeout value
+var byte wtchdogEnabled            -- watchdog enabled/disabled flag
+
+-- POWER_DOWN - stop "humming at position" timer
+const word PWR_DOWN_TICK_SCALE = 5    -- # position bitvalue shifted (multiply *32)
+const word PWR_DOWN_DEFAULT    = 16   -- 16 * TICK_SCALE = 512 ms
+var word powerDownTime             -- power down time count
+var byte usePowerDown              -- boolean power down feature used YES/NO
+var byte pwrDownValid              -- power down stator values valid flag
+var byte pwrDownLevel              -- full power down or "half"
+var byte pwrDownS1Ampl             -- power down S1 Amplitude value
+var byte pwrDownS2Ampl             -- power down S2 Amplitude value
+var byte pwrDownS3Ampl             -- power down S3 Amplitude value
+
+const byte POWER_DOWN_MAX      = 1
+const byte POWER_DOWN_HALF     = 0
+
+-- variables for USB connection monitoring
+
+var byte chkUSBconnect             -- USB uses a startup (connection made)
+var word prevISRcounter            -- fast period connection check timer
+
+
+-- commands (for DOA this is the sub-address, for USB this is the first byte)
+
+const byte CMD_SSYNQ1      = 0     -- set synchro indicator in Q1 (000..255)
+const byte CMD_SSYNQ2      = 1     -- set synchro indicator in Q2 (256..511)
+const byte CMD_SSYNQ3      = 2     -- set synchro indicator in Q3 (512..767)
+const byte CMD_SSYNQ4      = 3     -- set synchro indicator in Q4 (768..1023)
+
+const byte CMD_LIMIT_MIN   = 4     -- angle limit minimum value
+const byte CMD_LIMIT_MAX   = 5     -- angle limit maximum value
+
+const byte CMD_S1AMPLD     = 6     -- set S1 amplitude "deferred"
+const byte CMD_S2AMPLD     = 7     -- set S2 amplitude "deferred"
+const byte CMD_S3AMPLD     = 8     -- set S3 amplitude "deferred"
+const byte CMD_SxPOLD      = 9     -- set S1, S2, S3 polarity + LOAD "deferred"
+
+const byte CMD_WTCHDOG_DIS = 10    -- disabled watchdog
+const byte CMD_WTCHDOG_ENA = 11    -- enable watchdog
+
+const byte CMD_SET8BIT     = 12    -- set synchro angle with 8 bit
+const byte CMD_PWR_DOWN    = 13    -- power down, stop "at position humming"
+
+const byte CMD_DEFOUT      = 14    -- define DIGPWM1 ~ DIGPWM7 output mode
+const byte CMD_USROUT1     = 15    -- set DIGPWM1 output value
+const byte CMD_USROUT2     = 16    -- set DIGPWM2 output value
+const byte CMD_USROUT3     = 17    -- set DIGPWM3 output value
+const byte CMD_USROUT4     = 18    -- set DIGPWM4 output value
+const byte CMD_USROUT5     = 19    -- set DIGPWM5 output value
+const byte CMD_USROUT6     = 20    -- set DIGPWM6 output value
+const byte CMD_USROUT7     = 21    -- set DIGPWM7 output value
+
+const byte CMD_PWMOUT      = 22    -- set fixed output PWM duty cycle
+const byte CMD_UPDRATE     = 23    -- max / smooth movement "speed" updates
+const byte CMD_DIAGMODE    = 24    -- set diagnostic LED operating mode
+const byte CMD_S1BASE_L    = 25    -- S1 offset angle for "zero position" lsb
+const byte CMD_S1BASE_H    = 26    -- S1 offset angle for "zero position" msb
+const byte CMD_S2BASE_L    = 27    -- S2 offset angle for "zero position" lsb
+const byte CMD_S2BASE_H    = 28    -- S2 offset angle for "zero position" msb
+const byte CMD_S3BASE_L    = 29    -- S3 offset angle for "zero position" lsb
+const byte CMD_S3BASE_H    = 30    -- S3 offset angle for "zero position" msb
+
+const byte CMD_DEMO_CTRL   = 31    -- DEMO mode control: stepsize & start/stop
+const byte CMD_DEMO_STRT   = 32    -- DEMO mode start position
+const byte CMD_DEMO_STOP   = 33    -- DEMO mode stop position
+
+const byte CMD_S1AMPL      = 34    -- set S1 amplitude
+const byte CMD_S2AMPL      = 35    -- set S2 amplitude
+const byte CMD_S3AMPL      = 36    -- set S3 amplitude
+const byte CMD_SxPOL       = 37    -- set S1, S2, S3 polarity
+
+const byte CMD_LASTVAL     = 37    -- last valid command for DOA
+-- USB only commands
+const byte CMD_IDENTIFY    = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG   = (CMD_LASTVAL+2)   -- USB only: enable debug output
+
+
+-- =============================================================================
+-- Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+
+const byte USE_USB         = 0              ; jumper installed
+const byte USE_DOA         = 1              ; no jumper installed
+var byte  commPort                          ; selected port at startup
+
+-- synchro coil setpoint values
+
+var byte  actualS1Pol                       ; actual S1 Polarity value
+var byte  actualS2Pol                       ; actual S2 Polarity value
+var byte  actualS3Pol                       ; actual S3 Polarity value
+var byte  actualS1Ampl                      ; actual S1 Amplitude value
+var byte  actualS2Ampl                      ; actual S2 Amplitude value
+var byte  actualS3Ampl                      ; actual S3 Amplitude value
+var byte  deferredS1Pol                     ; deferred S1 Polarity value
+var byte  deferredS2Pol                     ; deferred S2 Polarity value
+var byte  deferredS3Pol                     ; deferred S3 Polarity value
+var byte  deferredS1Ampl                    ; deferred S1 Amplitude value
+var byte  deferredS2Ampl                    ; deferred S2 Amplitude value
+var byte  deferredS3Ampl                    ; deferred S3 Amplitude value
+var sword s1BaseAngle                       ; offset S1 for "zero position"
+var sword s1BaseAngleLsb
+var sword s2BaseAngle                       ; offset S2 for "zero position"
+var sword s2BaseAngleLsb
+var sword s3BaseAngle                       ; offset S3 for "zero position"
+var sword s3BaseAngleLsb
+var sword angleLimitMin                     ; limit minimum value (10-bit) angle
+var sword angleLimitMax                     ; limit maximum value (10-bit) angle
+var byte  amplitude                         ; global var for calculation
+var byte  polarity                          ; global var for calculation
+
+
+-- user output pins functionality: standard digital output or PWM output
+
+var byte  userOutMode1                      ; output mode: DIGITAL or PWM
+var byte  userOutMode2
+var byte  userOutMode3
+var byte  userOutMode4
+var byte  userOutMode5
+var byte  userOutMode6
+var byte  userOutMode7
+
+const byte PWM_OUTPUT = 0                   ; output is a PWM output
+const byte DIG_OUTPUT = 1                   ; output is "standard digital out"
+
+var byte  userOutputPWM0                    ; initial duty cycle setpoint
+var byte  userOutputPWM1                    ; only applicable if PWM is selected
+var byte  userOutputPWM2
+var byte  userOutputPWM3
+var byte  userOutputPWM4
+var byte  userOutputPWM5
+var byte  userOutputPWM6
+var byte  userOutputPWM7
+
+;; ** global variables and flags **
+var volatile byte gie_flag
+
+;; ** timer variables **
+var volatile byte timer0conv
+var volatile byte timer3L
+var volatile byte timer3H
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+include synchrodrive-watchdog  -- communication watchdog
+include synchrodrive-doa       -- PHCC DOA receiver routine
+include synchrodrive-usb       -- USB handler
+include synchrodrive-led       -- DIAG LED routines
+include synchrodrive-pwm       -- PWM signal generation
+include synchrodrive-upd-defs  -- position update defines and variables
+include synchrodrive-code      -- process received commands
+include synchrodrive-upd-code  -- position update code
+
+
+-- =============================================================================
+-- START OF SYNCHRO DRIVE INTERFACE (SDI) PROGRAM
+-- =============================================================================
+
+; BSR = 0                      ; set bank select register to default
+INTCON_GIE = FALSE           ; disable all interrupts
+enable_digital_io()          ; all I/O pins set to digital
+INTCON = 0                   ; all interrupts disabled
+
+-- initialize variables
+
+DOA_address     = 0
+DOA_subaddr     = 0
+DOA_databyte    = 0
+bitcounter      = 7
+DOAcmdReceived  = FALSE
+USBcmdReceived  = FALSE
+USBdebugEnabled = TRUE
+DOA_RXstate     = DOA_STATE_ADDRESS   ; DOA RX state machine initial state
+USB_RXstate     = USB_STATE_IDLE      ; USB RX state machine initial state
+
+--  set all outputs to defined state ("0")
+
+    ; user pin output mode: DIGITAL or PWM. Default :: standard digital output
+
+userOutMode1 = DIG_OUTPUT          ; DIGPWM1 default DIGITAL out
+userOutMode2 = DIG_OUTPUT          ; DIGPWM2 default DIGITAL out
+userOutMode3 = OUT3MODE            ; DIGPWM3 depends on PITCH/ROLL SDI assigned
+userOutMode4 = OUT4MODE            ; DIGPWM4 depends on PITCH/ROLL SDI assigned
+userOutMode5 = DIG_OUTPUT          ; DIGPWM5 default DIGITAL out
+userOutMode6 = DIG_OUTPUT          ; DIGPWM6 default DIGITAL out
+userOutMode7 = DIG_OUTPUT          ; DIGPWM7 default DIGITAL out
+
+userOutputPWM0  = 128              ; hardware is for "center"-zero meter
+userOutputPWM1  = 0                ; initial duty cycle setpoint
+userOutputPWM2  = 0                ; (if PWM selected no "jump" on output pin)
+userOutputPWM3  = OUT3VAL          ; Output 3 and 4 are PWM for the PITCH SDI
+userOutputPWM4  = OUT4VAL          ; Output 3 and 4 are DIG for the ROLL SDI
+userOutputPWM5  = 0
+userOutputPWM6  = 0
+userOutputPWM7  = 0
+
+PWMOUT          = 0
+DIGPWM1         = 0
+DIGPWM2         = 0
+DIGPWM3         = 0
+DIGPWM4         = 0
+DIGPWM5         = 0
+DIGPWM6         = 0
+DIGPWM7         = 0
+
+DIAGLED         = LED_OFF
+diagLEDstate    = LED_OFF
+heartbeat_state = LED_OFF
+resetFlashCount = 0
+flashRate       = STARTUP_FLASHRATE
+set_delay(HEARTBEAT_SLOT, flashRate)                -- start heartbeat blinking
+
+demoActive      = FALSE                             -- DEMO mode inactive
+demoSpeed       = DEMO_UPD_RATE_0                   -- position update speed
+demoStepSize    = DEMO_DFLT_STEPSIZE                -- update position step size
+demoModus       = DEMO_MODE_INC_DEC                 -- movement modus: sweeping
+demoStartPos    = 0                                 -- demo setpoint start pos
+demoStopPos     = 255                               -- demo setpoint stop pos
+demoAngle       = 0                                 -- just an initial value asg
+
+s1BaseAngle     = S1DEFAULTANGLE
+s2BaseAngle     = S2DEFAULTANGLE
+s3BaseAngle     = S3DEFAULTANGLE
+angleLimitMin   = POS_ANGLE_MIN
+angleLimitMax   = POS_ANGLE_MAX
+
+
+    ; initial synchro stator output signals
+actualS1Pol     = 0
+actualS2Pol     = 0
+actualS3Pol     = 0
+actualS1Ampl    = 255                                -- note: 0 :: max amplitude
+actualS2Ampl    = 255                                --     255 :: min amplitude
+actualS3Ampl    = 255
+pwrDownS1Ampl   = 255
+pwrDownS2Ampl   = 255
+pwrDownS3Ampl   = 255
+deferredS1Pol   = 0
+deferredS2Pol   = 0
+deferredS3Pol   = 0
+deferredS1Ampl  = 255
+deferredS2Ampl  = 255
+deferredS3Ampl  = 255
+S1POLARITY      = actualS1Pol                        -- polarity set directly
+S2POLARITY      = actualS2Pol                        -- amplitude is a PWM value
+S3POLARITY      = actualS3Pol
+
+powerDownTime   = PWR_DOWN_DEFAULT << PWR_DOWN_TICK_SCALE
+usePowerDown    = FALSE
+pwrDownValid    = FALSE
+pwrDownLevel    = POWER_DOWN_MAX
+
+
+prevISRcounter  = 0
+
+RCON_IPEN       = 0          ; disable priority levels on interrupts
+INTCON2_INTEDG0 = 1          ; external INT0 interrupt on rising edge
+INTCON_INT0IF   = 0          ; clear INT0 interrupt flag
+initPWM()                    ; start Timer3, set CCP1
+-- loadPWMsettings()
+timer0_isr_init()            ; initialize timer0 (also enables interrupts)
+INTCON_GIE      = 1          ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE     = 1          ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+if (USB_DOA == USE_USB) then
+    commPort      = USE_USB
+    diagLED_use   = DIAGLED_HEARTBEAT
+    flashRate     = STARTUP_FLASHRATE
+    chkUSBconnect = TRUE
+    INTCON_INT0IE = 0                  -- disable INT0 (DOA) external interrupt
+else
+    commPort      = USE_DOA
+    diagLED_use   = DIAGLED_HEARTBEAT
+    flashRate     = DOA_RESET_RATE      -- indicate initial 1 sec delay
+    chkUSBconnect = FALSE
+    INTCON_INT0IE = 1                   -- enable INT0 (DOA) external interrupt
+end if
+
+; diagLED_use = DIAGLED_MSG_ACK                  -- debug chk handshake IRQ/main
+
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT         -- initialize watchdog
+wtchdogEnabled    = TRUE
+commRestartWatchdog()                            -- start comm protocol watchdog
+updRateInitialize()                              -- init position update vars
+
+forever loop
+  -- for PHCC, the DOA communication can start immediately
+  -- for USB, there is first a check that the USB connection is made
+
+  if (chkUSBconnect == TRUE) then
+    -- check periodically for USB connection active
+    diagLEDheartBeat()                                 ; update DIAG LED state
+    if (isr_counter != prevISRcounter) then
+      -- one (or more) timer tick elapsed
+      prevISRcounter = isr_counter
+--    if (usb_cdc_line_status() != 0x00) then          ; check_comm_active()
+      if (VsenseIN) then                               ; check_comm_active()
+        chkUSBconnect = FALSE
+        -- USB connection established: setup USB serial library
+        usb_serial_init()
+        flashRate = USB_FLASH_RATE
+      end if
+    end if
+  else
+    -- main loop: startup phase for USB done -- OR -- PHCC selected
+    if (commPort == USE_USB) then
+      -- USB communication
+      --     keep checking whether USB is still connected
+--    if (usb_cdc_line_status() != 0x00) then
+      if (VsenseIN) then
+        handleUSBcommunication()
+        if (USBcmdReceived == TRUE) then
+          USBcmdReceived = FALSE
+          commandCode = USBrxByte1
+          commandData = USBrxByte2
+          if (diagLED_use == DIAGLED_MSG_ACK) then
+             DIAGLED = !DIAGLED
+          end if
+          processCommand()
+        end if
+      else
+        -- USB connection lost -> restart USB connection setup loop
+        chkUSBconnect  = TRUE
+        flashRate      = STARTUP_FLASHRATE
+        diagLED_use    = DIAGLED_HEARTBEAT     -- make sure the DIAG LED flashes
+        prevISRcounter = 0
+      end if
+    else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLED_use == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+    end if
+
+    -- execute continuously running actions (if required)
+    diagLEDheartBeat()   ; update DIAG LED state if in "heart beat" mode
+    commCheckWatchdog()  ; check communication protocol watchdog
+    updSynchroPosition() ; move synchro axis to new setpoint
+    demo()               ; execute DEMO mode (if active)
+    chkPowerDown()       ; check time-out for power down ("humming at position")
+    -- loadPWMsettings()    ; check/load new PWM values
+
+  end if
+end loop
+
+
+-- =============================================================================
+
+-- Interrupt routine for the DOA serial communication and processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+
+procedure DOA_interrupt is
+  pragma INTERRUPT
+
+  if ( INTCON_INT0IF == 1 ) then
+      processDOAinterrupt()
+      INTCON_INT0IF = 0         -- reset external interrupt flag
+  end if
+end procedure
+
