@@ -1,0 +1,671 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-ascii
+--
+-- this module contains
+--     - routine to punch an ASCII character readable as "image" on tape
+
+const byte _____            = 0x00
+const byte ____X            = 0x01
+const byte ___X_            = 0x02
+const byte ___XX            = 0x03
+const byte __X__            = 0x04
+const byte __X_X            = 0x05
+const byte __XX_            = 0x06
+const byte __XXX            = 0x07
+const byte _X___            = 0x08
+const byte _X__X            = 0x09
+const byte _X_X_            = 0x0a
+const byte _X_XX            = 0x0b
+const byte _XX__            = 0x0c
+const byte _XX_X            = 0x0d
+const byte _XXX_            = 0x0e
+const byte _XXXX            = 0x0f
+const byte X____            = 0x10
+const byte X___X            = 0x11
+const byte X__X_            = 0x12
+const byte X__XX            = 0x13
+const byte X_X__            = 0x14
+const byte X_X_X            = 0x15
+const byte X_XX_            = 0x16
+const byte X_XXX            = 0x17
+const byte XX___            = 0x18
+const byte XX__X            = 0x19
+const byte XX_X_            = 0x1a
+const byte XX_XX            = 0x1b
+const byte XXX__            = 0x1c
+const byte XXX_X            = 0x1d
+const byte XXXX_            = 0x1e
+const byte XXXXX            = 0x1f
+
+const byte token0x00[7] = { -- 0x20 - space
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____ }
+const byte token0x01[7] = { -- 0x21 - bang
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            _____,
+                            __X__ }
+const byte token0x02[7] = { -- 0x22 - double quote
+                            _X_X_,
+                            _X_X_,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____ }
+const byte token0x03[7] = { -- 0x23 - hash
+                            _X_X_,
+                            _X_X_,
+                            XXXXX,
+                            _X_X_,
+                            XXXXX,
+                            _X_X_,
+                            _X_X_ }
+const byte token0x04[7] = { -- 0x24 - dollar sign
+                            __X__,
+                            _XXXX,
+                            X_X__,
+                            _XXX_,
+                            __X_X,
+                            XXXX_,
+                            __X__ }
+const byte token0x05[7] = { -- 0x25 - percent sign
+                            XX___,
+                            XX__X,
+                            ___X_,
+                            __X__,
+                            _X___,
+                            X__XX,
+                            ___XX }
+const byte token0x06[7] = { -- 0x26 - ampersand
+                            _X___,
+                            X_X__,
+                            X_X__,
+                            _X___,
+                            X_X_X,
+                            X__X_,
+                            _XX_X }
+const byte token0x07[7] = { -- 0x27 - single quote
+                            __X__,
+                            __X__,
+                            __X__,
+                            _____,
+                            _____,
+                            _____,
+                            _____ }
+const byte token0x08[7] = { -- 0x28 - left parenthesis
+                            ___X_,
+                            __X__,
+                            _X___,
+                            _X___,
+                            _X___,
+                            __X__,
+                            ___X_ }
+const byte token0x09[7] = { -- 0x29 - right parenthesis
+                            _X___,
+                            __X__,
+                            ___X_,
+                            ___X_,
+                            ___X_,
+                            __X__,
+                            _X___ }
+const byte token0x0A[7] = { -- 0x2a - splat
+                            __X__,
+                            X_X_X,
+                            _XXX_,
+                            __X__,
+                            _XXX_,
+                            X_X_X,
+                            __X__ }
+const byte token0x0B[7] = { -- 0x2b - plus
+                            _____,
+                            __X__,
+                            __X__,
+                            XXXXX,
+                            __X__,
+                            __X__,
+                            _____ }
+const byte token0x0C[7] = { -- 0x2c - comma
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            __X__,
+                            __X__,
+                            _X___ }
+const byte token0x0D[7] = { -- 0x2d - hyphen
+                            _____,
+                            _____,
+                            _____,
+                            XXXXX,
+                            _____,
+                            _____,
+                            _____ }
+
+const byte token0x0E[7] = { -- 0x2e - period
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            __X__ }
+const byte token0x0F[7] = { -- 0x2f - slash
+                            _____,
+                            ____X,
+                            ___X_,
+                            __X__,
+                            _X___,
+                            X____,
+                            _____ }
+const byte token0x10[7] = { -- 0x30 - zero
+                            _XXX_,
+                            X___X,
+                            X__XX,
+                            X_X_X,
+                            XX__X,
+                            X___X,
+                            _XXX_ }
+const byte token0x11[7] = { -- 0x31 - one
+                            __X__,
+                            _XX__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            _XXX_ }
+const byte token0x12[7] = { -- 0x32 - two
+                            _XXX_,
+                            X___X,
+                            ____X,
+                            __XX_,
+                            _X___,
+                            X____,
+                            XXXXX }
+const byte token0x13[7] = { -- 0x33 - three
+                            XXXXX,
+                            ____X,
+                            ___X_,
+                            __XX_,
+                            ____X,
+                            X___X,
+                            _XXX_ }
+const byte token0x14[7] = { -- 0x34 - four
+                            ___X_,
+                            __XX_,
+                            _X_X_,
+                            X__X_,
+                            XXXXX,
+                            ___X_,
+                            ___X_ }
+const byte token0x15[7] = { -- 0x35 - five
+                            XXXXX,
+                            X____,
+                            XXXX_,
+                            ____X,
+                            ____X,
+                            X___X,
+                            _XXX_ }
+const byte token0x16[7] = { -- 0x36 - six
+                            __XXX,
+                            _X___,
+                            X____,
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            _XXX_ }
+const byte token0x17[7] = { -- 0x37 - seven
+                            XXXXX,
+                            ____X,
+                            ___X_,
+                            __X__,
+                            _X___,
+                            _X___,
+                            _X___ }
+const byte token0x18[7] = { -- 0x38 - eight
+                            _XXX_,
+                            X___X,
+                            X___X,
+                            _XXX_,
+                            X___X,
+                            X___X,
+                            _XXX_ }
+const byte token0x19[7] = { -- 0x39 - nine
+                            _XXX_,
+                            X___X,
+                            X___X,
+                            _XXXX,
+                            ____X,
+                            ___X_,
+                            XXX__ }
+const byte token0x1A[7] = { -- 0x3a - colon
+                            _____,
+                            _____,
+                            __X__,
+                            _____,
+                            __X__,
+                            _____,
+                            _____ }
+const byte token0x1B[7] = { -- 0x3b - semicolon
+                            _____,
+                            _____,
+                            __X__,
+                            _____,
+                            __X__,
+                            __X__,
+                            _X___ }
+const byte token0x1C[7] = { -- 0x3c - less than
+                            ___X_,
+                            __X__,
+                            _X___,
+                            X____,
+                            _X___,
+                            __X__,
+                            ___X_ }
+const byte token0x1D[7] = { -- 0x3d - equal
+                            _____,
+                            _____,
+                            XXXXX,
+                            _____,
+                            XXXXX,
+                            _____,
+                            _____ }
+const byte token0x1E[7] = { -- 0x3e - greater
+                            _X___,
+                            __X__,
+                            ___X_,
+                            ____X,
+                            ___X_,
+                            __X__,
+                            _X___ }
+const byte token0x1F[7] = { -- 0x3f - question mark
+                            _XXX_,
+                            X___X,
+                            ___X_,
+                            __X__,
+                            __X__,
+                            _____,
+                            __X__ }
+const byte token0x20[7] = { -- 0x40 - at sign
+                            _XXX_,
+                            X___X,
+                            X_X_X,
+                            X_XXX,
+                            X_XX_,
+                            X____,
+                            _XXXX }
+const byte token0x21[7] = { -- 0x41 - A
+                            __X__,
+                            _X_X_,
+                            X___X,
+                            X___X,
+                            XXXXX,
+                            X___X,
+                            X___X }
+const byte token0x22[7] = { -- 0x42 - B
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            XXXX_ }
+const byte token0x23[7] = { -- 0x43 - C
+                            _XXX_,
+                            X___X,
+                            X____,
+                            X____,
+                            X____,
+                            X___X,
+                            _XXX_ }
+const byte token0x24[7] = { -- 0x44 - D
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            XXXX_ }
+const byte token0x25[7] = { -- 0x45 - E
+                            XXXXX,
+                            X____,
+                            X____,
+                            XXXX_,
+                            X____,
+                            X____,
+                            XXXXX }
+const byte token0x26[7] = { -- 0x46 - F
+                            XXXXX,
+                            X____,
+                            X____,
+                            XXXX_,
+                            X____,
+                            X____,
+                            X____ }
+const byte token0x27[7] = { -- 0x47 - G
+                            _XXXX,
+                            X____,
+                            X____,
+                            X____,
+                            X__XX,
+                            X___X,
+                            _XXXX }
+const byte token0x28[7] = { -- 0x48 - H
+                            X___X,
+                            X___X,
+                            X___X,
+                            XXXXX,
+                            X___X,
+                            X___X,
+                            X___X }
+const byte token0x29[7] = { -- 0x49 - I
+                            _XXX_,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            _XXX_ }
+const byte token0x2A[7] = { -- 0x4a - J
+                            ____X,
+                            ____X,
+                            ____X,
+                            ____X,
+                            ____X,
+                            X___X,
+                            _XXX_ }
+const byte token0x2B[7] = { -- 0x4b - K
+                            X___X,
+                            X__X_,
+                            X_X__,
+                            XX___,
+                            X_X__,
+                            X__X_,
+                            X___X }
+const byte token0x2C[7] = { -- 0x4c - L
+                            X____,
+                            X____,
+                            X____,
+                            X____,
+                            X____,
+                            X____,
+                            XXXXX }
+const byte token0x2D[7] = { -- 0x4d - M
+                            X___X,
+                            XX_XX,
+                            X_X_X,
+                            X_X_X,
+                            X___X,
+                            X___X,
+                            X___X }
+const byte token0x2E[7] = { -- 0x4e - N
+                            X___X,
+                            X___X,
+                            XX__X,
+                            X_X_X,
+                            X__XX,
+                            X___X,
+                            X___X }
+const byte token0x2F[7] = { -- 0x4f - O
+                            _XXX_,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            _XXX_ }
+const byte token0x30[7] = { -- 0x50 - P
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            XXXX_,
+                            X____,
+                            X____,
+                            X____ }
+const byte token0x31[7] = { -- 0x51 - Q
+                            _XXX_,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X_X_X,
+                            X__X_,
+                            _XX_X }
+const byte token0x32[7] = { -- 0x52 - R
+                            XXXX_,
+                            X___X,
+                            X___X,
+                            XXXX_,
+                            X_X__,
+                            X__X_,
+                            X___X }
+const byte token0x33[7] = { -- 0x53 - S
+                            _XXX_,
+                            X___X,
+                            X____,
+                            _XXX_,
+                            ____X,
+                            X___X,
+                            _XXX_ }
+const byte token0x34[7] = { -- 0x54 - T
+                            XXXXX,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__ }
+const byte token0x35[7] = { -- 0x55 - U
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            _XXX_ }
+const byte token0x36[7] = { -- 0x56 - V
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            X___X,
+                            _X_X_,
+                            __X__ }
+const byte token0x37[7] = { -- 0x57 - W
+                            X___X,
+                            X___X,
+                            X___X,
+                            X_X_X,
+                            X_X_X,
+                            XX_XX,
+                            X___X }
+const byte token0x38[7] = { -- 0x58 - X
+                            X___X,
+                            X___X,
+                            _X_X_,
+                            __X__,
+                            _X_X_,
+                            X___X,
+                            X___X }
+const byte token0x39[7] = { -- 0x59 - Y
+                            X___X,
+                            X___X,
+                            _X_X_,
+                            __X__,
+                            __X__,
+                            __X__,
+                            __X__ }
+const byte token0x3A[7] = { -- 0x5a - Z
+                            XXXXX,
+                            ____X,
+                            ___X_,
+                            __X__,
+                            _X___,
+                            X____,
+                            XXXXX }
+const byte token0x3B[7] = { -- 0x5b - left bracket
+                            XXXXX,
+                            XX___,
+                            XX___,
+                            XX___,
+                            XX___,
+                            XX___,
+                            XXXXX }
+const byte token0x3C[7] = { -- 0x5c - backslash
+                            _____,
+                            X____,
+                            _X___,
+                            __X__,
+                            ___X_,
+                            ____X,
+                            _____ }
+const byte token0x3D[7] = { -- 0x5d - right bracket
+                            XXXXX,
+                            ___XX,
+                            ___XX,
+                            ___XX,
+                            ___XX,
+                            ___XX,
+                            XXXXX }
+const byte token0x3E[7] = { -- 0x5e - caret
+                            _____,
+                            _____,
+                            __X__,
+                            _X_X_,
+                            X___X,
+                            _____,
+                            _____ }
+const byte token0x3F[7] = { -- 0x5f - underscore
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            _____,
+                            XXXXX }
+
+
+
+-- -----------------------------------------------------------------------------
+-- punchASCIIdots : convert the 7-byte character "image" to punch hole pattern.
+--      The character "image" is stored "horizontally" and must be converted to
+--      a hole pattern vertically, to be punched as a frame.
+-- -----------------------------------------------------------------------------
+procedure punchASCIIdots(byte in holesList[]) is
+  var byte  column       --  int col;
+  var byte  holeFrame    --  uint8_t val;
+  var sbyte row          --  int row;
+  var byte  mask
+
+    column = 0
+    while (column < 5) loop
+        holeFrame = 0
+        row = 6
+        mask = 0x10 >> column
+        while (row >=0) loop
+            holeFrame = holeFrame << 1
+            if ( (holesList[row] & mask) != 0) then
+                holeFrame = holeFrame + 1
+            end if
+            row = row - 1
+        end loop
+        punchByte(holeFrame)
+        column = column + 1
+    end loop
+    punchByte(0)   -- spacing between characters
+    punchByte(0)
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- punchASCIIchar : accepts a data byte and punches it as ASCII "image"
+--                  Data byte must be "printable" (0x20 .. 0x7F).
+--                  If data byte is not printable no output is punched.
+-- -----------------------------------------------------------------------------
+procedure punchASCIIchar(BYTE in character) is
+    if ( (character < 0x20) | (character > 0x7F) ) then
+        return
+    end if
+    if (character >= 0x60) then
+        character = character - 0x20
+    end if
+    character = character - 0x20
+
+    case (character) of
+     0x00 : block  punchASCIIdots(token0x00)  end block
+     0x01 : block  punchASCIIdots(token0x01)  end block
+     0x02 : block  punchASCIIdots(token0x02)  end block
+     0x03 : block  punchASCIIdots(token0x03)  end block
+     0x04 : block  punchASCIIdots(token0x04)  end block
+     0x05 : block  punchASCIIdots(token0x05)  end block
+     0x06 : block  punchASCIIdots(token0x06)  end block
+     0x07 : block  punchASCIIdots(token0x07)  end block
+     0x08 : block  punchASCIIdots(token0x08)  end block
+     0x09 : block  punchASCIIdots(token0x09)  end block
+     0x0A : block  punchASCIIdots(token0x0A)  end block
+     0x0B : block  punchASCIIdots(token0x0B)  end block
+     0x0C : block  punchASCIIdots(token0x0C)  end block
+     0x0D : block  punchASCIIdots(token0x0D)  end block
+     0x0E : block  punchASCIIdots(token0x0E)  end block
+     0x0F : block  punchASCIIdots(token0x0F)  end block
+     0x10 : block  punchASCIIdots(token0x10)  end block
+     0x11 : block  punchASCIIdots(token0x11)  end block
+     0x12 : block  punchASCIIdots(token0x12)  end block
+     0x13 : block  punchASCIIdots(token0x13)  end block
+     0x14 : block  punchASCIIdots(token0x14)  end block
+     0x15 : block  punchASCIIdots(token0x15)  end block
+     0x16 : block  punchASCIIdots(token0x16)  end block
+     0x17 : block  punchASCIIdots(token0x17)  end block
+     0x18 : block  punchASCIIdots(token0x18)  end block
+     0x19 : block  punchASCIIdots(token0x19)  end block
+     0x1A : block  punchASCIIdots(token0x1A)  end block
+     0x1B : block  punchASCIIdots(token0x1B)  end block
+     0x1C : block  punchASCIIdots(token0x1C)  end block
+     0x1D : block  punchASCIIdots(token0x1D)  end block
+     0x1E : block  punchASCIIdots(token0x1E)  end block
+     0x1F : block  punchASCIIdots(token0x1F)  end block
+     0x20 : block  punchASCIIdots(token0x20)  end block
+     0x21 : block  punchASCIIdots(token0x21)  end block
+     0x22 : block  punchASCIIdots(token0x22)  end block
+     0x23 : block  punchASCIIdots(token0x23)  end block
+     0x24 : block  punchASCIIdots(token0x24)  end block
+     0x25 : block  punchASCIIdots(token0x25)  end block
+     0x26 : block  punchASCIIdots(token0x26)  end block
+     0x27 : block  punchASCIIdots(token0x27)  end block
+     0x28 : block  punchASCIIdots(token0x28)  end block
+     0x29 : block  punchASCIIdots(token0x29)  end block
+     0x2A : block  punchASCIIdots(token0x2A)  end block
+     0x2B : block  punchASCIIdots(token0x2B)  end block
+     0x2C : block  punchASCIIdots(token0x2C)  end block
+     0x2D : block  punchASCIIdots(token0x2D)  end block
+     0x2E : block  punchASCIIdots(token0x2E)  end block
+     0x2F : block  punchASCIIdots(token0x2F)  end block
+     0x30 : block  punchASCIIdots(token0x30)  end block
+     0x31 : block  punchASCIIdots(token0x31)  end block
+     0x32 : block  punchASCIIdots(token0x32)  end block
+     0x33 : block  punchASCIIdots(token0x33)  end block
+     0x34 : block  punchASCIIdots(token0x34)  end block
+     0x35 : block  punchASCIIdots(token0x35)  end block
+     0x36 : block  punchASCIIdots(token0x36)  end block
+     0x37 : block  punchASCIIdots(token0x37)  end block
+     0x38 : block  punchASCIIdots(token0x38)  end block
+     0x39 : block  punchASCIIdots(token0x39)  end block
+     0x3A : block  punchASCIIdots(token0x3A)  end block
+     0x3B : block  punchASCIIdots(token0x3B)  end block
+     0x3C : block  punchASCIIdots(token0x3C)  end block
+     0x3D : block  punchASCIIdots(token0x3D)  end block
+     0x3E : block  punchASCIIdots(token0x3E)  end block
+     0x3F : block  punchASCIIdots(token0x3F)  end block
+    end case
+end procedure
+

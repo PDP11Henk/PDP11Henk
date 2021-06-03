@@ -1,0 +1,289 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-punch
+--
+-- this module contains
+--     - the circular buffer
+--           - to store data received from the PC
+--           - retrieve this data to send it to the punch
+--     - routine to receive PCH data from the PC
+--     - routine to control the PC05 punch
+
+
+const byte  MAX_PCH_BUFFER    = 80      -- PCH buffer size
+
+var   byte  PCHheadIndex                -- PCH buffer "input" index
+var   byte  PCHtailIndex                -- PCH buffer "output" index
+var   byte  PCHbuffer[MAX_PCH_BUFFER]   -- PCH buffer
+
+var   byte  punchToken                  -- 8-bit token to punch
+var   byte  punchCode                   -- diagnostic specifier byte
+var   byte  PCHstate                    -- PCH cycle state variable
+const byte  PCH_STATE_WAIT_READY  = 0
+const byte  PCH_STATE_DATA_SETUP  = 1
+const byte  PCH_STATE_IOP4_PULSE  = 2
+
+;const byte  PCH_SPACE_1_4         = MAX_PCH_BUFFER/4
+;const byte  PCH_SPACE_1_2         = MAX_PCH_BUFFER/2
+
+var   byte  punchDiagCommand                -- command ("X" or "x")
+var   byte  punchDiagByte                   -- the data value to be punched
+var   byte  punchDiagCount                  -- number of diag tokens to punch
+var   DWORD punchDiagDelay
+const DWORD PUNCH_BYTE_DELAY      = 125000  -- approx 200 msec/frame
+var   byte  punchDiagState                  -- PUNCH all bytes state variable
+const byte  PCH_DIAG_DATA_IDLE    = 0
+const byte  PCH_DIAG_DATA_BYTE1   = 1
+const byte  PCH_DIAG_WAIT_BYTE1_2 = 2
+const byte  PCH_DIAG_DATA_BYTE2   = 3
+
+
+-- -----------------------------------------------------------------------------
+-- initialize buffering for PUNCH data & state machine
+-- -----------------------------------------------------------------------------
+procedure initPCHbuffering() is
+    PCHheadIndex = 0
+    PCHtailIndex = 0
+    PCHstate = PCH_STATE_WAIT_READY
+    punchDiagState = PCH_DIAG_DATA_IDLE
+end procedure
+
+
+
+function getPunchState() return BYTE is
+    return PCHstate
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- databyte from PUNCH command received from PC: store in buffer
+-- -----------------------------------------------------------------------------
+procedure punchByte(BYTE in databyte) is
+  var byte nextIndex
+
+     nextIndex = PCHheadIndex + 1
+     if (nextIndex >= MAX_PCH_BUFFER) then
+        -- the last location of the buffer is not used.
+        -- This makes identification "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != PCHtailIndex) then
+        -- space available in buffer: store the new data byte to be punched.
+        PCHbuffer[PCHheadIndex] = databyte
+        PCHheadIndex = nextIndex
+     else
+        -- if no space is available, the data is simply lost!
+        ERROR_LED = LED_ON
+     end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- get databyte from PCH buffer
+-- Function returns a flag;
+--        - TRUE  -> punchToken contains byte to punch
+--        - FALSE -> no token available (buffer empty)
+-- -----------------------------------------------------------------------------
+function retrievePCHtoken() return BYTE is
+  var byte nextIndex
+
+    if (PCHheadIndex == PCHtailIndex) then
+        -- buffer is empty
+        return FALSE
+    else
+        punchToken = PCHbuffer[PCHtailIndex]
+        nextIndex = PCHtailIndex + 1
+        if (nextIndex >= MAX_PCH_BUFFER) then
+            -- the last location of the buffer is not used.
+            -- easy to identify "buffer full" and "buffer empty".
+            nextIndex = 0
+        end if
+        PCHtailIndex = nextIndex
+        return TRUE
+    end if
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- get punch in ready state: punch a NULL *without* status check
+-- -----------------------------------------------------------------------------
+procedure T_startPCH() is
+    DATA_PCH = 0                       -- punch NULL, no "punch ready" check
+    PCH_IOP4 = 1                       -- assert IOP4 pulse
+    delay_10us(1)                      -- pulse length = 10 usec
+    PCH_IOP4 = 0                       -- negate IOP4 pulse
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- this function is called when the "D" (diagnostic punch) command is received.
+--  specifier:
+--    "0" : punch all byte values 1x
+--    "1" : punch all bit values 2x
+--    "2" : punch 16 x 0xAA / 0x55 (punch stress test)
+--    "3" : punch 16 bytes 0xFF ("repair tape")
+--    "4" : punch 16 bytes 0x00 (leader/trailer)
+-- -----------------------------------------------------------------------------
+procedure punchDiag() is
+  var DWORD punchTime
+
+    case punchDiagState of
+       PCH_DIAG_DATA_IDLE : block
+       end block
+
+       PCH_DIAG_DATA_BYTE1 : block
+           punchByte(punchDiagByte)
+           punchDiagState = PCH_DIAG_WAIT_BYTE1_2
+       end block
+
+       PCH_DIAG_WAIT_BYTE1_2 : block
+               -- determine what to punch next
+               if (punchDiagCommand == "0") then
+                   -- ALL possible 8-bit data values
+                   punchDiagByte = punchDiagByte + 1
+                   if (punchDiagByte != 0x00) then
+                       punchTime = micros()
+                       punchDiagDelay = punchTime + PUNCH_BYTE_DELAY
+                       punchDiagState = PCH_DIAG_DATA_BYTE2
+                   else
+                       punchDiagState = PCH_DIAG_DATA_IDLE
+                   end if
+
+               elsif (punchDiagCommand == "1") then
+                   -- punch data 2x, shift bit
+                   if (punchDiagCount != 0) then
+                       punchDiagCount = punchDiagCount - 1
+                       punchTime = micros()
+                       punchDiagDelay = punchTime + PUNCH_BYTE_DELAY
+                       punchDiagState = PCH_DIAG_DATA_BYTE2
+                   else
+                       if (punchDiagByte != 0x80) then
+                           if (punchDiagByte == 0x00) then
+                               punchDiagByte = punchDiagByte + 1
+                           else
+                               punchDiagByte = punchDiagByte + punchDiagByte
+                           end if
+                           punchDiagCount = 2 - 1
+                           punchTime = micros()
+                           punchDiagDelay = punchTime + PUNCH_BYTE_DELAY
+                           punchDiagState = PCH_DIAG_DATA_BYTE2
+                       else
+                           punchDiagState = PCH_DIAG_DATA_IDLE
+                       end if
+                   end if
+
+               elsif (punchDiagCommand == "2") then
+                   -- punch 16 x 0xAA / 0x55 (punch stress test)
+                   if (punchDiagCount != 0) then
+                       punchDiagCount = punchDiagCount - 1
+                       punchDiagByte = !punchDiagByte
+                       punchTime = micros()
+                       punchDiagDelay = punchTime + PUNCH_BYTE_DELAY
+                       punchDiagState = PCH_DIAG_DATA_BYTE2
+                   else
+                       punchDiagState = PCH_DIAG_DATA_IDLE
+                   end if
+
+               else ; punchDiagCommand == "3" OR punchDiagCommand == "3"
+                   -- "3" : punch 16 bytes 0xFF ("repair tape")
+                   -- "4" : punch 16 bytes 0x00 (leader/trailer)
+                   if (punchDiagCount != 0) then
+                       punchDiagCount = punchDiagCount - 1
+                       punchTime = micros()
+                       punchDiagDelay = punchTime + PUNCH_BYTE_DELAY
+                       punchDiagState = PCH_DIAG_DATA_BYTE2
+                   else
+                       punchDiagState = PCH_DIAG_DATA_IDLE
+                   end if
+               end if
+       end block
+
+       PCH_DIAG_DATA_BYTE2 : block
+           punchTime = micros()
+           if ( punchTime > punchDiagDelay ) then
+               punchDiagState = PCH_DIAG_DATA_BYTE1
+           end if
+       end block
+    end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- this function is called when the "D" (diagnostic punch) command is received.
+--  specifier:
+--    "0" : punch all byte values 1x
+--    "1" : punch all bit values 2x
+--    "2" : punch 16 x 0xAA / 0x55 (punch stress test)
+--    "3" : punch 16 bytes 0xFF ("repair tape")
+--    "4" : punch 16 bytes 0x00 (leader/trailer)
+-- -----------------------------------------------------------------------------
+procedure punchDiagStart(BYTE in specifier) is
+    punchDiagCommand = specifier
+    case punchDiagCommand of
+       "0" : block
+                punchDiagByte = 0x00
+                punchDiagCount = 255
+             end block
+       "1" : block
+                punchDiagByte = 0x00
+                punchDiagCount = 2 - 1
+             end block
+       "2" : block
+                punchDiagByte = 0xAA
+                punchDiagCount = 32 - 1
+             end block
+       "3" : block
+                punchDiagByte = 0xFF
+                punchDiagCount = 16 - 1
+             end block
+       "4" : block
+                punchDiagByte = 0x00
+                punchDiagCount = 16 - 1
+             end block
+    end case
+    punchDiagState = PCH_DIAG_DATA_BYTE1
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- PCH process implemented as a state machine
+-- Get databyte from buffer (if available) and punch it
+--     -> periodically called from main()
+-- -----------------------------------------------------------------------------
+procedure checkPunch() is
+  var word databyte
+
+    case PCHstate of
+       PCH_STATE_WAIT_READY : block
+           if (PCH_READY) then
+               -- punch ready to punch next databyte
+               if (retrievePCHtoken() == TRUE) then
+                   -- buffer not empty, punch databyte
+                   DATA_PCH = punchToken              -- load punch databyte
+                   delay_5us()                        -- some setup time
+                   PCHstate = PCH_STATE_DATA_SETUP    -- data settle delay
+               end if
+           end if
+       end block
+
+       PCH_STATE_DATA_SETUP : block
+           PCH_IOP4 = 1                               -- assert IOP4 pulse
+           delay_5us()                                -- some pulse duration
+           PCHstate = PCH_STATE_IOP4_PULSE            -- data settle delay
+       end block
+
+       PCH_STATE_IOP4_PULSE : block
+           PCH_IOP4 = 0                               -- negate IOP4 pulse
+           delay_5us()                                -- min delay to next punch
+           PCHstate = PCH_STATE_WAIT_READY
+       end block
+    end case
+end procedure
+

@@ -1,0 +1,146 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-reply : send reply message to PC
+--
+-- this module contains
+--     - the circular buffer for the 2-byte reply messages
+--     - procedure to store messages in the buffer
+--     - procedure to retrieve a message from the buffer
+--     - transmit data control (state machine)
+
+
+const byte MAX_REPLY_BUFFER    = 120*2     -- reply message buffer size
+                                           -- NOTE: also reader output buffer
+
+var   byte replyHeadIndex                  -- reply buffer "input" index
+var   byte replyTailIndex                  -- reply buffer "output" index
+var   byte replyBuffer[MAX_REPLY_BUFFER]   -- reply buffer
+
+var   byte replyMessage[2]                 -- message to transmit to PC
+var   byte transmitState                   -- send reply message state variable
+const byte TRANSMIT_IDLE   = 0
+const byte TRANSMIT_BYTE1  = 1
+const byte TRANSMIT_BYTE2  = 2
+
+;const byte REPLY_SPACE_1_4     = MAX_REPLY_BUFFER/8    -- 4 bytes/reply message
+;const byte REPLY_SPACE_1_2     = MAX_REPLY_BUFFER/4
+
+-- -----------------------------------------------------------------------------
+-- initialize reply message buffering & state machine
+-- -----------------------------------------------------------------------------
+procedure initReplyBuffering() is
+    replyHeadIndex = 0
+    replyTailIndex = 0
+    transmitState  = TRANSMIT_IDLE
+end procedure
+
+
+
+function getReplyState() return BYTE is
+    return transmitState
+end function
+
+
+
+function getStatusBits() return BYTE is
+  var byte replyByte1
+
+    if (PCH_PAPEROUT == 1) then
+        -- still papertape in the punch available
+        replyByte1 = 0
+    else
+        -- paper out
+        replyByte1 = PCHOUTTAPE
+    end if
+    if (RDR_PAPEROUT == 1) then
+        replyByte1 = replyByte1 + RDROUTTAPE
+    end if
+    if (ERROR_LED == LED_ON) then
+        replyByte1 = replyByte1 + 0x80
+    end if
+    -- force "paper out" if in the reader a timeout has occurred
+    if (readerTimeOut == 1) then
+        replyByte1 = replyByte1 | RDROUTTAPE
+    end if
+    return replyByte1
+end function
+
+
+-- -----------------------------------------------------------------------------
+-- sendReplyToPC: store reply message in reply buffer
+-- -----------------------------------------------------------------------------
+procedure sendReplyToPC(BYTE in byte1, BYTE in byte2) is
+  var byte nextIndex
+
+     nextIndex = replyHeadIndex + 2
+     if (nextIndex >= MAX_REPLY_BUFFER) then
+        -- the last location of the buffer is not used.
+        -- This makes identification "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != replyTailIndex) then
+        -- space available in buffer: store the reply message in the buffer
+        replyBuffer[replyHeadIndex]   = byte1
+        replyBuffer[replyHeadIndex+1] = getStatusBits()
+        replyHeadIndex = nextIndex
+     else
+        -- if no space is available, the reply is simply lost!
+        ERROR_LED = LED_ON
+     end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve reply message from reply buffer
+-- Function returns a flag;
+--        - TRUE  -> replyMessage[2] contains a reply message
+--        - FALSE -> no message available (buffer empty)
+-- -----------------------------------------------------------------------------
+function retrieveReplyMessage() return BYTE is
+  var byte nextIndex
+
+  if (replyHeadIndex == replyTailIndex) then
+      -- buffer is empty
+      return FALSE
+  else
+      replyMessage[0] = replyBuffer[replyTailIndex]
+      replyMessage[1] = replyBuffer[replyTailIndex+1]
+      nextIndex = replyTailIndex + 2
+      if (nextIndex >= MAX_REPLY_BUFFER) then
+          -- the last location of the buffer is not used.
+          -- easy to identify "buffer full" and "buffer empty".
+          nextIndex = 0
+      end if
+      replyTailIndex = nextIndex
+      return TRUE
+  end if
+end function
+
+
+
+procedure transmitSTD() is
+    case (transmitState) of
+        TRANSMIT_IDLE : block
+                if ( retrieveReplyMessage() == TRUE ) then
+                    transmitState = TRANSMIT_BYTE1
+                end if
+            end block
+
+        TRANSMIT_BYTE1 : block
+                if PIR1_TXIF then
+                    TXREG = replyMessage[0]
+                    transmitState = TRANSMIT_BYTE2
+                end if
+            end block
+
+        TRANSMIT_BYTE2 : block
+                if PIR1_TXIF then
+                    TXREG = replyMessage[1]
+                    transmitState = TRANSMIT_IDLE
+                end if
+            end block
+    end case
+end procedure
+

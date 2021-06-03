@@ -1,0 +1,405 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Author: Henk Gooijen
+-- Compiler: 2.5r1 (18dec2018)
+--
+-- Description:
+--   Interface for  D|I|G|I|T|A|L  PC05  READER and PUNCH.
+--   This firmware controls the reader and punch of the PC05.
+--   A simple protocol is created to read a paper tape via the READER, punch a
+--   paper tape via the PUNCH and (upon request) get a status from the PC05.
+--   The PC is *always* the initiator, whether it is for reading the paper tape,
+--   punching the paper tape or requesting the status of the PC05 READER/PUNCH.
+--   The interface uses the standard 3-wire RS-232 serial lines (RxD, TxD, GND).
+--   The initiator message consists of 2 bytes.
+--
+--       +-----------+------------+
+--       |  COMMAND  |  DATABYTE  |
+--       +-----------+------------+
+--
+--   Commands (data transfer)
+--   ---------------------------------------------------------------------------
+--   command | databyte                                     | reply
+--   ---------------------------------------------------------------------------
+--      P    | punch character.                             | none
+--      A    | ASCII character. Print as readable ASCII.    | none
+--      R    | 2-complement of 'R'. Read 1 character.       | read character.
+--      r    | 2-complement of 'r'. Read till EOT (stream). | read character,
+--           |                                              | repeated till EOT.
+--   ===========================================================================
+--
+--
+--   Commands (control)
+--   ---------------------------------------------------------------------------
+--   command | databyte                                     | reply
+--   ---------------------------------------------------------------------------
+--      I    | 2-complement of 'I'. PC05 hardware reset.    | 0x00:OK / 0xFF:NOK
+--      C    | 2-complement of 'C'. Interface clear STDs.   | none
+--      W    | Timeout. PC05 interface watchdog control.    | none
+--           | Timeout == 0x00  -> watchdog disabled        |
+--           | Timeout != 0x00  -> watchdog time out        |
+--           |                     1 tick is approx 6.55 ms |
+--      M    | 2-complement of 'M'. Get machine states.     | machine state bits
+--      S    | 2-complement of 'S'. PC05 state.             | RDR & PCH state.
+--      D    | Specifier. Diagnostics & utilities.          | none
+--   ===========================================================================
+--
+--   state machine bits
+--        xx xx xx xx [8 bits of the state machines states]
+--        --------------------------------------------------
+--                 ^^ CMD_STATE
+--                 00 CMD_COMMAND
+--                 01 CMD_BYTE
+--              ^^    READER STATE
+--              00    RDR_STATE_INIT
+--              01    RDR_STATE_RUN_ACTIVE
+--              10    RDR_STATE_INT_ACTIVE
+--              11    RDR_STATE_STREAM_DELAY
+--           ^^       PUNCH STATE
+--           00       PCH_STATE_WAIT_READY
+--           01       PCH_STATE_DATA_SETUP
+--           10       PCH_STATE_IOP4_PULSE
+--                    REPLY STATE
+--        ^^ 00       TRANSMIT_IDLE
+--           01       TRANSMIT_ACTIVE_BYTE1
+--           10       TRANSMIT_ACTIVE_BYTE2
+--        Note: The reader output buffer and reply buffer are the same buffer.
+--
+--
+--   PC05 status ('S' command reply):
+--
+--    ---7--+--6--+--5--+--4--+--3--+--2--+--1--+--0---
+--    |  e  |  o  |  .  |  .  |  .  |  .  |  r  |  p  |
+--    ------+-----+-----+-----+-----+-----+-----+------
+--
+--       p - punch status   ::  0 = OK // 1 = out of tape
+--       r - reader status  ::  0 = OK // 1 = no more frames
+--                                           ("out of tape" OR "no feedholes")
+--       o - buffer overrun ::  0 = OK // 1 = error (cyclic buffer overrun)
+--       e - error status   ::  0 = OK // 1 = error (interface)
+--       . - not assigned, "0"
+--
+--
+-- Hardware indicators (LED):
+--   DIAG  - This LED is software-controlled via the main() loop.
+--           As long as the firmare did not crash, this LED blinks at ~1 Hz.
+--   FAULT - Is turned on when a check of the initiator message fails.
+--           Is turned off when a check of the initiator message is OK.
+--
+--
+-- Operation (sequentially executed in main loop)
+--       Each received initiator message is stored in a cyclic buffer. Since
+--   time elapses between the 2 bytes of this message, a state machine is used
+--   to received the initiator message. When the message is completely received,
+--   the message is stored in the cyclic buffer.
+--       When an initiator message is available in the buffer, the procedure
+--   "processCommand" retrieves the message from the buffer and performs the
+--   validation checks. If one of the checks fails the FAULT LED is turned on.
+--   If all checks are successful, the appropriate command handler is called.
+--
+--       "P" handler.
+--   As the punch is a slow device, the data byte to be punched is stored in a
+--   cyclic buffer. A separate state machine monitors the buffer, and when data
+--   is available in the buffer, one data byte is retrieved from the buffer and
+--   the punch state machine is triggered to execute the I/O to the punch.
+--
+--       "R" handler.
+--   As the reader is also a relatively slow device the reader state machine is
+--   triggered to execute the I/O to the reader. When a byte is read from the
+--   reader it is stored in a cyclic buffer, and another state machine takes
+--   care of sending the 2-byte reply message to the PC via RS-232. The state
+--   machine is needed to avoid a busy-wait loop for the transmitter flag
+--   "TX buffer empty".
+--
+--       "A" handler.
+--
+--       "r" handler.
+--
+--       "I" handler.
+--   When the "INITIALIZE" command is received, a hardware reset pulse is issued
+--   to the PC05 hardware. The 2-byte reply message is generated, stored in the
+--   buffer and via the separate state machine sent to the PC.
+--
+--       "C" handler.
+--   The "CLEAR" command forces all state machines to the initial state. This
+--   command might help to return the firmware to an operative state in case of
+--   being "stuck". If this dos not help, a hardware RESET might be needed (the
+--   button on the interface board).
+--
+--       "W" handler.
+--   Depending on the data byte the watchdog is disabled or enabled.
+--
+--       "M" handler.
+--   Retrieve the state of all internal state machines. Might be useful in
+--   hang-up conditions for debugging.
+--
+--       "S" handler.
+--   Retrieve the state of the reader and punch. When a bit is set, the
+--   "out-of-paper" condition is active. The most-significant bit is the status
+--   of the DIAG LED (should always be 0).
+--
+--       "D" handler.
+--   The databyte of the command specifies the requested action.
+--    '0' - punch all byte values 1x (output 256 chars): 0x00, 0x01, 0x02, 0x03,
+--          etc. up to 0xFF.
+--    '1' - punch all single bit values 2x (output 16 chars): 0x00, 0x00, 0x01,
+--          0x01, 0x02, 0x02, 0x04, 0x04, 0x08, 0x08, .. 0x40, 0x40, 0x80, 0x80.
+--    '2' - punch 16 bytes 0xAA / 0x55 (punch stress test)
+--    '3' - punch 16 bytes 0xFF ("repair tape")
+--    '4' - punch 16 bytes 0x00 (leader/trailer)
+--    '5' - toggle reader debug mode: instead of sending the read character,
+--          send the reader progress "0", [ "1" , "2", "3" ] , "!" sequence
+--     x  - Other specifier values are ignored.
+--
+--
+-- Notes:
+-- - File creation date/time: 13 August 2018.
+--   13-08-2018 : Initial (part) of firmware using PIC18F2550.
+--   20-08-2018 : Changed to PIC18F4550, because more I/O is needed.
+--                As side effect, RDR/PCH 8-bit octal latches are not needed.
+--   10-09-2018 : Update checkReader() after some tests with the PC05 reader!
+--   27-09-2018 : Changed the punch and status reply message format.
+--   28-09-2018 : Data from the reader is inverted! So inverted received chars.
+--   29-09-2018 : Added C command -> clears all state machines.
+--                Added I command -> sends an INITIALIZE pulse to the PC05.
+--                Added D command -> debug info: state machine state bits.
+--   22-10-2018 : Changed the command an reply packets. Both are always 4 bytes.
+--   28-10-2018 : Added S command -> get status of reader and punch. With this
+--                command it is possible to get the status at any time.
+--                Added X command -> punch hex data (0x00 thru 0xFF). With this
+--                command the puncher can be tested.
+--   05-11-2018 : To test each punch needle quickly, the "x" command is added.
+--                Just like "X", but instead of punching each byte value twice,
+--                "x" punches each bit in a byte twice (so just 16 frames).
+--   09-11-2018 : Added "p" command. Same as "P" command, but without reply msg.
+--   08-01-2019 : Protocol completely changed!
+--                Description (above) completely revised.
+--   14-01-2019 : Last free I/O pin on PIC used for "OVERRUN" LED indicator. The
+--                LED is lit when one of the cyclic buffers is overrun.
+--                RDR stream mode limited to 200 char/sec using timed delay.
+--   04-03-2019 : Reverted the change of 14-01-2018. The last I/O pin is now an
+--                input and connects to the RDR BUSY signal. The limiting on RDR
+--                stream mode is removed. A time-out detection is added so that
+--                stream mode is properly terminates if no more characters are
+--                to be read.
+--
+-- -----------------------------------------------------------------------------
+
+include 18f4550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+
+pragma target clock 20_000_000          -- OSC frequency used by delay routines
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+-- *** defines for compiler version 2.4n
+-- pragma target WDT           DISABLED    -- no watchdog
+--
+-- *** defines for compiler version 2.5r1
+pragma target WDT           CONTROL     -- no watchdog
+--
+pragma target OSC           HS
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+
+alias  RDR_IOP2     is pin_A0        -- RDR IOP2
+alias  RDR_IOP4     is pin_A1        -- RDR IOP4
+alias  RDR_INT      is pin_A2        -- RDR INT flag
+alias  RDR_BUSY     is pin_A3        -- RDR BUSY status
+alias  DIAGLED      is pin_A4        -- diagnostic on-board LED
+alias  PC05_INIT    is pin_A5        -- RDR & PCH INIT
+
+alias  DATA_RDR     is portb         -- RDR 8-bit data input
+
+alias  RDR_PAPEROUT is pin_C0        -- RDR paper out input
+alias  PCH_PAPEROUT is pin_C1        -- PCH paper out input
+alias  SENSE        is pin_C2        -- (USB)
+--     USBvoltRef   is pin_C3        -- (USB)
+--     USBdataN     is pin_C4        -- (USB D-)
+--     USBdataP     is pin_C5        -- (USB D+)
+--     RS232_TXD    is pin_C6        -- RS232 transmit data
+--     RS232_RXD    is pin_C7        -- RS232 receive data
+
+alias  DATA_PCH     is portd         -- PCH 8-bit data output
+
+alias  ERROR_LED    is pin_E0        -- error status LED
+alias  PCH_IOP4     is pin_E1        -- PCH IOP4
+alias  PCH_READY    is pin_E2        -- PCH READY status
+
+--  I/O direction
+
+pin_A0_direction    = output
+pin_A1_direction    = output
+pin_A2_direction    = input
+pin_A3_direction    = input
+pin_A4_direction    = output
+pin_A5_direction    = output
+
+pin_B0_direction    = input
+pin_B1_direction    = input
+pin_B2_direction    = input
+pin_B3_direction    = input
+pin_B4_direction    = input
+pin_B5_direction    = input
+pin_B6_direction    = input
+pin_B7_direction    = input
+
+pin_C0_direction    = input
+pin_C1_direction    = input
+pin_C2_direction    = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction    = output
+pin_C7_direction    = input
+
+pin_D0_direction    = output
+pin_D1_direction    = output
+pin_D2_direction    = output
+pin_D3_direction    = output
+pin_D4_direction    = output
+pin_D5_direction    = output
+pin_D6_direction    = output
+pin_D7_direction    = output
+
+pin_E0_direction    = output
+pin_E1_direction    = output
+pin_E2_direction    = input
+
+
+
+-- =============================================================================
+-- ** constants and variables: diagnostic LED, RS232
+-- =============================================================================
+
+-- diagnostic LED
+const byte LED_ON  = 0              -- LED connected to common +5, so:
+const byte LED_OFF = 1              -- inverted logic: 0::on // 1::off
+var   byte heartbeatState           -- heartbeat mode LED state (LED_ON|LED_OFF)
+
+var   byte cmdState                 -- command packet receiver state variable
+const byte CMD_COMMAND     = 0      -- command STD states
+const byte CMD_BYTE        = 1
+
+
+const serial_hw_baudrate   = 19200   -- RS-232 RX and TX at 19k2 Baud
+
+-- reply status byte
+const byte PCHOUTTAPE      = 0x01   -- bit 0 :: punch out of tape
+const byte RDROUTTAPE      = 0x02   -- bit 1 :: reader out of tape
+
+var   byte readerTimeOut
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+include delay                  -- busy-wait delay loops
+include serial_hardware        -- serial comms library
+include pc05-usec              -- microsecond counter
+include pc05-watchdog          -- watchdog
+include pc05-led               -- DIAG LED routines
+include pc05-reply             -- send reply message of protocol
+include pc05-reader            -- RDR buffering and control
+include pc05-punch             -- PCH buffering and control
+include pc05-ascii             -- punch as ASCII characters
+include pc05-code              -- protocol handling
+
+
+
+-- =============================================================================
+-- ------------    START OF PC05 READER/PUNCH INTERFACE PROGRAM    -------------
+-- =============================================================================
+
+BSR = 0                      ; set bank select register to default
+INTCON_GIE = FALSE           ; disable all interrupts
+enable_digital_io()          ; all I/O pins set to digital
+serial_hw_init()             ; initialize serial comm port interface
+INTCON = 0                   ; all interrupts disabled
+
+--  diagnostic LEDs initialization
+ERROR_LED         = LED_OFF
+DIAGLED           = LED_OFF
+heartbeatState    = LED_OFF
+
+-- set RDR/PCH interface signals in correct initial state
+RDR_IOP2          = 0
+RDR_IOP4          = 0
+PCH_IOP4          = 0
+
+PC05_INIT = 1
+delay_10us(100)              ; wait
+PC05_INIT = 0                ; assert INIT pulse
+delay_10us(100)              ; pulse length = 100*10 usec = 1 msec
+PC05_INIT = 1                ; negate INIT pulse
+
+-- initialize all state machines and variables
+initCommandSTD()             ; protocol: receive message
+initReplyBuffering()         ;           send reply message
+initPCHbuffering()           ; PCH buffer & state machine
+initRDRbuffering()           ; RDR state machine
+initTimeSincePowerUp()       ; timer 3 for microsecond timing
+startDiagLED()
+initWatchdog()
+readerTimeOut     = 0
+
+RCON_IPEN         = 0        ; disable priority levels on interrupts
+INTCON_PEIE       = 1        ; enable unmasked peripheral interrupts
+INTCON_GIE        = 1        ; enable unmasked interrupts
+
+T_startRDR()                 ; start RDR state machine
+T_startPCH()                 ; get PCH in ready state
+
+forever loop
+    commCheckWatchdog()
+    diagLEDheartBeat()       ; maintain DIAG LED heartbeat
+    commandSTD()             ; protocol: receive command packet state machine
+    processCommand()         ;           process command (if any received)
+    punchDiag()              ; diagnostic punch (if activated)
+    checkPunch()             ; punch a token (if any "W" command received)
+    checkReader()            ; read a token (if any "R" command received)
+    transmitSTD()            ; protocol: send reply message
+end loop
+

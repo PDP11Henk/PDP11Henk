@@ -1,0 +1,155 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-reader
+--
+-- this module contains
+--     - routine to control the PC05 reader
+
+
+var   byte RDRstate                        -- RDR cycle state variable
+var   byte RDRmode                         -- "R" : start/stop , "r" : streaming
+const byte RDR_STATE_INIT          = 0
+const byte RDR_STATE_BUSY          = 1
+const byte RDR_STATE_RUN_ACTIVE    = 2
+const byte RDR_STATE_INT_ACTIVE    = 3
+
+var   DWORD streamTimeOut                    -- micro() tick is 1.6 us
+const DWORD STREAM_TIME_OUT        = 625000  -- time out = 1 second
+
+var   byte readerDebugging                   -- when set, not the read character
+                                             -- is sent, but "1", "2", "3", "!"
+                                             -- sequence: check proper progress
+
+
+procedure sendDebugChar(BYTE in token) is
+    if (readerDebugging == TRUE) then
+        serial_hw_write(token)
+    end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- initialize buffering for READER data
+-- -----------------------------------------------------------------------------
+procedure initRDRbuffering() is
+    RDRstate = RDR_STATE_INIT
+    readerDebugging = FALSE
+end procedure
+
+
+
+function getReaderState() return BYTE is
+    return RDRstate
+end function
+
+
+
+procedure readReply(BYTE in readerToken) is
+  var byte replyByte1, replyByte2
+
+    replyByte1 = readerToken
+    replyByte2 = !replyByte1
+    sendReplyToPC(replyByte1, replyByte2)
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- get reader in ready state: issue initial read request *without* status check
+-- -----------------------------------------------------------------------------
+procedure T_startRDR() is
+    ; RDR_IOP4 = 1                       -- assert IOP4 pulse
+    ; delay_10us(1)                      -- pulse length = 10 usec
+    ; RDR_IOP4 = 0                       -- negate IOP4 pulse
+    RDRstate = RDR_STATE_INIT
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- fetchReaderByte initiates READER (via the state machine)
+-- -----------------------------------------------------------------------------
+procedure fetchReaderByte(BYTE in readerMode) is
+    -- readerMode can be "r" or "R"
+    --   "R" - read one tape frame (start/stop mode)
+    --   "r" - read entire tape (streaming mode)
+    sendDebugChar("0")
+    RDRmode  = readerMode
+    RDRstate = RDR_STATE_BUSY
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- RDR process implemented as a state machine
+-- Get databyte from RDR (if available) and store databyte in buffer
+--     -> periodically called from main()
+-- -----------------------------------------------------------------------------
+procedure checkReader() is
+  var byte databyte
+  var DWORD streamTime
+
+    case RDRstate of
+       RDR_STATE_INIT : block
+           -- waiting until state machine is triggered
+       end block
+
+       RDR_STATE_BUSY : block
+           sendDebugChar("1")
+           -- ??? wait for RDR_BUSY negated ???
+           RDRstate = RDR_STATE_RUN_ACTIVE
+       end block
+
+       RDR_STATE_RUN_ACTIVE : block
+           sendDebugChar("2")
+           RDR_IOP4 = 1                       -- assert IOP4 pulse
+           delay_10us(1)                      -- pulse length = 10 usec
+           RDR_IOP4 = 0                       -- negate IOP4 pulse
+           --
+           -- in streaming mode, after the last frame is read from the tape,
+           -- the state machine will stay in RDR_STATE_INT_ACTIVE, because the
+           -- RDR_INT is no longer asserted as there is no next frame.
+           -- A time-out is used to get out of this state.
+           streamTimeOut = micros() + STREAM_TIME_OUT
+           RDRstate = RDR_STATE_INT_ACTIVE
+       end block
+
+       RDR_STATE_INT_ACTIVE : block
+           -- wait for INT flag asserted =OR= time out occurs in streaming mode
+           if (RDR_INT == 0) then
+               sendDebugChar("3")
+               RDR_IOP2 = 1                   -- assert IOP2
+               delay_10us(1)                  -- settle delay = 10 usec
+               databyte = !DATA_RDR           -- read from READER (and invert!)
+               RDR_IOP2 = 0                   -- negate IOP2
+               readerTimeOut = 0
+               if (readerDebugging == FALSE) then
+                   readReply(databyte)
+               end if
+               if (RDRmode == "r") then
+                   RDRstate = RDR_STATE_BUSY  -- "streaming" till EOT
+               else
+                   RDRstate = RDR_STATE_INIT  -- "start/stop"
+               end if
+           else
+               -- RDR INT not asserted
+               -- *if* in streaming mode : check for time out
+               if (RDRmode == "r") then
+                   streamTime = micros()
+                   if ( streamTime > streamTimeOut ) then
+                       -- time out :
+                       -- force INIT state of this state transition controller
+                       RDRstate = RDR_STATE_INIT
+                       readerTimeOut = 1
+                       readReply(0)
+                       sendDebugChar("!")        -- terminated by time-out
+                   end if
+               end if
+           end if
+       end block
+    end case
+end procedure
+

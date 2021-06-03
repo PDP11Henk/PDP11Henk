@@ -1,0 +1,325 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-code : command STD, processCommand
+--
+--    this module contains
+--    - the command STD, cyclic buffer, processCommand routines
+
+
+var   byte RXdatabyte                  -- received character buffer
+var   byte receiveBuffer[2]            -- receive message buffer
+var   byte commandMessage[2]           -- command message to be processed
+
+const byte MAX_REC_BUFFER    = 60*2    -- receive message buffer size
+var   byte recHeadIndex                -- receive buffer "input" index
+var   byte recTailIndex                -- receive buffer "output" index
+var   byte recBuffer[MAX_REC_BUFFER]   -- receive buffer
+
+
+
+-- -----------------------------------------------------------------------------
+-- Initialize command STD and cyclic buffer
+-- -----------------------------------------------------------------------------
+procedure initCommandSTD() is
+    cmdState = CMD_COMMAND
+    recHeadIndex = 0
+    recTailIndex = 0
+    ERROR_LED = LED_OFF
+end procedure
+
+
+
+function getCommandState() return BYTE is
+    return cmdState
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- command message received from PC: store in buffer - called from commandSTD()
+-- The message packet is in receiveBuffer[2].
+-- -----------------------------------------------------------------------------
+procedure storeCommand() is
+  var byte nextIndex
+
+     nextIndex = recHeadIndex + 2
+     if (nextIndex >= MAX_REC_BUFFER) then
+        -- the last location of the buffer is not used.
+        -- This makes identification "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != recTailIndex) then
+        -- space available in buffer: store new command message from the PC.
+        recBuffer[recHeadIndex]   = receiveBuffer[0]
+        recBuffer[recHeadIndex+1] = receiveBuffer[1]
+        recHeadIndex = nextIndex
+     else
+        -- if no space is available, the data is simply lost!
+        ERROR_LED = LED_ON
+     end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- get command message from receiver buffer
+-- Function returns a flag;
+--        - TRUE  -> commandMessage[4] contains a message
+--        - FALSE -> no message available (buffer empty)
+-- -----------------------------------------------------------------------------
+function retrieveCommand() return BYTE is
+  var byte nextIndex
+
+  if (recHeadIndex == recTailIndex) then
+      -- buffer is empty
+      return FALSE
+  else
+      commandMessage[0] = recBuffer[recTailIndex]
+      commandMessage[1] = recBuffer[recTailIndex+1]
+      nextIndex = recTailIndex + 2
+      if (nextIndex >= MAX_REC_BUFFER) then
+          -- the last location of the buffer is not used.
+          -- easy to identify "buffer full" and "buffer empty".
+          nextIndex = 0
+      end if
+      recTailIndex = nextIndex
+      return TRUE
+  end if
+end function
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- send status byte
+--   bit 7 : error flag (ERROR LED state)
+--   bit 6 : overrun flag (cyclic buffer overrun occurred)
+--   bit 1 : reader out of tape
+--   bit 0 : punch out of tape
+-- -----------------------------------------------------------------------------
+procedure statusReply() is
+  var byte replyByte1, replyByte2
+
+    if (PCH_PAPEROUT == 1) then
+        -- still papertape in the punch available
+        replyByte1 = 0
+    else
+        -- paper out
+        replyByte1 = PCHOUTTAPE
+    end if
+    if (RDR_PAPEROUT == 1) then
+        replyByte1 = replyByte1 + RDROUTTAPE
+    end if
+    if (ERROR_LED == LED_ON) then
+        replyByte1 = replyByte1 + 0x80
+    end if
+    replyByte2 = !replyByte1
+    sendReplyToPC(replyByte1, replyByte2)
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Receive one byte from RS-232 port (** non-blocking **)
+-- If the function returns FALSE, there was no byte received in the buffer
+-- If the function returns TRUE, the received data byte is in "RXdatabyte".
+-- -----------------------------------------------------------------------------
+function receiveRS232data() return BYTE is
+  var byte databyte
+
+    if (serial_hw_read(databyte)) then
+        RXdatabyte = databyte
+        return TRUE
+    end if
+    return FALSE
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- commandSTD - handle command packet reception - called from main()
+-- -----------------------------------------------------------------------------
+procedure commandSTD() is
+    case (cmdState) of
+        CMD_COMMAND : block
+                if ( receiveRS232data() == TRUE ) then
+                    receiveBuffer[0] = RXdatabyte
+                    commRestartWatchdog()
+                    cmdState = CMD_BYTE
+                    ERROR_LED = LED_ON
+                end if
+            end block
+
+        CMD_BYTE    : block
+                if ( receiveRS232data() == TRUE ) then
+                    receiveBuffer[1] = RXdatabyte
+                    commRestartWatchdog()
+                    -- store message in cyclic buffer
+                    storeCommand()
+                    cmdState = CMD_COMMAND
+                    ERROR_LED = LED_OFF
+                end if
+            end block
+    end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- validateCommand - check received command packet
+--   called: from processCommand()
+--   Input : commandMessage[2]
+--   Return: TRUE  -> commandMessage[2] is valid
+--           FALSE -> commandMessage[2] is invalid
+-- -----------------------------------------------------------------------------
+function validateCommand() return BYTE is
+  var byte validMessage
+
+    validMessage = TRUE
+    -- check command code
+    if ( (commandMessage[0] == "R") | (commandMessage[0] == "P") |
+         (commandMessage[0] == "A") | (commandMessage[0] == "r") |
+         (commandMessage[0] == "I") | (commandMessage[0] == "C") |
+         (commandMessage[0] == "W") | (commandMessage[0] == "M") |
+         (commandMessage[0] == "S") | (commandMessage[0] == "D") ) then
+        -- ok
+    else
+        -- command not recognized
+        validMessage = FALSE
+    end if
+    -- check databyte: must be 2-complement of command code
+    if ( (commandMessage[1] == "R") | (commandMessage[1] == "r") |
+         (commandMessage[1] == "I") | (commandMessage[1] == "C") |
+         (commandMessage[1] == "M") | (commandMessage[1] == "S") ) then
+        if (commandMessage[1] != (!commandMessage[0] + 1)) then
+            validMessage = FALSE
+        end if
+    end if
+    ;
+    ; TEST CODE - overrule validation for now!   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    ;
+    validMessage = TRUE
+    ;
+    return validMessage
+end function
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet - called from main()
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte stateStates
+
+    if ( retrieveCommand() == TRUE ) then
+        if ( validateCommand() == TRUE) then
+            ERROR_LED = LED_OFF
+            case (commandMessage[0]) of
+                "P" : block
+                        -- punch data byte
+                        punchByte(commandMessage[1])
+                    end block
+
+                "A" : block
+                        -- punch data byte as ASCII "image"
+                        punchASCIIchar(commandMessage[1])
+                    end block
+
+                "R" : block
+                        -- READER start/stop mode: read one token from tape
+                        fetchReaderByte(commandMessage[0])
+                    end block
+
+                "r" : block
+                        -- READER streaming mode: read till EOT
+                        fetchReaderByte(commandMessage[0])
+                    end block
+
+                "I" : block
+                        PC05_INIT = 1
+                        delay_10us(1)              ; wait
+                        PC05_INIT = 0              ; assert INIT pulse
+                        delay_10us(1)              ; pulse length = 1 msec
+                        PC05_INIT = 1              ; negate INIT pulse
+                        delay_10us(1)              ; settling delay
+                        statusReply()              ; 0x00:OK / 0xFF:NOK
+                    end block
+
+                "C" : block
+                        initCommandSTD()
+                        initPCHbuffering()
+                        initRDRbuffering()
+                        initReplyBuffering()
+                        ERROR_LED = LED_OFF
+                    end block
+
+                "W" : block
+                        -- set watchdog timeout
+                        setWatchdog(commandMessage[1])
+                    end block
+
+                "M" : block
+                        -- return state machine bits
+                        -- xx xx xx xx
+                        -- =====================================
+                        --          ^^ CMD_STATE
+                        -- -------------------------------------
+                        --          00 CMD_COMMAND
+                        --          01 CMD_BYTE
+                        -- -------------------------------------
+                        --       ^^    READER STATE
+                        -- -------------------------------------
+                        --       00    RDR_STATE_INIT
+                        --       01    RDR_STATE_RUN_ACTIVE
+                        --       10    RDR_STATE_INT_ACTIVE
+                        -- -------------------------------------
+                        --    ^^       PUNCH STATE
+                        -- -------------------------------------
+                        --    00       PCH_STATE_WAIT_READY
+                        --    01       PCH_STATE_DATA_SETUP
+                        --    10       PCH_STATE_IOP4_PULSE
+                        -- -------------------------------------
+                        -- ^^          REPLY STATE
+                        -- -------------------------------------
+                        -- 00          TRANSMIT_IDLE
+                        -- 01          TRANSMIT_BYTE1
+                        -- 10          TRANSMIT_BYTE2
+                        -- =====================================
+                        stateStates = getCommandState()
+                        stateStates = stateStates + (getReaderState() << 2)
+                        stateStates = stateStates + (getPunchState() << 4)
+                        stateStates = stateStates + (getReplyState() << 6)
+                        readReply(stateStates)
+                    end block
+
+                "S" : block
+                        -- return PC05 RDR/PCH state
+                        statusReply()
+                    end block
+
+                "D" : block
+                        -- Diagnostics & utilities
+                        if ( (commandMessage[1] == "0") |
+                             (commandMessage[1] == "1") |
+                             (commandMessage[1] == "2") |
+                             (commandMessage[1] == "3") |
+                             (commandMessage[1] == "4") ) then
+                            punchDiagStart(commandMessage[1])
+                        elsif (commandMessage[1] == "5") then
+                            if (readerDebugging == FALSE) then
+                                readerDebugging = TRUE
+                            else
+                                readerDebugging = FALSE
+                            end if
+                        end if
+                    end block
+            end case
+        else
+            -- message packet invalid: turn ERROR LED on
+            ERROR_LED = LED_ON
+        end if
+    end if
+end procedure
+

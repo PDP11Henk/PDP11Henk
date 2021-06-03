@@ -1,0 +1,43 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-led
+--
+--    this module contains the routines for control of the DIAG LED.
+--    Routine "diagLEDheartBeat" maintains the flashing of the LED at the
+--       currently defined heartbeat rate.
+
+
+-- -----------------------------------------------------------------------------
+-- diagnostic LED update (based on timer) - called from main()
+-- -----------------------------------------------------------------------------
+
+var   DWORD   diagLEDpulseTime
+const DWORD   DIAG_PULSE_DELAY  = 312500   -- approx 500 msec
+
+
+procedure startDiagLED() is
+  var DWORD currentTime
+
+    currentTime = micros()
+    diagLEDpulseTime = currentTime + DIAG_PULSE_DELAY
+end procedure
+
+
+
+procedure diagLEDheartBeat() is
+  var DWORD checkTime
+
+    checkTime = micros()
+    if ( checkTime > diagLEDpulseTime ) then
+       diagLEDpulseTime = checkTime + DIAG_PULSE_DELAY  -- restart timer
+       if (heartbeatState == LED_OFF) then              -- change DIAG LED state
+          heartbeatState = LED_ON
+          DIAGLED = LED_ON
+       else
+          heartbeatState = LED_OFF
+          DIAGLED = LED_OFF
+       end if
+    end if
+end procedure
+

@@ -1,0 +1,50 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-usec
+--
+--    this module maintains a microsecond counter using timer3.
+--    Timer3 is used in 16-bit mode and is clocked by Fosc/4 followed by the
+--    prescaler set to 8. As the xtal is 20 MHz, Fosc/4 = 0.2 usec, and after
+--    prescaler set to 8, the counter is incremented every 1.6 usec.
+--    As the counter is 16 bit, overflow will occur at 65536*1.6 usec = 104 ms.
+--    At overflow an interrupt is generated, and a 16-bit word is incremented.
+--    In total, the 16-bit timer3 count and the 16-bit word result in a 32-bit
+--    counter which returns elapsed time after power-up in microseconds with a
+--    granularity of approx. 1.6 usec.
+--
+--    The function micros() returns the number of "microseconds" elapsed after
+--    power-up. It is a substitute for the Arduino "micros()" function.
+
+var word  tim3_32            -- upper count word (bits 31-16)
+
+
+procedure initTimeSincePowerUp() is
+    T3CON_RD16   = 1         -- 16-bit R/W access mode
+    T3CON_T3CKPS = 3         -- 1:8 prescaler
+    T3CON_TMR3CS = 0         -- use internal clock Fosc/4
+    TMR3 = 0                 -- start count at 0
+    tim3_32 = 0              -- clear upper count word
+    T3CON_TMR3ON = 1         -- enable timer3
+    --
+    PIE2_TMR3IE = 1          -- enable timer3 overflow interrupt
+    -- INTCON_PEIE = 1       -- enable peripheral interrupts (done in main)
+    -- INTCON_GIE = 1        -- enable all interrupts        (done in main)
+end procedure
+
+
+
+function micros() return DWORD is
+    return ( ((DWORD(tim3_32))<<16) + (DWORD(TMR3)) )
+end function
+
+
+
+procedure tmr3_isr() is
+    pragma interrupt
+    if PIR2_TMR3IF then
+        PIR2_TMR3IF = 0            -- clear overflow flag
+        tim3_32 = tim3_32 + 1      -- increment upper count word
+    end if
+end procedure
+

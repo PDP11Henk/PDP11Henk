@@ -1,0 +1,61 @@
+-- -----------------------------------------------------------------------------
+-- Title:  PC05 reader/punch control module using the Microchip PIC18F4550
+--
+-- Submodule: pc05-watchdog : communication watchdog routines
+
+
+var   byte  defaultWDTtimeout          -- watchdog time out
+var   byte  watchdogState              -- watchdog ENABLED/DISABLED flag
+const byte  WATCHDOG_ENABLED   = 1
+const byte  WATCHDOG_DISABLED  = 0
+
+var   dword watchdogTimeout            -- watchdog time out moment
+var   dword timeoutDelay               -- time out delay value
+
+
+procedure initWatchdog() is
+    defaultWDTtimeout = 10                                  -- watchdog time out
+    timeoutDelay = (dword(defaultWDTtimeout)) << 12
+    -- 1 tick of defaultWDTtimeout represents ~6.553 msec
+    watchdogState = WATCHDOG_DISABLED                       -- disabled for now!
+end procedure
+
+
+
+procedure setWatchdog(BYTE in timeout) is
+    if (timeout == 0) then
+        watchdogState = WATCHDOG_DISABLED
+    else
+        defaultWDTtimeout = timeout
+        timeoutDelay = (dword(defaultWDTtimeout)) << 12
+        watchdogTimeout = micros() + timeoutDelay
+        watchdogState = WATCHDOG_ENABLED
+    end if
+end procedure
+
+
+
+procedure commRestartWatchdog() is
+    if (watchdogState == WATCHDOG_ENABLED) then
+        watchdogTimeout = micros() + timeoutDelay
+    end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- communication watchdog check - called from main()
+-- -----------------------------------------------------------------------------
+procedure commCheckWatchdog() is
+  var dword timeNow
+
+    if (watchdogState == WATCHDOG_ENABLED) then
+        timeNow = micros()
+        if ( timeNow > watchdogTimeout ) then
+            -- restart command packet receiver state machine
+            cmdState = CMD_COMMAND
+            watchdogTimeout = micros() + timeoutDelay
+        end if
+    end if
+end procedure
+
