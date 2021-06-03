@@ -1,0 +1,440 @@
+-- -----------------------------------------------------------------------------
+-- Title:  FuelFlow Indicator control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: ffi-code
+--
+--    this module contains the circular buffer to store FFI setpoints, the
+--    conversion of a 12-bit "angle" to synchro stator signals, the main synchro
+--    position update routine, and the processing of all "FFI" commands.
+
+include ffi-sin12bit
+include ffi-dacs
+
+var word    amplitude
+var byte    polarity
+var word    stepSize
+
+
+-- -----------------------------------------------------------------------------
+-- new FFI setpoint received: store in buffer - called from main()
+-- -----------------------------------------------------------------------------
+procedure acceptNewSetpoint() is
+  var byte nextIndex
+
+  if (FFIupdate == TRUE) then
+     nextIndex = headIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != tailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        setpointBuffer[headIndex] = newSetpoint
+        headIndex = nextIndex
+     end if
+     FFIupdate = FALSE
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- get (new) FFI setpoint from buffer - called from updSynchroPosition()
+-- -----------------------------------------------------------------------------
+function retrieveNewSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (headIndex == tailIndex) then
+      -- buffer is empty
+      setpoint = 55555 -- impossible value to indicate no new setpoint available
+  else
+      setpoint = setpointBuffer[tailIndex]
+      nextIndex = tailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- yes I know; the last location of the buffer is not used.
+          -- But this makes it easy to identify "buffer full" and "buffer empty"
+          nextIndex = 0
+      end if
+      tailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+
+procedure convertAngle(WORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 8192.
+  ; The value is converted to a look-up value for a "half-sine" (12-bit).
+  ; The first half sine period is equal to the second half, except for polarity.
+
+var word baseAngle, sineValue
+
+  -- get "base" angle :: always in first half of sine wave for table lookup
+
+  if (angle < 4096) then
+     baseAngle = angle
+     polarity = 1                       -- sine value is positive
+  else
+     baseAngle = 4096 - (8192 - angle)
+     if (baseAngle == 4096) then
+        baseAngle = 0
+     end if
+     polarity = 0                       -- sine value is negative
+  end if
+
+  sineValue = sine[baseAngle]
+
+  -- the higher the sine value, the lower the VCA control voltage must be
+  -- VCA control voltage 0V => attenuation = 0 dB  (gain = 1)
+  -- VCA control voltage 1V => attenuation ~ 30 dB (gain = 1/1000)
+  amplitude = 1023 - sineValue
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- set FFI setpoint - called from updSynchroPosition()
+-- -----------------------------------------------------------------------------
+procedure setFFI(WORD in setAngle) is
+  ; setAngle is the 12-bit setpoint angle where 0 :: 0° and 8192 :: 360°
+  ; sine lookup table is used to retrieve the individual stator amplitudes.
+  ; As the angle varies from 0 to 8192 for one full sine wave, one "half"
+  ; spans a range of 4096 values. Therefore, the sine table has 4096 entries,
+  ; and returns a value between 0 and 1023 (10-bit synchro stator amplitude,
+  ; controlled by 10-bits DACs).
+
+var word s1Angle, s2Angle, s3Angle
+
+  ; For the altimeter, a higher vaue resulted in a higher altitude indication.
+  ; For the FFI, a higher value causes a *lower* indication -> invert setpoint.
+  
+  setAngle = 4096 - setAngle   ; invert the range
+                               ; Note that for a full range this should be 8192.
+                               ; However, for the FFI only 1/2 of the full range
+                               ; represetns 0 - 80000 PPH.
+
+  s1Angle = setAngle + offsetS1
+  s2Angle = setAngle + offsetS2
+  s3Angle = setAngle + offsetS3
+
+  -- normalize to base value
+  if (s1Angle >= 8192) then s1Angle = s1Angle - 8192  end if   ; 8192 == 0
+  if (s2Angle >= 8192) then s2Angle = s2Angle - 8192  end if
+  if (s3Angle >= 8192) then s3Angle = s3Angle - 8192  end if
+
+  -- retrieve amplitude and polarity
+  convertAngle(s1Angle)             -- convert S1
+  amplitudeS1 = amplitude
+  polarityS1  = polarity
+
+  convertAngle(s2Angle)             -- convert S2
+  amplitudeS2 = amplitude
+  polarityS2  = polarity
+
+  convertAngle(s3Angle)             -- convert S3
+  amplitudeS3 = amplitude
+  polarityS3  = polarity
+
+  -- output to FFI
+  synchroSetpoint( amplitudeS1, amplitudeS2, amplitudeS3,
+                   polarityS1,  polarityS2,  polarityS3  )
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- set (new) FFI setpoint - called from main()
+-- -----------------------------------------------------------------------------
+procedure updSynchroPosition() is
+  var word setpoint
+
+  -- output a new setpoint only if no previous setpoint output is in progress!
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = retrieveNewSetpoint()
+      if (setpoint != 55555) then    -- 55555 is magic number for "buffer empty"
+          -- start cycle to send data to the DACs for S1-S2-S3 amplitude
+          setpointsToDACsActive = TRUE
+          setFFI(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte IDbyte, polData
+
+  case (commandCode) of
+      CMD_FFISQ1A     : block
+                           newSetpoint = word(commandData)
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ1B     : block
+                           newSetpoint = word(commandData) + 256
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ1C     : block
+                           newSetpoint = word(commandData) + 512
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ1D     : block
+                           newSetpoint = word(commandData) + 768
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ2A     : block
+                           newSetpoint = word(commandData) + 1024
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ2B     : block
+                           newSetpoint = word(commandData) + 1024 + 256
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ2C     : block
+                           newSetpoint = word(commandData) + 1024 + 512
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ2D     : block
+                           newSetpoint = word(commandData) + 1024 + 768
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ3A     : block
+                           newSetpoint = word(commandData) + 2048
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ3B     : block
+                           newSetpoint = word(commandData) + 2048 + 256
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ3C     : block
+                           newSetpoint = word(commandData) + 2048 + 512
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ3D     : block
+                           newSetpoint = word(commandData) + 2048 + 768
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ4A     : block
+                           newSetpoint = word(commandData) + 3072
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ4B     : block
+                           newSetpoint = word(commandData) + 3072 + 256
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ4C     : block
+                           newSetpoint = word(commandData) + 3072 + 512
+                           FFIupdate = TRUE
+                        end block
+      CMD_FFISQ4D     : block
+                           newSetpoint = word(commandData) + 3072 + 768
+                           FFIupdate = TRUE
+                        end block
+--
+      CMD_S1AMPL   : block
+                        amplitudeS1 = word(commandData) << 2
+                     end block
+      CMD_S2AMPL   : block
+                        amplitudeS2 = word(commandData) << 2
+                     end block
+      CMD_S3AMPL   : block
+                        amplitudeS3 = word(commandData) << 2
+                     end block
+      CMD_SxPOL    : block
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --  |     |     |     |     |     |  S3 |  S2 |  S1 |
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --                                  pol   pol   pol
+                        --
+                        --  Bits 0, 1, and 2 set the polarity of S1, S2, and S3
+                        --  respectively of the FFI synchro.
+                        --  Bits 3-4-5-6-7 are ignored.
+
+                        polData = !commandData         -- "0" pass // "1" invert
+                        polarityS1 = (polData & 0x01)
+                        polarityS2 = (polData & 0x02) >> 1
+                        polarityS3 = (polData & 0x04) >> 2
+                        synchroSetpoint(amplitudeS1, amplitudeS2, amplitudeS3,
+                                        polarityS1,  polarityS2,  polarityS3 )
+                     end block
+--
+      -- base angle offsets (in 12-bit accuracy)
+      -- NOTE: LSB value must be set *before* MSB value!
+      CMD_S1BASE_L : block
+                        offsetS1low = word(commandData)
+                     end block
+      CMD_S1BASE_H : block
+                        offsetS1 = (word(commandData)) << 8
+                        offsetS1 = offsetS1 + offsetS1low
+                     end block
+      CMD_S2BASE_L : block
+                        offsetS2low = word(commandData)
+                     end block
+      CMD_S2BASE_H: block
+                        offsetS2 = (word(commandData)) << 8
+                        offsetS2 = offsetS2 + offsetS2low
+                     end block
+      CMD_S3BASE_L : block
+                        offsetS3low = word(commandData)
+                     end block
+      CMD_S3BASE_H : block
+                        offsetS3 = (word(commandData)) << 8
+                        offsetS3 = offsetS3 + offsetS3low
+                     end block
+--
+      CMD_WTCHDOG_DIS : block
+                            wtchdogState = WTCHDOG_DISABLED
+                        end block
+      CMD_WTCHDOG_ENA : block
+                           if ((commandData & 0x3F) == 0x00) then
+                               -- set default timeout value
+                               wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+                           else
+                               wtchdogDelayValue = word(commandData & 0x3F)
+                           end if
+                           if ((commandData & 0xC0) == 0x80) then
+                               -- enable watchdog
+                               wtchdogState = WTCHDOG_ENABLED
+                               set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                           end if
+                           if ((commandData & 0xC0) == 0x00) then
+                               -- disable watchdog
+                               wtchdogState = WTCHDOG_DISABLED
+                           end if
+                        end block
+--
+      CMD_DIAGMODE : block
+                        if (flashRate != DOA_RESET_RATE) then
+                           -- do not accept DIAG commands during DOA power-up
+                           setDiagLEDmode(commandData)
+                        end if
+                     end block
+--
+      CMD_USROUT1  : block
+                        if (commandData == 0) then  DIGOUT1 = 0 end if
+                        if (commandData == 1) then  DIGOUT1 = 1 end if
+                     end block
+      CMD_USROUT2  : block
+                        if (commandData == 0) then  DIGOUT2 = 0 end if
+                        if (commandData == 1) then  DIGOUT2 = 1 end if
+                     end block
+      CMD_USROUT3  : block
+                        if (commandData == 0) then  DIGOUT3 = 0 end if
+                        if (commandData == 1) then  DIGOUT3 = 1 end if
+                     end block
+      CMD_USROUT4  : block
+                        if (commandData == 0) then  DIGOUT4 = 0 end if
+                        if (commandData == 1) then  DIGOUT4 = 1 end if
+                     end block
+      CMD_USROUT5  : block
+                        if (commandData == 0) then  DIGOUT5 = 0 end if
+                        if (commandData == 1) then  DIGOUT5 = 1 end if
+                     end block
+--
+      -- load "manual" setpoint via direct access to S1, S2, S3 (12-bit value)
+      -- NOTE 1: LSB value must be set *before* MSB value!
+      -- NOTE 2: NO offset is included!
+      -- NOTE 3: setpoint buffering is bypassed: the DACs are loaded immediately
+      --         but only if a previous manual load is not "in progress". If a
+      --         manual load is in "progress", this new setpoint load is ignored
+      --         There is NO check whether manual loading and "normal" setpoint
+      --         loading is used simultaneously.
+      CMD_S1MAN_L : block
+                       manualS1low = word(commandData)
+                    end block
+      CMD_S1MAN_H : block
+                       manualS1 = (word(commandData)) << 8
+                       manualS1 = manualS1 + manualS1low
+                    end block
+      CMD_S2MAN_L : block
+                       manualS2low = word(commandData)
+                    end block
+      CMD_S2MAN_H: block
+                       manualS2 = (word(commandData)) << 8
+                       manualS2 = manualS2 + manualS2low
+                    end block
+      CMD_S3MAN_L : block
+                       manualS3low = word(commandData)
+                    end block
+      CMD_S3MAN_H : block
+                       manualS3 = (word(commandData)) << 8
+                       manualS3 = manualS3 + manualS3low
+                    end block
+      CMD_LD_MAN  : block
+                       amplitudeS1 = manualS1 & 0x0FFF   -- strip to 12 bits
+                       amplitudeS2 = manualS2 & 0x0FFF
+                       amplitudeS3 = manualS3 & 0x0FFF
+                       if ((commandData & 0x01) == 0x01) then
+                           polarityS1  = 1
+                       else
+                           polarityS1  = 0
+                       end if
+                       if ((commandData & 0x02) == 0x02) then
+                           polarityS2  = 1
+                       else
+                           polarityS2  = 0
+                       end if
+                       if ((commandData & 0x04) == 0x04) then
+                           polarityS3  = 1
+                       else
+                           polarityS3  = 0
+                       end if
+                       if (manualLoadFinished == TRUE) then
+                           manualLoadFinished = FALSE
+                           synchroSetpoint( amplitudeS1, amplitudeS2,
+                                            amplitudeS3, polarityS1,
+                                            polarityS2,  polarityS3 )
+                           -- manualLoadFinished -> TRUE done in SPI interrupt
+                       end if
+                    end block
+
+      -- USB test
+      CMD_IDENTIFY  : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            usb_serial_data = "F"
+                            usb_serial_data = "F"
+                            usb_serial_data = "I"
+                            usb_serial_data = " "
+                            usb_serial_data = "v"
+                            usb_serial_data = "0" + MAJOR_VERSION
+                            usb_serial_data = "."
+                            usb_serial_data = "0" + MINOR_VERSION
+                            usb_serial_data = " "
+                            usb_serial_data = "$"
+                            IDbyte = ((FFI_ADDR >> 4) & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            IDbyte = (FFI_ADDR & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            usb_serial_data = ASCII_CR                  ; add CR
+                            usb_serial_data = ASCII_LF                  ; add LF
+                         end if
+                      end block
+      -- USB debug
+      CMD_USB_DEBUG : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            if (commandData == "N") then
+                               USBdebugEnabled = FALSE
+                            elsif (commandData == "Y") then
+                               USBdebugEnabled = TRUE
+                            end if
+                         end if
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

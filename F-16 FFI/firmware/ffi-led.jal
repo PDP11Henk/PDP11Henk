@@ -1,0 +1,79 @@
+-- -----------------------------------------------------------------------------
+-- Title:  FuelFlow Indicator control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: ffi-led
+--
+--    this module contains the routines for control of the DIAG LED.
+--    Routine "diagLEDheartBeat" maintains the flashing of the LED at the
+--       currently defined heartbeat rate.
+--    Routine "setDiagLEDmode" processes the received command for the DIAG LED.
+--       The LED can be permanently OFF or ON, flash at a set heartbeat rate,
+--       or can toggle state (ON / OFF) per received (and acknowledged) command.
+
+
+procedure setDiagLEDmode(BYTE in databyte) is
+    case databyte of
+      DIAGLED_OFF       : block
+                             diagLEDuse = DIAGLED_OFF
+                             DIAGLED = LED_OFF
+                          end block
+      DIAGLED_ON        : block
+                             diagLEDuse = DIAGLED_ON
+                             DIAGLED = LED_ON
+                          end block
+      DIAGLED_HEARTBEAT : block
+                             -- start timer for 1st time
+                             set_delay(HEARTBEAT_SLOT, flashRate)
+                             diagLEDuse = DIAGLED_HEARTBEAT
+                             heartbeatState = LED_OFF
+                             DIAGLED = LED_OFF
+                          end block
+      DIAGLED_MSG_ACK   : block
+                             diagLEDuse = DIAGLED_MSG_ACK
+                             DIAGLED = !DIAGLED
+                          end block
+      otherwise block
+                   -- ignore all other values
+                end block
+    end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- diagnostic LED update (based on timer) - called from main()
+-- -----------------------------------------------------------------------------
+procedure diagLEDheartBeat() is
+    if (diagLEDuse == DIAGLED_HEARTBEAT) then
+       if ( check_delay(HEARTBEAT_SLOT) ) then
+          -- first check if in initial 1 second start-up delay
+          if (flashRate == DOA_RESET_RATE) then
+             -- it is: count the flashes as a delay
+             if (resetFlashCount < 30) then
+                resetFlashCount = resetFlashCount + 1
+             else
+                -- end of DOA power-up delay cycle: reset DOA variables
+                INTCON3_INT2IE = 0               -- disable INT2 (DOA) interrupt
+                                                 -- (for USB: already disabled)
+                bitcounter   = 7
+                DOA_address  = 0
+                DOA_subaddr  = 0
+                DOA_databyte = 0
+                DOA_RXstate  = DOA_STATE_ADDRESS
+                flashRate    = DOA_FLASH_RATE
+                INTCON3_INT2IE = 1               -- enable INT2 (DOA) interrupt
+             end if
+          end if
+          set_delay(HEARTBEAT_SLOT, flashRate)       -- restart timer
+          if (heartbeatState == LED_OFF) then        -- change DIAG LED state
+             heartbeatState = LED_ON
+             DIAGLED = LED_ON
+          else
+             heartbeatState = LED_OFF
+             DIAGLED = LED_OFF
+          end if
+       end if
+    end if
+end procedure
+
