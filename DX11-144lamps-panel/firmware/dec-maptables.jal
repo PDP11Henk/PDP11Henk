@@ -1,0 +1,105 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-maptables
+--
+--    this module contains the mapping look-up tables.
+--
+--    To the user the indicator panel appears to be a group of 144 lamps,
+--    numbered in groups of 8 lamps. The first group is top row left 8 indicator
+--    lamps and from left to right the indicator lamp state is represented by
+--    bit-7, bit-6 .. bit-0 in the data byte.
+--    However, hardware-wise the connections are different due to trace routing
+--    complexity on the interface board. This is hidden to the user by using
+--    mapping look-up tables.
+--
+-- mapping description
+--
+-- Data input from user:
+--      command byte representing one group of 8 lamps, logically arranged as
+--      viewed on the display panel. Command byte 00 represents the 8 indicator
+--      lamps top left on the display panel.
+--
+-- For each command [0 .. 19] is a look-up table. Each look-up table holds 8
+-- bytes. Each byte contains the following information.
+--
+--     +-----+-----+-----+-----+-----+-----+-----+-----+
+--     |  7  |  6  |  5  |  4  |  3  |  2  |  1  |  0  |
+--     +-----+-----+-----+-----+-----+-----+-----+-----+
+--
+--       XXXXXXXXXXXXXXXXXXXXXXXXXX     XXXXXXXXXXXXX
+--        IC# (MCP27S13) & outport        bit number
+--
+-- The IC# & outport is a constant holding the IC# as designed in the schematic
+-- multiplied by 2, minus 2 (base 0). Bits 7 ~ 4 hold that constant.
+-- If the output bit is in output port A, bit 3 is "0".
+-- If the output bit is in output port B, the bit 3 is "1".
+--
+-- MCP23S17 device definitions for the mapping look-up tables
+--
+const IC01A  = 0x00     -- IC #1 port A
+const IC01B  = 0x08     -- IC #1 port B
+const IC02A  = 0x10     -- IC #2 port A
+const IC02B  = 0x18     -- IC #2 port B
+const IC03A  = 0x20
+const IC03B  = 0x28
+const IC04A  = 0x30
+const IC04B  = 0x38
+const IC05A  = 0x40
+const IC05B  = 0x48
+const IC06A  = 0x50
+const IC06B  = 0x58
+const IC07A  = 0x60
+const IC07B  = 0x68
+const IC08A  = 0x70
+const IC08B  = 0x78
+const IC09A  = 0x80
+const IC09B  = 0x88
+const IC10A  = 0x90     -- IC #10 port A
+const IC10B  = 0x98     -- IC #10 port B
+--
+--
+-- Now that the IC# (MCP27S13) & outport identifiers are defined, the look-up
+-- mapping tables (from user input to physical hardware) can be defined.
+--
+const BYTE TABLE00[8] = {IC01A + 7, IC01A + 6, IC01A + 5, IC01A + 4,
+                         IC01A + 3, IC01A + 2, IC01A + 1, IC01A + 0}
+const BYTE TABLE01[8] = {IC01B + 7, IC01B + 6, IC01B + 5, IC01B + 4,
+                         IC01B + 3, IC01B + 2, IC01B + 1, IC01B + 0}
+const BYTE TABLE02[8] = {IC02A + 7, IC02A + 6, IC02A + 5, IC02A + 4,
+                         IC02A + 3, IC02A + 2, IC02A + 1, IC02A + 0}
+const BYTE TABLE03[8] = {IC02B + 7, IC02B + 6, IC02B + 5, IC02B + 4,
+                         IC02B + 3, IC02B + 2, IC02B + 1, IC02B + 0}
+const BYTE TABLE04[8] = {IC03A + 7, IC03A + 6, IC03A + 5, IC03A + 4,
+                         IC03A + 3, IC03A + 2, IC03A + 1, IC03A + 0}
+const BYTE TABLE05[8] = {IC03B + 7, IC03B + 6, IC03B + 5, IC03B + 4,
+                         IC03B + 3, IC03B + 2, IC03B + 1, IC03B + 0}
+const BYTE TABLE06[8] = {IC04A + 7, IC04A + 6, IC04A + 5, IC04A + 4,
+                         IC04A + 3, IC04A + 2, IC04A + 1, IC04A + 0}
+const BYTE TABLE07[8] = {IC04B + 7, IC04B + 6, IC04B + 5, IC04B + 4,
+                         IC04B + 3, IC04B + 2, IC04B + 1, IC04B + 0}
+const BYTE TABLE08[8] = {IC05A + 7, IC05A + 6, IC05A + 5, IC05A + 4,
+                         IC05A + 3, IC05A + 2, IC05A + 1, IC05A + 0}
+const BYTE TABLE09[8] = {IC05B + 7, IC05B + 6, IC05B + 5, IC05B + 4,
+                         IC05B + 3, IC05B + 2, IC05B + 1, IC05B + 0}
+const BYTE TABLE10[8] = {IC06A + 7, IC06A + 6, IC06A + 5, IC06A + 4,
+                         IC06A + 3, IC06A + 2, IC06A + 1, IC06A + 0}
+const BYTE TABLE11[8] = {IC06B + 7, IC06B + 6, IC06B + 5, IC06B + 4,
+                         IC06B + 3, IC06B + 2, IC06B + 1, IC06B + 0}
+const BYTE TABLE12[8] = {IC07A + 7, IC07A + 6, IC07A + 5, IC07A + 4,
+                         IC07A + 3, IC07A + 2, IC07A + 1, IC07A + 0}
+const BYTE TABLE13[8] = {IC07B + 7, IC07B + 6, IC07B + 5, IC07B + 4,
+                         IC07B + 3, IC07B + 2, IC07B + 1, IC07B + 0}
+const BYTE TABLE14[8] = {IC08A + 7, IC08A + 6, IC08A + 5, IC08A + 4,
+                         IC08A + 3, IC08A + 2, IC08A + 1, IC08A + 0}
+const BYTE TABLE15[8] = {IC08B + 7, IC08B + 6, IC08B + 5, IC08B + 4,
+                         IC08B + 3, IC08B + 2, IC08B + 1, IC08B + 0}
+const BYTE TABLE16[8] = {IC09A + 7, IC09A + 6, IC09A + 5, IC09A + 4,
+                         IC09A + 3, IC09A + 2, IC09A + 1, IC09A + 0}
+const BYTE TABLE17[8] = {IC09B + 7, IC09B + 6, IC09B + 5, IC09B + 4,
+                         IC09B + 3, IC09B + 2, IC09B + 1, IC09B + 0}
+const BYTE TABLE18[8] = {IC10A + 7, IC10A + 6, IC10A + 5, IC10A + 4,
+                         IC10A + 3, IC10A + 2, IC10A + 1, IC10A + 0}
+const BYTE TABLE19[8] = {IC10B + 7, IC10B + 6, IC10B + 5, IC10B + 4,
+                         IC10B + 3, IC10B + 2, IC10B + 1, IC10B + 0}
+

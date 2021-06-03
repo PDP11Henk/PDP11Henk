@@ -1,0 +1,328 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-output
+--
+--    this module contains the actual output to the LEDs.
+--
+--    The data that must be sent (over SPI) to the MCP23S17 ICs is stored in the
+--    actionList an array. Calling startActualOutput() triggers a state machine
+--    that will do the actual output actions specified in the actionList array.
+--    When the cycle is complete the flag "outputCycleActive" is cleared.
+--    *** NOTE:
+--    SPI hardware control sometimes seems to send "spurious" data. Therefore,
+--    SPI is software controlled. Data and successive data are sent over the SPI
+--    hardware lines, but control is managed in a state machine which is called
+--    from main(). The state machine is implemented in processSPIloading().
+
+
+var   BYTE shadowMap[20]
+var   BYTE modifyMap[20*2]          -- 2 bytes/entry array for outport/bit
+const BYTE UPD_FLAG          = 0    -- bit 7 : entry valid, bit 0 : on/off flag
+const BYTE UPD_MASK          = 1    -- bit mask indicating affected output bit
+var   BYTE outputCycleActive        -- indicates that an output cycle is active
+var   BYTE actionList[16]           -- 8 2-byte entries: outputPort & outputData
+
+var   byte processListIx               -- index in actionList array
+var   byte loadState                   -- state machine state
+const byte SPI_LOAD_IDLE     = 0
+const byte PROCESS_LIST      = 1
+const byte CYCLE_COMPLETE    = 2
+
+-- MCP23S17 CS* state
+const byte ASSERT            = 0       -- MCP23S17 CS* pin asserted level
+const byte NEGATE            = 1       -- MCP23S17 CS* pin negated level
+
+const byte IC_BANK_1         = 0       -- CS* for IC # 1-2-3-4-5
+const byte IC_BANK_2         = 1       -- CS* for IC # 6-7-8-9-10
+const byte PORT_A            = 0x0A    -- MCP23S17 I/O port A register address
+const byte PORT_B            = 0x1A    -- MCP23S17 I/O port B register address
+
+
+
+procedure initSPIcontrol() is
+    SPI_DATA          = 0
+    SPI_CLOCK         = 1             -- using MODE 1,1
+    CS1               = 1             -- ChipSelect outputs 000-071
+    CS2               = 1             -- ChipSelect outputs 072-142
+    RESET             = 0
+    delay_1ms(1)                      -- MCP27S13 reset pulse (all ICs)
+    RESET             = 1
+    outputCycleActive = FALSE         -- no SPI transmission in progress
+    processListIx     = 0
+    loadState         = SPI_LOAD_IDLE
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- startActualOutput
+--
+-- Initiate the transfer of the new lamps settings to the MCP23S17 ICs.
+--   --> start the state machine.
+-- The bytes are sent via processSPIloading() called from the main() loop.
+--
+-- Input  : actionList - list of output port & lightByte to be updated.
+--                       Each entry in actionList consists of 2 bytes.
+--                       1st: if entry valid: MCP23S17 IC number and port ID.
+--                            if entry not used: 0xFF (and implies end of list).
+--                       2nd: if entry valid: data byte for specified IC/port.
+-- Output : state machine activated
+-- -----------------------------------------------------------------------------
+procedure startActualOutput() is
+    processListIx = 0
+    loadState     = PROCESS_LIST
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- controlChipCS
+--
+-- Assert or negate the correct MCP23S17C group Chip Select (CS) pin
+-- -----------------------------------------------------------------------------
+procedure controlChipCS(BYTE in ICbank, BYTE in CSstate) is
+  case (ICbank) of
+      IC_BANK_1 : block   CS1 = CSstate   end block
+      IC_BANK_2 : block   CS2 = CSstate   end block
+
+      otherwise block
+          -- ignore everything else  -- reject
+      end block
+  end case
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- sendSPIdata
+--
+-- This routine actually sends a data byte to the MCP23S17 using "bit-banging".
+-- It is a generic routine, starting with asserting the appropriate CS of the
+-- IC identified by the ICnumber. The data bits are subsequently loaded and
+-- clocked into the IC. The CS of the IC is negated after the last bit.
+--
+-- Input -
+-- -----------------------------------------------------------------------------
+procedure sendSPIdata(BYTE in SPIaddr, BYTE in regAddr,
+                      BYTE in regData, BYTE in ICbank)  is
+  var byte bitmask
+
+    controlChipCS(ICbank, ASSERT)        -- assert appropriate CS*
+    ASM nop                              -- CS* settling time
+    ASM nop
+    ASM nop
+    ASM nop
+    bitmask = 0x80                       -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the SPI address
+        if ((SPIaddr & bitmask) == 0) then SPI_DATA = 0 else SPI_DATA = 1 end if
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 0              -- assert clock
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 1              -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+        ASM nop
+    end loop
+
+    bitmask = 0x80                       -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+         -- bit-bang the register address
+        if ((regAddr & bitmask) == 0) then SPI_DATA = 0 else SPI_DATA = 1 end if
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 0              -- assert clock
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 1              -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+        ASM nop
+    end loop
+
+    bitmask = 0x80                       -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+         -- bit-bang the register data
+        if ((regData & bitmask) == 0) then SPI_DATA = 0 else SPI_DATA = 1 end if
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 0              -- assert clock
+        ASM nop
+        ASM nop
+        ASM nop
+        SPI_CLOCK = 1              -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+        ASM nop
+    end loop
+    ASM nop
+    ASM nop
+    ASM nop
+    controlChipCS(ICbank, NEGATE)        -- negate appropriate CS*
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- initMCP23S17()
+--
+-- Initialize the MCP23S17 ICs.
+-- For each IC the following registers are initialized.
+--   1. IOCON I/O CONfiguration register
+--        BANK   = 1  registers for each port in separate bank
+--        MIRROR = 0  INT pins are not connected
+--        SEQOP  = 1  sequential operation disabled
+--        DISSLW = 1  SDA output slew rate disbled
+--        HAEN   = 1  Hardware Address enabled
+--        ODR    = 1  INT pin open-drain
+--        INTPOL = 0  INT polarity active low (overruled by ODR)
+--   2. I/O Direction for port A and port B
+--
+-- Data transmission:
+--   byte-1:
+--     +---+---+---+---+---+---+---+---+
+--     | 0 | 1 | 0 | 0 | A | B | C | W |   [ABC] = device address (0 ~ 4)
+--     +---+---+---+---+---+---+---+---+   [W]   = WRITE (0)
+--
+--   byte-2:
+--     +---+---+---+---+---+---+---+---+
+--     | * | * | * | * | * | * | * | * |   register address
+--     +---+---+---+---+---+---+---+---+
+--
+--   byte-3:
+--     +---+---+---+---+---+---+---+---+
+--     | * | * | * | * | * | * | * | * |   register data
+--     +---+---+---+---+---+---+---+---+
+--
+-- -----------------------------------------------------------------------------
+procedure initMCP23S17() is
+  var byte ICaddress, SPIaddr
+
+    ICaddress = 0
+    while (ICaddress < 5) loop
+        SPIaddr = 0x40 + (ICaddress << 1)                   -- IC # in chip bank
+        -- initialize chips
+        sendSPIdata(SPIaddr, 0x05, 0xBC, IC_BANK_1)         -- init IOCON
+        sendSPIdata(SPIaddr, 0x05, 0xBC, IC_BANK_2)
+        sendSPIdata(SPIaddr, 0x00, 0x00, IC_BANK_1)         -- init IODIR-A
+        sendSPIdata(SPIaddr, 0x00, 0x00, IC_BANK_2)
+        sendSPIdata(SPIaddr, 0x10, 0x00, IC_BANK_1)         -- init IODIR-B
+        sendSPIdata(SPIaddr, 0x10, 0x00, IC_BANK_2)
+        ICaddress = ICaddress + 1
+    end loop
+    --
+    ICaddress = 0
+    while (ICaddress < 5) loop
+        SPIaddr = 0x40 + (ICaddress << 1)                   -- IC # in chip bank
+        -- set all outputs to '0'
+        sendSPIdata(SPIaddr, PORT_A, 0x00, IC_BANK_1)       -- I/O out port A
+        sendSPIdata(SPIaddr, PORT_B, 0x00, IC_BANK_1)       -- I/O out port B
+        sendSPIdata(SPIaddr, PORT_A, 0x00, IC_BANK_2)       -- I/O out port A
+        sendSPIdata(SPIaddr, PORT_B, 0x00, IC_BANK_2)       -- I/O out port B
+        ICaddress = ICaddress + 1
+    end loop
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- outputByte
+--
+-- Send portData to the specified port of an MCP23S17 IC.
+--
+-- Input  : ICport   - IC number and output port (A or B)
+--          portData - data to be sent to specified port
+-- -----------------------------------------------------------------------------
+procedure outputByte(BYTE in ICport, BYTE in portData) is
+  var byte ICaddress, portID, ICbank
+
+    portID = PORT_A                      -- assume port A
+    if ((ICport & 0x01) == 0x01) then
+        portID = PORT_B                  -- nope, it is port B
+    end if
+    ICaddress = ICport & 0x1E            -- get address bits, mask port A/B bit
+    if (ICaddress < 10) then
+        ICbank = IC_BANK_1               -- CS* chips 1-2-3-4-5
+    else
+        ICaddress = ICaddress - 10       -- to base address 0
+        ICbank = IC_BANK_2               -- CS* chips 6-7-8-9-10
+    end if
+    ICaddress = ICaddress | 0x40         -- add "header" bits for "opcode" byte
+    -- debug output
+    serial_hw_write("O")
+    serial_hw_write("U")
+    serial_hw_write("T")
+    serial_hw_write(" ")
+    echo(ICaddress)
+    echo(portID)
+    echo(portData)
+    echo(ICbank)
+    serial_hw_write(0x0D)
+    serial_hw_write(0x0A)
+    --
+    sendSPIdata(ICaddress, portID, portData, ICbank)
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- SPI send data routine
+-- -----------------------------------------------------------------------------
+
+procedure processSPIloading() is
+  case (loadState) of
+      SPI_LOAD_IDLE : block
+              -- nothing to do, no transmission active
+          end block
+
+      PROCESS_LIST  : block
+              -- process one list entry at a time
+              if (actionList[processListIx] != 0xFF) then
+                  -- output this entry
+                  outputByte( actionList[processListIx],
+                              actionList[processListIx + 1] )
+                  -- to next entry
+                  processListIx = processListIx + 2
+                  if (processListIx > 14) then
+                      -- entire list processed
+                      loadState = CYCLE_COMPLETE
+                  else
+                      if (actionList[processListIx] == 0xFF) then
+                          -- all valid entries in list processed
+                          loadState = CYCLE_COMPLETE
+                      end if
+                  end if
+              else
+                  -- list processed, done
+                  loadState = CYCLE_COMPLETE
+              end if
+          end block
+
+      CYCLE_COMPLETE : block
+              loadState = SPI_LOAD_IDLE
+              outputCycleActive = FALSE       -- release lock
+          end block
+
+      -- ignore everything else
+      otherwise block
+              -- reject: go to safe state
+              loadState = SPI_LOAD_IDLE
+              outputCycleActive = FALSE
+          end block
+  end case
+end procedure
+

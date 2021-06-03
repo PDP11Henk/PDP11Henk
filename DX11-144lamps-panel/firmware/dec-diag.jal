@@ -1,0 +1,59 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-diag
+--
+--    this module contains the routine to blink the DIAG LED.
+--    Routine "diagLEDheartBeat" maintains the flashing of the LED
+
+var   word  flashRate                  -- selected current flash frequency
+var   byte  resetFlashCount            -- # times flash during reset @ power up
+const word  FLASH_RATE       = 900     -- blink at nice looking almost 1 Hz
+const word  RESET_FLASH_RATE = 100     -- LED flash rate during startup (reset)
+
+
+procedure initDiagLED() is
+    DIAGLED = LED_OFF
+    resetFlashCount = 0
+    flashRate = RESET_FLASH_RATE
+    -- start heartbeat blinking
+    set_delay(HEARTBEAT_SLOT, flashRate)
+end procedure
+
+
+
+function startUpDone() return BYTE is
+  var byte done
+
+    if (flashRate == RESET_FLASH_RATE) then
+        done = FALSE
+    else
+        done = TRUE
+    end if
+
+    return done
+end function
+
+
+
+-- -----------------------------------------------------------------------------
+-- diagnostic LED update (based on timer) - called from main()
+-- -----------------------------------------------------------------------------
+procedure diagLEDheartBeat() is
+    if ( check_delay(HEARTBEAT_SLOT) ) then
+        -- first check if in initial start-up delay
+        if (flashRate == RESET_FLASH_RATE) then
+             -- it is: count the flashes as a delay
+             if (resetFlashCount < 30) then
+                resetFlashCount = resetFlashCount + 1
+             else
+                -- end of power-up delay cycle
+                flashRate = FLASH_RATE
+             end if
+        end if
+
+        set_delay(HEARTBEAT_SLOT, flashRate)   -- restart timer
+        DIAGLED = !DIAGLED
+    end if
+end procedure
+

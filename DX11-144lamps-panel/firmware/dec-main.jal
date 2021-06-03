@@ -1,0 +1,223 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Author: Henk Gooijen
+--
+-- Compiler: 2.5r1
+--
+-- Description:
+--         The DEC lamp Panel is an interface to control 144 (142) LEDs or lamps
+--         of the DX11 status display. The processor controls ten MCP23S17 ICs
+--         using the SPI protocol (software implemented). A simple protocol via
+--         an RS-232 connection controls the indicators.
+--         Note that the panel with LEDs/lamps is generic. The panel cover made
+--         it a display for a specific peripheral.
+--
+-- Notes:
+--         - 08-JAN-2020: file creation.
+--         - 20-FEB-2020: changed receiver from polling to interrupt-driven.
+--
+-- -----------------------------------------------------------------------------
+
+include 18f252                          -- target PIC processor
+
+pragma target clock 40_000_000          -- OSC frequency with 10 MHz xtal
+
+
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+pragma target OSC           HS_PLL
+-- *** defines for compiler version 2.4o
+--pragma target WDT           DISABLED    -- no watchdog
+--pragma target CCP2MUX       DISABLED    -- CCP2 pin (not used)
+--
+-- *** defines for compiler version 2.5r1
+pragma target WDT           CONTROL     -- no watchdog
+pragma target CCP2MUX       pin_B3      -- CCP2 pin (not used)
+--
+pragma target VOLTAGE       V42         -- brown out voltage
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+
+--  I/O pin definitions
+
+alias  FAULTLED     is pin_A0    -- FAULT status on-board LED
+alias  NOT_USED_02  is pin_A1    --
+alias  NOT_USED_03  is pin_A2    --
+alias  NOT_USED_04  is pin_A3    --
+alias  DIAGLED      is pin_A4    -- DIAGnostic on-board LED
+alias  NOT_USED_05  is pin_A5    --
+
+alias  NOT_USED_06  is pin_B0    --
+alias  NOT_USED_07  is pin_B1    --
+alias  NOT_USED_08  is pin_B2    --
+alias  SPI_DATA     is pin_B3    -- SPI data
+alias  SPI_CLOCK    is pin_B4    -- SPI clock
+alias  RESET        is pin_B5    -- MCP27S13 reset (all ICs)
+alias  CS1          is pin_B6    -- ChipSelect outputs 000-071
+alias  CS2          is pin_B7    -- ChipSelect outputs 072-142
+
+alias  NOT_USED_09  is pin_C0    --
+alias  NOT_USED_10  is pin_C1    --
+alias  NOT_USED_11  is pin_C2    --
+alias  NOT_USED_12  is pin_C3    --
+alias  NOT_USED_13  is pin_C4    --
+alias  NOT_USED_14  is pin_C5    --
+alias  RX_RS232     is pin_C6    -- RS-232 receive
+alias  TX_RS232     is pin_C7    -- RS-232 transmit
+
+
+--  set the I/O direction
+
+pin_A0_direction = output
+pin_A1_direction = input
+pin_A2_direction = input
+pin_A3_direction = input
+pin_A4_direction = output
+pin_A5_direction = input
+
+pin_B0_direction = input
+pin_B1_direction = input
+pin_B2_direction = input
+pin_B3_direction = output
+pin_B4_direction = output
+pin_B5_direction = output
+pin_B6_direction = output
+pin_B7_direction = output
+
+pin_C0_direction = input
+pin_C1_direction = input
+pin_C2_direction = input
+pin_C3_direction = input
+pin_C4_direction = input
+pin_C5_direction = input
+pin_C6_direction = input
+pin_C7_direction = output
+
+-- RS-232 baudrate
+const serial_hw_baudrate = 19_200
+
+
+-- =============================================================================
+-- ** constants and variables: protocol receiver routines
+-- =============================================================================
+
+var byte   commandCode             -- received command
+var byte   commandData             -- received data
+
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition and diagnostic LED
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const DELAY_SLOTS          = 1     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON          = 0     -- LED connected to common +5, so:
+const byte LED_OFF         = 1     -- inverted logic: 0::on // 1::off
+
+
+include delay
+include timer0_isr_interval        -- timer0 for interval ticks
+-- include spi_master_hw           -- SPI master hardware library
+include dec-diag                   -- DIAG LED routines
+include serial_hardware            -- JAL RS-232 library
+include dec-queue                  -- command queue
+include dec-receive                -- receive commands from RS-232 port
+include dec-output                 -- SPI output bit streaming
+include dec-process                -- process command
+
+
+-- =============================================================================
+-- ############        start of DEC LED/lamp Panel interface        ############
+-- =============================================================================
+
+BSR                 = 0            -- set bank select register to default
+INTCON_GIE          = FALSE        -- disable all interrupts
+enable_digital_io()                -- all I/O pins set to digital
+INTCON              = 0            -- all interrupts disabled
+
+initRS232receiver()                -- init RS-232 receiver state machine
+initSPIcontrol()                   -- init SPI hardware & software control
+initDiagLED()                      -- init diagnostic LED
+initQueueAdministration()          -- init cyclic buffer administration
+
+-- FAULT LED off
+FAULTLED = LED_OFF
+
+-- set environment
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF        = 0        ; clear SPI interrupt flag
+-- PIE1_SSPIE        = 1        ; enable SPI interrupt
+-- INTCON2_INTEDG2   = 0        ; external INT2 interrupt on rising edge
+-- INTCON3_INT2IF    = 0        ; clear INT2 interrupt flag
+
+serial_hw_init()                ; initialize serial port, set baudrate
+serial_hw_enable()
+
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+PIE1_RCIE         = 1           ; enable receiver interrupt
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+-- set 160 outputs initial state
+initShadowMap()                 ; set all outputs to '0'
+
+-- ignore "possible garbage" at power up
+while ( startUpDone() == FALSE ) loop
+    diagLEDheartBeat()
+end loop
+--
+forever loop
+    diagLEDheartBeat()      -- update DIAG LED state
+    receiveCommand()        -- receive command from RS-232 port
+    processCommand()        -- handle command, prepare outputs mask
+    processSPIloading()     -- bit streaming MCP27S13 outputs
+end loop
+
+
+-- =============================================================================
+-- Interrupt routine for the serial communication (receive only).
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check whether the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( PIR1_RCIF ) then
+      PIE1_RCIE = 1
+      receiveMessage()
+  end if
+end procedure

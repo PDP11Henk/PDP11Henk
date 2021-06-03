@@ -1,0 +1,87 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-receive
+--
+--    this module contains the RS-232 receive routine implemented as an STD.
+--    The reception of a byte is interrupt-driven. The state machine that
+--    determines wheter it is a command byte or the associated data byte is also
+--    in the interrupt routine. When a complete message is received, the bytes
+--    are copied to variables usable outside the interrupt routine.
+
+
+-- receiver state machine
+const byte  RX_STATE_IDLE  = 0   -- awaiting 1st byte
+const byte  RX_STATE_BYTE  = 1   -- awaiting 2nd byte
+
+var   byte  irqRxState           -- state machine variable
+var   byte  irqcmd               -- IRQ routine: received 1st byte
+var   byte  irqdat               -- IRQ routine: received 2nd byte
+
+var   byte  msgReceived          -- flag: received message available
+var   byte  rxByte1              -- 1st received byte
+var   byte  rxByte2              -- 2nd received byte
+
+
+procedure initRS232receiver() is
+    irqRxState = RX_STATE_IDLE
+    msgReceived = FALSE
+end procedure
+
+
+
+function nibbleASCII(byte in dataNibble) return byte is
+  var byte token
+
+    token = dataNibble + 0x30
+    if (token > 0x39)  then  token = token + 7  end if
+    return token
+end function
+
+procedure echo(byte in databyte) is
+  var byte nibble
+
+    nibble = nibbleASCII((databyte >> 4))
+    serial_hw_write(nibble)
+    nibble = nibbleASCII((databyte & 0x0F))
+    serial_hw_write(nibble)
+    serial_hw_write(0x20)
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- receive command from RS-232 port state machine - called from main()
+-- -----------------------------------------------------------------------------
+procedure receiveCommand() is
+    if (msgReceived == TRUE) then
+        msgReceived = FALSE
+        storeCommand(rxByte1, rxByte2)   -- store new command
+        echo(rxByte1)
+        echo(rxByte2)
+        echo(0x20)
+    end if
+end procedure
+
+
+-- state machine in the interrupt routine
+procedure receiveMessage() is
+    case (irqRxState) of
+        RX_STATE_IDLE : block
+                irqCmd = RCREG
+                irqRxState = RX_STATE_BYTE
+            end block
+        RX_STATE_BYTE : block
+                irqDat = RCREG
+                -- copy
+                rxByte1 = irqCmd
+                rxByte2 = irqDat
+                msgReceived = TRUE
+                irqRxState = RX_STATE_IDLE
+            end block
+        otherwise block
+                irqRxState = RX_STATE_IDLE
+            end block
+    end case
+end procedure
+

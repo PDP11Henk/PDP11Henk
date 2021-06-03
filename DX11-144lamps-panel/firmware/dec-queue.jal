@@ -1,0 +1,80 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-queue
+--
+--    this module contains the circular buffer to store/retrieve commands.
+
+
+-- cyclic command buffer used to store new commands (command byte + data byte)
+const byte  MAX_NO_COMMANDS  = 40
+const byte  BUFFER_SIZE = 2*MAX_NO_COMMANDS
+
+var   byte  cmdBuffer[BUFFER_SIZE+2]
+var   byte  cmdHeadIndex
+var   byte  cmdTailIndex
+
+var   byte  cmdCommand       -- "global" current command to process
+var   byte  cmdData          -- "global" current command data to process
+
+
+procedure initQueueAdministration() is
+    cmdHeadIndex = 0
+    cmdTailIndex = 0
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- accept new command
+-- -----------------------------------------------------------------------------
+
+procedure storeCommand(BYTE in cmdNewCommand, BYTE in cmdNewData) is
+  var byte nextIndex
+
+    nextIndex = cmdHeadIndex + 2
+    if (nextIndex >= BUFFER_SIZE) then
+        -- the last 2 locations of the buffer are not used.
+        -- This makes identification of "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+    end if
+    if (nextIndex != cmdTailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        cmdBuffer[cmdHeadIndex]   = cmdNewCommand
+        cmdBuffer[cmdHeadIndex+1] = cmdNewData
+        cmdHeadIndex = nextIndex
+    end if
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new command
+--  If the function returns TRUE,
+--  the global variables cmdCommand and cmdData are valid,
+-- -----------------------------------------------------------------------------
+
+function commandAvailable() return BYTE is
+  var byte cmdAvailable
+  var byte nextIndex
+
+    if (cmdHeadIndex == cmdTailIndex) then
+        -- buffer is empty
+        cmdAvailable = FALSE
+    else
+        cmdAvailable = TRUE
+        cmdCommand = cmdBuffer[cmdTailIndex]
+        cmdData    = cmdBuffer[cmdTailIndex+1]
+        nextIndex = cmdTailIndex + 2
+        if (nextIndex >= BUFFER_SIZE) then
+            -- the last 2 locations of the buffer are not used.
+            -- This makes identification of "buffer full" / "buffer empty" easy.
+            nextIndex = 0
+        end if
+        cmdTailIndex = nextIndex
+    end if
+    return cmdAvailable
+end function
+

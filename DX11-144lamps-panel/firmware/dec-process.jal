@@ -1,0 +1,278 @@
+-- -----------------------------------------------------------------------------
+-- Title:  DEC lamp panel using the Microchip PIC18F252
+--
+-- Submodule: dec-process
+--
+--    this module contains the routine to retrieve and process a command.
+--    A command consists of a
+--    "command byte" --> number [0..19] indicating a group of 8 lamps
+--    "data byte"    --> 8 bits indicating ON/OFF for each of the 8 lamps
+--
+--    The command represents the numbering (in group of 8 lamps) as seen on the
+--    indicator panel. Thus, top row, left 8 indicator lamps have "address" 0
+--    and from left to right the indicator lamp state is represented by bit-7,
+--    bit-6 .. bit-0 in the data byte.
+--    However, hardware-wise the connections are different due to trace routing
+--    complexity on the interface board. This is hidden to the user by using
+--    mapping look-up tables.
+
+include  dec-maptables              -- lookup tables
+
+-- A given user command/data set will result in 8 output bits, and these output
+-- bits may (worst case) all be on different IC# and outports. Further, it must
+-- be remembered whether the specific bit must be turned on or turned off.
+-- A "0" in the user data means indicator off, a "1" in the user data means
+-- indicator on.
+-- As one user data set may affect several different outports (possibly on more
+-- than one physical IC), the outputs that must be changed (bits set or reset)
+-- must be remembered. The array modifyMap holds the 8 bits that (possibly) must
+-- be updated to the MCP23S17 outputs.
+-- As the actual output state cannot be read back, a "shadow output bits map"
+-- must be maintained. The shadow map is an array of 20 bytes, representing the
+-- 160 actual output bits state.
+
+
+
+-- -----------------------------------------------------------------------------
+-- initShadowMap
+--
+-- This routine initializes the shadow map and sets all outputs to "0".
+-- -----------------------------------------------------------------------------
+procedure initShadowMap() is
+  var byte ix
+
+    ix = 0
+    while (ix < 20) loop
+        shadowMap[ix] = 0           -- set all actual outputs to "OFF"
+        ix = ix + 1
+    end loop
+    outputCycleActive = TRUE        -- output update cycle active (excl. access)
+    initMCP23S17()                  -- set all actual outputs (hardware-wise)
+    outputCycleActive = FALSE       -- no output update cycle active
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- convertLogicalToPhysical
+--
+-- This routine converts the "user-friendly" logical "indicator position" to the
+-- physical (in hardware) indicator position. The logical position is the "8"
+-- indicators per group, starting at the top left corner of the display panel.
+-- The hardware position is the physical connection of an indicator to a
+-- specific IC, output port and bit position in the output port. The hardware
+-- position is stored in the "modifyMap" array. The entry is marked "used", and
+-- the indicator state (ON or OFF) is also stored in the array.
+--
+-- Input  : lookUpTable - correct look-up table (based on command byte)
+--          command     - 8-bit output port number (0 ~ 19)
+--          lightBits   - state of the 8 lamps     (0::OFF , 1::ON)
+--          modifyMap   - map with current actual state (on/off) of each lamp
+-- Output : modifyMap   - state for each lamp updated [UPD_MASK] (on OR off)
+--                        UPD flags set [UPD_FLAG] (bit7 set::CHANGED)
+-- -----------------------------------------------------------------------------
+procedure convertLogicalToPhysical(BYTE IN lookUpTable[],
+                                   BYTE IN command,
+                                   BYTE IN lightBits) is
+  var BYTE bitMask, bitIndex, currentByteState, currentBitState, currentBitMask
+  var BYTE physLocation, physPort, physBitPos
+
+    bitMask = 0x80
+    bitIndex = 0
+    while (bitMask != 0x00) loop
+        physLocation = lookUpTable[bitIndex]      -- logical -> physical bit pos
+        physPort = physLocation >> 3
+        physBitPos = physLocation & 0x07
+        currentByteState = modifyMap[physPort]
+        case (physBitPos) of
+          0 : block  currentBitMask = 0x01  end block
+          1 : block  currentBitMask = 0x02  end block
+          2 : block  currentBitMask = 0x04  end block
+          3 : block  currentBitMask = 0x08  end block
+          4 : block  currentBitMask = 0x10  end block
+          5 : block  currentBitMask = 0x20  end block
+          6 : block  currentBitMask = 0x40  end block
+          7 : block  currentBitMask = 0x80  end block
+        end case
+        currentBitState = currentByteState & currentBitMask
+        if ( (lightBits & bitMask) == bitMask) then
+            -- requested new lamp state is ON; check with current actual state
+            if (currentBitState == 0) then
+                -- turn lamp ON
+                currentByteState = currentByteState | currentBitMask
+                modifyMap[physPort + UPD_MASK] = currentByteState
+                modifyMap[physPort + UPD_FLAG] = 0x80
+            end if
+        else
+            -- requested new lamp state is OFF; check with current actual state
+            if (currentBitState != 0) then
+                -- turn lamp OFF
+                currentByteState = currentByteState & (!currentBitMask)
+                modifyMap[physPort + UPD_MASK] = currentByteState
+                modifyMap[physPort + UPD_FLAG] = 0x80
+            end if
+        end if
+        bitIndex = bitIndex + 1
+        bitMask = bitMask >> 1
+    end loop
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- startOutputCycle
+--
+-- This routine does the following actions
+--   1. shadowMap update: copy modifyMap CHANGED-marked entries to the shadowMap
+--   2. build output action list from modifyMap CHANGED-marked entries
+--   3. start actual lamp state output cycle
+--
+-- Input  : modifyMap  - state for each lamp updated [UPD_MASK] (on OR off)
+--                       UPD flags set [UPD_FLAG] (bit7 set::CHANGED)
+-- Output : actionList - list of output port & lightByte to be updated
+-- -----------------------------------------------------------------------------
+procedure startOutputCycle() is
+;  var BYTE actionIx, modifyIx, shadowIx, indicatorState
+;
+;    actionIx = 0
+;    while (actionIx < 16) loop
+;        actionList[actionIx] = 0xFF -- erase action list: set each entry "clear"
+;        actionIx = actionIx + 2
+;    end loop
+;
+;    modifyIx = 0
+;    shadowIx = 0
+;    actionIx = 0
+;    while (modifyIx < 40) loop
+;        -- get all "CHANGED" entries in modifyMap
+;        if (modifyMap[modifyIx + UPD_FLAG] != 0) then
+;            -- "CHANGED" flagged entry --> update shadowMap, add to actionList
+;            indicatorState = modifyMap[modifyIx + UPD_MASK]
+;            shadowMap[shadowIx] = indicatorState
+;            actionList[actionIx] = shadowIx
+;            actionList[actionIx + 1] = indicatorState
+;            actionIx = actionIx + 2
+;        end if
+;        modifyIx = modifyIx + 2
+;        shadowIx = shadowIx + 1
+;    end loop
+    startActualOutput()  -- trigger SPI output state machine
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- map
+--
+-- This routine converts the user-friendly "light numbering" scheme to the
+-- hardware physical actual output device and port bit using look-up tables.
+--  input  : "command" byte (guaranteed valid value) and 8-bit data byte
+--  output : updated "modifyMap" array
+--
+-- NOTE:
+--    One command (+ 8 data bits) MAY result in affecting several MCP27S13 chips
+--    and bits !!
+-- The 8 indicator bits (ON or OFF) are stored in the "modifyMap" array.
+-- -----------------------------------------------------------------------------
+procedure map(BYTE in command, BYTE in lightBits) is
+;  var BYTE shadowIx, modifyIx
+;
+;  -- first initialize the "modifyMap"
+;  --   1. copy current shadow map (actual output state of each lamp)
+;  --   2. set all entries to "NOT_CHANGED"
+;  shadowIx = 0
+;  modifyIx = 0
+;  while (shadowIx < 20) loop
+;      modifyMap[modifyIx + UPD_MASK] = shadowMap[shadowIx]  -- copy state
+;      modifyMap[modifyIx + UPD_FLAG] = 0                    -- entry NOT_CHANGED
+;      shadowIx = shadowIx + 1
+;      modifyIx = modifyIx + 2
+;  end loop
+;
+;  case (command) of
+;    0 : block convertLogicalToPhysical(TABLE00, command, lightBits)  end block
+;    1 : block convertLogicalToPhysical(TABLE01, command, lightBits)  end block
+;    2 : block convertLogicalToPhysical(TABLE02, command, lightBits)  end block
+;    3 : block convertLogicalToPhysical(TABLE03, command, lightBits)  end block
+;    4 : block convertLogicalToPhysical(TABLE04, command, lightBits)  end block
+;    5 : block convertLogicalToPhysical(TABLE05, command, lightBits)  end block
+;    6 : block convertLogicalToPhysical(TABLE06, command, lightBits)  end block
+;    7 : block convertLogicalToPhysical(TABLE07, command, lightBits)  end block
+;    8 : block convertLogicalToPhysical(TABLE08, command, lightBits)  end block
+;    9 : block convertLogicalToPhysical(TABLE09, command, lightBits)  end block
+;   10 : block convertLogicalToPhysical(TABLE10, command, lightBits)  end block
+;   11 : block convertLogicalToPhysical(TABLE11, command, lightBits)  end block
+;   12 : block convertLogicalToPhysical(TABLE12, command, lightBits)  end block
+;   13 : block convertLogicalToPhysical(TABLE13, command, lightBits)  end block
+;   14 : block convertLogicalToPhysical(TABLE14, command, lightBits)  end block
+;   15 : block convertLogicalToPhysical(TABLE15, command, lightBits)  end block
+;   16 : block convertLogicalToPhysical(TABLE16, command, lightBits)  end block
+;   17 : block convertLogicalToPhysical(TABLE17, command, lightBits)  end block
+;   18 : block convertLogicalToPhysical(TABLE18, command, lightBits)  end block
+;   19 : block convertLogicalToPhysical(TABLE19, command, lightBits)  end block
+; end case
+; ==============================================================================
+; Simple: command is the port, lightBits are the 8 bits in the same byte.
+; Send this directly to the (correct) IC on the circuit board.
+    actionList[0] = command
+    actionList[1] = lightBits
+    actionList[2] = 0xFF         -- end of list
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- validate command
+--
+-- This routine implements the "communication protocol" message format.
+-- Function return:
+--    If the command is valid -> TRUE
+--    If the command is wrong -> FALSE
+-- The command byte range is 00 .. 19.
+-- The lightBits range is 00 .. 255.
+-- -----------------------------------------------------------------------------
+function validCommand(BYTE in command, BYTE in lightBits) return BYTE is
+  var byte valid
+
+    valid = TRUE    -- assume it will be OK
+    if (command > 19) then
+        valid = FALSE
+    end if
+
+    return valid
+end function
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand
+--
+-- This routine implements 3 tasks.
+--  1. the "communication protocol" message format.
+--  2. conversion from command data to correct MCP27S13 chip and port/bit mask.
+--  3. initiation of the SPI communication to set the port output.
+--
+--  Input: global variables cmdCommand and cmdData
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+    if (outputCycleActive == FALSE) then
+        -- no output action in progress: OK to process a new command
+        if (commandAvailable() == TRUE) then
+            -- cmdCommand and cmdData contain a message retrieved from the queue
+            if (validCommand(cmdCommand, cmdData) == TRUE) then
+                FAULTLED = LED_OFF
+                outputCycleActive = TRUE   -- cleared in processSPIloading()
+                map(cmdCommand, cmdData)   -- generate "modify" map
+                startOutputCycle()         -- update "shadow" map, start update
+            else
+                FAULTLED = LED_ON
+            end if
+        end if
+    end if
+end procedure
+
