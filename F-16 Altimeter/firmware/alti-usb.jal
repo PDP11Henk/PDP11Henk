@@ -1,0 +1,171 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Altimeter control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: alti-usb
+--
+--    this module contains the (polling) USB data byte reception and the state
+--    machine to process a complete USB "message".
+--    Output: - USBcmdReceived : flag to indicate valid data packet received
+--            - USBrxByte1     : first data byte
+--            - USBrxByte2     : second data byte
+
+include usb_serial
+
+-- -----------------------------------------------------------------------------
+-- USBmsgStateControl - determine action based on received USB data byte
+-- -----------------------------------------------------------------------------
+-- State machine states:
+--   IDLE : awaiting command code: the received byte is the first data byte
+--   DATA : awaiting command data: the received byte is the second data byte
+-- -----------------------------------------------------------------------------
+
+-- "!" : USB receive data state machine in illegal state (should never occur)
+-- "#" : invalid command number
+-- "x" : "disable watchdog" command received
+-- "-" : following 2 characters are hexadecimal command (first byte)
+-- "=" : following 2 characters are hexadecimal data (second byte)
+
+const BYTE ASCII_CR = 0x0D
+const BYTE ASCII_LF = 0x0A
+const BYTE nibble2hex[] = "0123456789ABCDEF"
+
+
+-- ##############  DEVELOPMENT DEBUGGING USB OUTPUT ROUTINES  ##################
+
+-- Debug routines can always be called, but will only operate if USB is active.
+
+-- sendDebugChar(byte in token)      : print one ASCII character
+-- sendDebugString(byte in string[]) : print ASCII string, ! terminated
+-- sendDebugByte(byte in dataByte)   : print byte as 2 hexadecimals
+-- sendDebugWord(word in dataWord)   : print word as 4 hexadecimals
+
+
+;procedure sendDebugChar(byte in token) is
+;    if (commPort == USE_USB) then
+;        usb_serial_data = token        -- print ASCII character
+;    end if
+;end procedure
+
+
+;procedure sendDebugString(byte in string[]) is
+;    var byte index
+
+    -- print string terminated by "!" character
+;    index = 0
+;    while (string[index] != "!") loop
+;        sendDebugChar(string[index])
+;        index = index + 1
+;    end loop
+;end procedure
+
+
+;procedure sendDebugByte(byte in dataByte) is
+;    if (commPort == USE_USB) then
+;        usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+;        usb_serial_data = nibble2hex[0x0F & (dataByte)]
+;    end if
+;end procedure
+
+
+;procedure sendDebugWord(word in dataWord) is
+;    var byte splitByte
+
+;    splitByte = byte(dataWord >> 8)
+;    sendDebugByte(splitByte)
+;    splitByte = byte(dataWord & 0x00FF)
+;    sendDebugByte(splitByte)
+;end procedure
+
+
+-- #############################################################################
+
+
+procedure sendUSBChar(byte in token) is
+    if (USBdebugEnabled == TRUE) then
+        -- print ASCII character
+        usb_serial_data = token
+    end if
+end procedure
+
+
+
+procedure sendUSBByte(byte in dataByte) is
+    if (USBdebugEnabled == TRUE) then
+        usb_serial_data = nibble2hex[0x0F & (dataByte>>4)]
+        usb_serial_data = nibble2hex[0x0F & (dataByte)]
+    end if
+end procedure
+
+
+
+procedure USBmsgStateControl(byte in rxbyte) is
+  if (wtchdogState == WTCHDOG_ENABLED) then
+     set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)     -- protocol watchdog
+  end if
+  case (USB_RXstate) of
+     USB_STATE_IDLE :
+        block
+           if (rxbyte <= CMD_USB_DEBUG) then
+              USBrxByte1 = rxbyte
+              if (USBrxByte1 == CMD_WTCHDOG_DIS) then
+                 -- special case: NO data byte will follow!
+                 wtchdogState = WTCHDOG_DISABLED
+                 sendUSBChar("x")
+              else
+                 USB_RXstate = USB_STATE_DATA
+                 sendUSBChar("-")
+                 sendUSBByte(USBrxByte1)
+              end if
+           else
+              sendUSBChar("#")
+              sendUSBByte(USBrxByte1)
+           end if
+        end block
+
+     USB_STATE_DATA :
+        block
+           -- store data & accept command
+           USBrxByte2     = rxbyte
+           USBcmdReceived = TRUE
+           USB_RXstate    = USB_STATE_IDLE
+           sendUSBChar("=")
+           sendUSBByte(USBrxByte2)
+        end block
+
+    USB_STATE_RESET :
+          block
+             -- this state could be reached if the watchdog is expired and an
+             -- interrupt is received while the watchdog resets variables.
+          end block
+
+    otherwise
+        block
+           USB_RXstate = USB_STATE_IDLE   -- ?? --> reset
+           sendUSBChar("!")
+        end block
+  end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- handleUSBcommunication - await (non-blocking) for character received
+--                          then process it in state machine
+-- -----------------------------------------------------------------------------
+-- The USB interrupt service routine is polled and checked if a character is
+-- received. When a character is received the LED is toggled. As the received
+-- character can be a command character or a data character belonging to a
+-- command, a state machine decides what to do.
+-- -----------------------------------------------------------------------------
+procedure handleUSBcommunication is
+
+var byte msgByte
+
+  msgByte = 0
+  usb_serial_flush()                 ; poll USB ISR function, serve USB requests
+  if (usb_serial_read(msgByte)) then       ; check received data & process it
+    USBmsgStateControl(msgByte)            ; let state machine decide what to do
+  end if
+end procedure
+

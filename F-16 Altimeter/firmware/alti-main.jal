@@ -1,0 +1,668 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Altimeter control module (based on SDI hardware)
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Author: Henk Gooijen, Copyright (c) 2016, all rights reserved
+--
+-- Compiler: 2.4q5
+--
+-- Released under the GPL license
+--         (http://www.opensource.org/licenses/bsd-license.php)
+--
+-- Description:
+--         Altimeter control module is the firmware to control the synchro coil
+--         in the altimeter.
+--         Setpoint data: ~2.5 feet/inc (fine), or
+--                        ~40 feet/inc (coarse).
+--         All digital outputs can be used freely. Outputs may be assigned
+--         (but optional) for a specific altimeter purpose. For example
+--         1 - selection which internal lighting to use: red or white.
+--         2 - on/off for the internal vibrator (only operating in STBY mode).
+--         3 - remote reset.
+--         The 3 analog voltages to control the amplitude of the stator signals
+--         are realized using DACs with SPI connection (instead of a software-
+--         generated PWM signal with a Op-Amp based low-pass filter on the PCB.
+--         (PWM is 8-bit resolution, DAC [MCP4821] is 10-bit resolution).
+--
+-- Notes:
+--         - File creation date/time: 25 August 2016.
+--         - Watchdog feature is default DISABLED (as per "lightning" request).
+--           To avoid DOA "hung ups" at power-up (receiving "garbage" that will
+--           cause the DOA reception routine to be in a wrong state), a delay is
+--           added at power-up (only for DOA). The DIAG LED flashes at high rate
+--           during the delay. After the delay the DOA variables are reset.
+--           USBdebugEnabled changed to default "disabled".
+--         - 15-10-2016. Software update to reflect the V2.0 circuit board.
+--           Polarity signals swapped. DOA interrupt disabled if USB connection
+--           is selected. Added TEST mode. Added debug print routines (via USB).
+--         - 27-10-2016. Changed the 90 degree sine lookup table (10-bit) to 180
+--           degree sine lookup table (11-bit). Added code to make sure that the
+--           polarity change always occurs at zero-crossing of the sine.
+--         - 06-01-2017. Added feature to set the altimeter to any preset, so
+--           that at 1313 mb (29.29" Hg) the indicated altitude at setpoint 0 is
+--           the required pit altitude. Two pins are defined as input; one is
+--           for UP/DOWN control, the other for update stepping (STEPRATE_1,
+--           STEPRATE_2, STEPRATE_3 using automatic rate control).
+--         - 20-01-2017. After many testing and measurements using the logic
+--           analyzer, I stopped using the SPI functionality of the PIC. The
+--           software now uses "bit-banging" to transmit the data to the DACs.
+--         - 17-09-2017. Took measurements of the altitude setting sent to the
+--           altimeter and the actual reading. I knew there was a delta, but now
+--           that I entered the setpoint and actual read value in an excel sheet
+--           and made a plot, you can see that the delta is sort of a sine wave
+--           of 6 periods over one full electric period of the altimeter (2*PI
+--           which corresponds to 10.000 feet). Implemented a "correction table"
+--           to look up the delta and apply that as a correction to the setpoint
+--           to get a correct actual indication. Also added a command to enable/
+--           disable the lookup correction functionality.
+--         - 24-09-2017. The correction table in the firmware was not a success.
+--           For more flexibility in testing, I implemented the sine correction
+--           in the Python demonstration program. Works a lot better, and I was
+--           able to make a new measurement pot in Excel. The error indication
+--           is a lot better, bu the deviation between given setpoint and the
+--           actual indicated altitude is still not good enough, IMO. In the end
+--           I decided to do no corrections at all, but create a table with 50
+--           feet entries, that is a table with 2000 entries! For each 50 feet
+--           given setpoint the table reurns the "setpoint data" required to see
+--           the correct 50 feet on the altimeter. For any altitude between 0 ft
+--           and 50 ft is linearly interpolated. Looks a lot better :)
+--           Correction table,lookup and its enable/disable command removed.
+--         - 06-10-2017.
+--           Circuit board Version 3 has Sallen-Key filters in the DAC output to
+--           gain voltage control to the VCAs. This dampens the indication a lot
+--           and "jitter" is gone! The filter capacitors are 1 µF which may be a
+--           bit too high as the setpoint position is a bit sluggish or my even
+--           not be reached.
+--           The 6 "jumps" are STILL there, but they are smaller.
+--         - 11-12-2017.
+--           I checked the code for the altimeter setting ... and found a bug!
+--           To speed up the steprate I used a shift left (*2), but I entered
+--           "<" which makes it a bit comparison! The compiler did not complain,
+--           but the "<" should of course have been a "<<".
+-- -----------------------------------------------------------------------------
+const byte MAJOR_VERSION = 3            -- hardware PCB version 3
+const byte MINOR_VERSION = 1            -- software version 1
+
+include 18f2550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- *** defines for compiler version 2.4n
+-- pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+-- pragma target WDT           DISABLED    -- no watchdog
+-- pragma target XINST         ENABLED     -- extended instruction set
+--
+-- *** defines for compiler version 2.4q5
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+pragma target XINST         DISABLED    -- ext'ed instruction set (not JAL V2)
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+
+alias  DIGOUT1     is pin_A0        -- DIG output #1
+alias  USB_DOA     is pin_A1        -- USB/DOA selection jumper
+alias  DIGOUT2     is pin_A2        -- DIG output #2
+alias  DIGOUT3     is pin_A3        -- DIG output #3
+alias  DIAGLED     is pin_A4        -- diagnostic on-board LED
+alias  DOA_DATA    is pin_A5        -- PHCC DOA bus data signal
+
+alias  SPI_SDI     is pin_B0        -- SPI: SDI (not used)
+alias  SPI_SCK     is pin_B1        -- SPI: SCK
+alias  DOA_CLOCK   is pin_B2        -- PHCC DOA bus clock signal
+alias  CS_DAC_S3   is pin_B3        -- CS* DAC S3 amplitude output
+alias  CS_DAC_S12  is pin_B4        -- CS* DAC S1-S2 amplitude output
+alias  S1POLARITY  is pin_B5        -- stator S1 polarity output
+alias  S2POLARITY  is pin_B6        -- stator S2 polarity output
+alias  S3POLARITY  is pin_B7        -- stator S3 polarity output
+
+alias  BUTTON_UP   is pin_C0        -- initial position ADJUST DIRECTION button
+alias  BUTTON_ADJ  is pin_C1        -- initial position ADJUST STEP button
+alias  VsenseIN    is pin_C2        -- USB host voltage sense
+--     USBvoltRef  is pin_C3        -- USB voltage reference
+--     USBdataN    is pin_C4        -- USB data -
+--     USBdataP    is pin_C5        -- USB data +
+alias  LOADDACS    is pin_C6        -- LDAC* S1-S2-S3
+alias  SPI_SDO     is pin_C7        -- SPI: SDO
+
+--  I/O direction
+
+pin_A0_direction    = output
+pin_A1_direction    = input
+pin_A2_direction    = output
+pin_A3_direction    = output
+pin_A4_direction    = output
+pin_A5_direction    = input
+
+pin_B0_direction    = input
+pin_B1_direction    = output
+pin_B2_direction    = input
+pin_B3_direction    = output
+pin_B4_direction    = output
+pin_B5_direction    = output
+pin_B6_direction    = output
+pin_B7_direction    = output
+
+pin_C0_direction    = input
+pin_C1_direction    = input
+pin_C2_direction    = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction    = output
+pin_C7_direction    = output
+
+
+-- =============================================================================
+-- ** constants and variables: DOA and USB protocol receiver routines
+-- =============================================================================
+
+const byte ALTI_ADDR             = 0x41    -- Altimeter CONTROL PHCC ADDRESS
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var byte   DOA_address             -- DOA IRQ routine device address
+var byte   DOA_subaddr             -- DOA IRQ device sub address
+var byte   DOA_databyte            -- DOA IRQ data
+var byte   bitcounter              -- DOA IRQ count for received bits
+var byte   DOA_RXstate             -- DOA IRQ protocol RX byte state
+const byte DOA_STATE_ADDRESS  = 0  -- DOA receiver state machine state
+const byte DOA_STATE_SUBADRS  = 1
+const byte DOA_STATE_DATA     = 2
+
+var byte   DOAcmdReceived          -- flag: DOA valid command received
+var byte   deviceaddress           -- DOA received device address
+var byte   subaddress              -- DOA received sub-address
+var byte   databyte                -- DOA received data byte
+
+var byte   USB_RXstate             -- USB protocol RX byte state
+const byte USB_STATE_IDLE     = 0  -- USB receiver state machine state
+const byte USB_STATE_DATA     = 1
+const byte USB_STATE_RESET    = 2
+var byte   USBrxByte1              -- USB first received byte
+var byte   USBrxByte2              -- USB second received byte
+var byte   USBcmdReceived          -- flag: USB valid command received
+var byte   USBdebugEnabled         -- flag: output USB debug info
+
+var byte   commandCode             -- received command code (DOA / USB) sub
+var byte   commandData             -- received command data (DOA / USB) sub
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition, diagnostic LED and watchdog
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const COMM_WATCHDOG_SLOT   = 1     -- DOA & USB communication watchdog timer
+const TEST_STEP_DELAY      = 2     -- TEST mode update (step) delay
+const BUT_UP_TIMER_SLOT    = 3     -- adjust button "UP/DOWN" debounce timer
+const BUT_ADJ_TIMER_SLOT   = 4     -- adjust button "ADJUST" debounce timer
+const ADJUST_RATE_SLOT     = 5     -- adjustment altimeter setting step delay
+const DELAY_SLOTS          = 6     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON  = 0             -- LED connected to common +5, so:
+const byte LED_OFF = 1             -- inverted logic: 0::on // 1::off
+
+var byte   diagLEDstate            -- current state (LED_ON|LED_OFF)
+var word   flashRate               -- selected current flash frequency
+var byte   diagLEDuse              -- current usage mode for the DIAG LED
+var byte   heartbeatState          -- heartbeat mode LED state (LED_ON|LED_OFF)
+var byte   resetFlashCount         -- # times flash during DOA reset @ power up
+
+const byte DIAGLED_OFF       = 0   -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1   -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2   -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3   -- DIAG LED ON/OFF per received message
+
+const word DOA_FLASH_RATE    = 1000   -- DOA selected: blink at approx 0.5 Hz
+const word DOA_RESET_RATE    = 40     -- DOA selected: initial 1 sec reset time
+const word USB_FLASH_RATE    = 500    -- USB selected: blink at approx 1 Hz
+const word STARTUP_FLASHRATE = 200    -- LED flash rate during (USB) startup
+
+const word TEST_STEP_RATE    = 200    -- TEST mode step delay
+
+-- DOA communication watchdog
+--     Bit time is set by Motherboard and is 500 us. As the timer granularity
+--     of SDI is 1 ms, it means that 2 bits, thus 2 clock pulses, occur the
+--     watchdog resolution is 2 bits of the DOA data bitstream.
+--     Initially the timer is started. Every time a DOA clock pulse is detected
+--     the timer is restarted. If the timer expires (time out) there has been
+--     a time out time period of inactivity on the DOA bus. This inactivity is
+--     used as a synchronization: the DOA data reception state machine is reset.
+
+const byte WTCHDOG_DISABLED     = FALSE
+const byte WTCHDOG_ENABLED      = TRUE
+const      WTCHDOG_DFLT_TIMEOUT = 20      -- default watchdog timeout
+var word   wtchdogDelayValue              -- set watchdog timeout value
+var byte   wtchdogState                   -- watchdog state: enabled/disabled
+
+-- variables for USB connection monitoring
+
+var byte   chkUSBconnect           -- USB uses a startup (connection made)
+var word   prevISRcounter          -- fast period connection check timer
+
+
+-- =============================================================================
+-- ** Altimeter commands
+--    (for DOA this is the sub-address, for USB this is the first message byte)
+-- =============================================================================
+   -- Quadrant 1 :: 0 .. 1023
+const byte CMD_SALTQ1A     = 0     -- set synchro indicator in Q1 (000..255)
+const byte CMD_SALTQ1B     = 1     -- set synchro indicator in Q2 (256..511)
+const byte CMD_SALTQ1C     = 2     -- set synchro indicator in Q3 (512..767)
+const byte CMD_SALTQ1D     = 3     -- set synchro indicator in Q4 (768..1023)
+   -- Quadrant 2 :: 1024 .. 2047
+const byte CMD_SALTQ2A     = 4     -- set synchro indicator in Q1 (1024..1279)
+const byte CMD_SALTQ2B     = 5     -- set synchro indicator in Q2 (1280..1535)
+const byte CMD_SALTQ2C     = 6     -- set synchro indicator in Q3 (1536..1791)
+const byte CMD_SALTQ2D     = 7     -- set synchro indicator in Q4 (1792..2047)
+   -- Quadrant 3 :: 2048 .. 3071
+const byte CMD_SALTQ3A     = 8     -- set synchro indicator in Q1 (2048..2303)
+const byte CMD_SALTQ3B     = 9     -- set synchro indicator in Q2 (2304..2559)
+const byte CMD_SALTQ3C     = 10    -- set synchro indicator in Q3 (2560..2815)
+const byte CMD_SALTQ3D     = 11    -- set synchro indicator in Q4 (2816..3071)
+   -- Quadrant 4 :: 3072 .. 4095
+const byte CMD_SALTQ4A     = 12    -- set synchro indicator in Q1 (3072..3327)
+const byte CMD_SALTQ4B     = 13    -- set synchro indicator in Q2 (3328..3583)
+const byte CMD_SALTQ4C     = 14    -- set synchro indicator in Q3 (3584..3839)
+const byte CMD_SALTQ4D     = 15    -- set synchro indicator in Q4 (3840..4095)
+
+const byte CMD_S1AMPL      = 16    -- set S1 amplitude coarse
+const byte CMD_S2AMPL      = 17    -- set S2 amplitude coarse
+const byte CMD_S3AMPL      = 18    -- set S3 amplitude coarse
+const byte CMD_SxPOL       = 19    -- set S1, S2, S3 polarity + LOAD COARSE
+
+const byte CMD_WTCHDOG_DIS = 20    -- disabled watchdog
+const byte CMD_WTCHDOG_ENA = 21    -- enable watchdog
+
+const byte CMD_USROUT1     = 22    -- set DIGOUT1 output
+const byte CMD_USROUT2     = 23    -- set DIGOUT2 output
+const byte CMD_USROUT3     = 24    -- set DIGOUT3 output
+
+const byte CMD_DIAGMODE    = 25    -- set diagnostic LED operating mode
+
+const byte CMD_S1BASE_L    = 26    -- S1 offset angle for "zero position" lsb
+const byte CMD_S1BASE_H    = 27    -- S1 offset angle (12-bit)
+const byte CMD_S2BASE_L    = 28    -- S2 offset angle for "zero position" lsb
+const byte CMD_S2BASE_H    = 29    -- S2 offset angle (12-bit)
+const byte CMD_S3BASE_L    = 30    -- S3 offset angle for "zero position" lsb
+const byte CMD_S3BASE_H    = 31    -- S3 offset angle (12-bit)
+
+const byte CMD_TESTSTART   = 32    -- rotate from 0 up to 4096 and back
+const byte CMD_TESTSTOP    = 33    -- back to 0 and stop
+const byte CMD_TESTRATE    = 34    -- test step update rate
+
+const byte CMD_S1MAN_L     = 35    -- S1 manual angle control lsb
+const byte CMD_S1MAN_H     = 36    -- S1 manual angle (12-bit)
+const byte CMD_S2MAN_L     = 37    -- S2 manual angle control lsb
+const byte CMD_S2MAN_H     = 38    -- S2 manual angle (12-bit)
+const byte CMD_S3MAN_L     = 39    -- S3 manual angle control lsb
+const byte CMD_S3MAN_H     = 40    -- S3 manual angle (12-bit)
+const byte CMD_LD_MAN      = 41    -- set S1,2,3 polarity and LOAD manual S1,2,3
+
+const byte CMD_LASTVAL     = 41    -- last valid command for DOA
+-- USB only commands
+const byte CMD_IDENTIFY    = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG   = (CMD_LASTVAL+2)   -- USB only: enable debug output
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+
+const byte USE_USB         = 0              ; jumper installed
+const byte USE_DOA         = 1              ; no jumper installed
+var byte   commPort                         ; selected port at startup
+
+-- synchro variables
+
+var byte   polarityS1
+var byte   polarityS2
+var byte   polarityS3
+var word   amplitudeS1
+var word   amplitudeS2
+var word   amplitudeS3
+var word   prevS1Angle
+var word   prevS2Angle
+var word   prevS3Angle
+var byte   prevS1Pol
+var byte   prevS2Pol
+var byte   prevS3Pol
+
+var word   offsetS1                         ; upper 4 bits OFFSET
+var word   offsetS1low                      ; lower 8 bits
+var word   offsetS2
+var word   offsetS2low
+var word   offsetS3
+var word   offsetS3low
+
+var word   manualS1                         ; upper 4 bits MANUAL LOAD
+var word   manualS1low                      ; lower 8 bits
+var word   manualS2
+var word   manualS2low
+var word   manualS3
+var word   manualS3low
+var byte   manualLoadFinished               ; flag to prevent "overrun" loading
+
+-- base angle default values                ; must be smaller than 4096
+-- With setpoint command SALT_0 data 0 and the setting knob at 1313mb (2929" Hg)
+-- the following defaults will put the altitude indication at approx 00000 feet.
+const word S1DEFAULTANGLE = 2365
+const word S2DEFAULTANGLE = 3730
+const word S3DEFAULTANGLE = 999
+
+
+var word   newSetpoint                      ; altimeter new setpoint position
+var byte   altiUpdate                       ; altimeter position update request
+
+-- cyclic buffer to store new setpoints
+const byte MAX_NO_SETPOINTS = 50
+var word   setpointBuffer[MAX_NO_SETPOINTS+1]
+var byte   headIndex
+var byte   tailIndex
+
+-- test mode variables
+var word   testModePosition
+var word   testModeStepRate
+var byte   testModeState
+const BYTE TEST_INACTIVE    = 0
+const BYTE TEST_RUNNING     = 1
+const BYTE TEST_STOPPING    = 2
+var byte   testModeDirection
+const BYTE TEST_DIR_INC     = 0
+const BYTE TEST_DIR_DEC     = 1
+
+-- (input) button setpoint adjustment
+var byte   adjustmentDirection              ; setting adjustment "direction"
+const BYTE ADJUST_UP              = 0
+const BYTE ADJUST_DOWN            = 1
+var byte   buttonCheckState[2]              ; button STD states
+const BYTE BUT_INACTIVE           = 0
+const BYTE BUT_DEBOUNCE_TO_ACT    = 1
+const BYTE BUT_ACTIVE             = 2
+const BYTE BUT_DEBOUNCE_TO_INACT  = 3
+var byte   buttonCheckCount[2]              ; number of debounce cycles
+const BYTE DEBOUNCE_COUNT         = 2       ; debounce cycles
+const word BUTTON_CHK_DELAY       = 2       ; time between debounce checks
+-- setting update step rate control
+var word   adjustStepRate                   ; time delay between two steps
+const word ADJ_STEPRATE_1         = 150     ; time between update steps
+const word ADJ_STEPRATE_2         = 75
+const word ADJ_STEPRATE_3         = 10
+const byte STEPS_BEFORE_FASTER    = 10      ; update step size after # updates
+var byte adjustStepCount                    ; # updates left with this step size
+
+-- SPI data transmission to DACs
+var byte   setpointsToDACsActive            ; indicates transmission in progress
+
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+-- include spi_master_hw       -- SPI master hardware library
+include alti-watchdog          -- communication watchdog
+include alti-doa               -- PHCC DOA receiver routine
+include alti-usb               -- USB handler
+include alti-led               -- DIAG LED routines
+include alti-code              -- process received commands
+
+
+-- =============================================================================
+-- START OF ALTIMETER INTERFACE PROGRAM
+-- =============================================================================
+
+BSR = 0                      ; set bank select register to default
+INTCON_GIE = FALSE           ; disable all interrupts
+enable_digital_io()          ; all I/O pins set to digital
+INTCON = 0                   ; all interrupts disabled
+
+-- SPI hardware control lines
+CS_DAC_S12 = 1               ; CS* DAC S1-S2 amplitude output
+CS_DAC_S3  = 1               ; CS* S3 amplitude output
+LOADDACS   = 1               ; LDAC* S1-S2-S3
+SPI_SCK    = 0               ; SPI clock inactive level
+-- spi_init(SPI_MODE_00, SPI_RATE_FOSC_64)
+
+-- initialize DOA/USB communication variables
+DOA_address     = 0
+DOA_subaddr     = 0
+DOA_databyte    = 0
+bitcounter      = 7
+DOAcmdReceived  = FALSE
+USBcmdReceived  = FALSE
+USBdebugEnabled = FALSE
+DOA_RXstate     = DOA_STATE_ADDRESS   ; DOA RX state machine initial state
+USB_RXstate     = USB_STATE_IDLE      ; USB RX state machine initial state
+
+--  diagnostic LED initialization
+DIAGLED         = LED_OFF
+diagLEDstate    = LED_OFF
+heartbeatState  = LED_OFF
+resetFlashCount = 0
+diagLEDuse      = DIAGLED_HEARTBEAT
+flashRate       = STARTUP_FLASHRATE
+set_delay(HEARTBEAT_SLOT, flashRate)                 -- start heartbeat blinking
+
+--  altimeter initial synchro stator output signals: amplitude = 0
+amplitudeS1   = 1023
+amplitudeS2   = 1023               -- max control voltage :: max VCA attenuation
+amplitudeS3   = 1023
+prevS1Angle   = 0                  -- needed for "jump" correction
+prevS2Angle   = 0
+prevS3Angle   = 0
+polarityS1    = 1
+polarityS2    = 1                  -- "0" :: invert  //  "1" :: phase shift 0
+polarityS3    = 1
+prevS1Pol     = 1
+prevS2Pol     = 1
+prevS3Pol     = 1
+
+--  (spare) digital outputs to defined state ("0")
+DIGOUT1       = 0
+DIGOUT2       = 0
+DIGOUT3       = 0
+
+--  initialize setting variables and setpoint buffer
+offsetS1              = S1DEFAULTANGLE   -- altimeter synchro coil offsets
+offsetS1low           = 0
+offsetS2              = S2DEFAULTANGLE
+offsetS2low           = 0
+offsetS3              = S3DEFAULTANGLE
+offsetS3low           = 0
+
+newSetpoint           = 0                -- altimeter new setpoint position
+altiUpdate            = FALSE            -- altimeter position update request
+headIndex             = 0                -- initialize setpoints cyclic buffer
+tailIndex             = 0
+setpointsToDACsActive = FALSE
+manualLoadFinished    = TRUE             -- flag to prevent manual load overrun
+
+testModePosition      = 0
+testModeState         = TEST_INACTIVE
+testModeStepRate      = TEST_STEP_RATE
+
+adjustmentDirection   = ADJUST_UP        -- setting adjustment "direction"
+buttonCheckState[0]   = BUT_INACTIVE     -- button processing STD state
+buttonCheckState[1]   = BUT_INACTIVE
+buttonCheckCount[0]   = DEBOUNCE_COUNT   -- number of debounce cycles
+buttonCheckCount[1]   = DEBOUNCE_COUNT
+
+prevISRcounter    = 0
+
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF        = 0        ; clear SPI interrupt flag
+-- PIE1_SSPIE        = 1        ; enable SPI interrupt
+INTCON2_INTEDG2   = 1           ; external INT2 interrupt on rising edge (DOA)
+INTCON3_INT2IF    = 0           ; clear INT2 (DOA) interrupt flag
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+if (USB_DOA == USE_USB) then
+    commPort       = USE_USB
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = STARTUP_FLASHRATE
+    chkUSBconnect  = TRUE
+    wtchdogState   = WTCHDOG_DISABLED   -- USB DEFAULT watchdog state: disabled
+    INTCON3_INT2IE = 0                  -- disable INT2 (DOA) external interrupt
+else
+    commPort       = USE_DOA
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = DOA_RESET_RATE     -- indicate initial 1 sec delay
+    chkUSBconnect  = FALSE
+    wtchdogState   = WTCHDOG_ENABLED    -- DOA DEFAULT watchdog state: enabled
+    INTCON3_INT2IE = 1                  -- enable INT2 (DOA) external interrupt
+end if
+
+-- watchdog
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT         -- initialize watchdog
+commRestartWatchdog()                            -- start comm protocol watchdog
+
+-- Initial "setpoint" :: all 3 stator coils zero "energized".
+initSPIcontrol()
+synchroSetpoint( amplitudeS1, amplitudeS2, amplitudeS3,
+                 polarityS1,  polarityS2,  polarityS3  )
+
+forever loop
+   -- for PHCC, the DOA communication can start immediately
+   -- for USB, there is first a check that the USB connection is made
+
+   if (chkUSBconnect == TRUE) then
+      -- check periodically for USB connection active
+      diagLEDheartBeat()                                 ; update DIAG LED state
+      if (isr_counter != prevISRcounter) then
+         -- one (or more) timer tick elapsed
+         prevISRcounter = isr_counter
+--       if (usb_cdc_line_status() != 0x00) then          ; check_comm_active()
+         if (VsenseIN) then                               ; check_comm_active()
+            chkUSBconnect = FALSE
+            -- USB connection established: setup USB serial library
+            usb_serial_init()
+            flashRate = USB_FLASH_RATE
+         end if
+      end if
+   else
+      -- main loop: startup phase for USB done -- OR -- PHCC DOA selected
+     if (commPort == USE_USB) then
+        -- USB communication
+        --     keep checking whether USB is still connected!
+--      if (usb_cdc_line_status() != 0x00) then
+        if (VsenseIN) then
+           handleUSBcommunication()
+           if (USBcmdReceived == TRUE) then
+              USBcmdReceived = FALSE
+              commandCode = USBrxByte1
+              commandData = USBrxByte2
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        else
+           -- USB connection lost -> restart USB connection setup loop
+           chkUSBconnect  = TRUE
+           flashRate      = STARTUP_FLASHRATE
+           diagLEDuse     = DIAGLED_HEARTBEAT  -- make sure the DIAG LED flashes
+           prevISRcounter = 0
+        end if
+     else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+     end if
+
+     -- execute continuously running actions (if required)
+     diagLEDheartBeat()          ; update DIAG LED state if in "heart beat" mode
+     commCheckWatchdog()         ; check communication protocol watchdog
+     acceptNewSetpoint()         ; store new setpoint (if one is received)
+     updSynchroPosition()        ; move synchro axis to new setpoint
+     testMode()
+     checkSettingAdjustment()    ; check manual altimeter setting adjustment
+     processSPIloading()         ; send data to DACs (if active)
+
+   end if
+end loop
+
+
+-- =============================================================================
+
+-- Interrupt routine for the DOA serial communication and SPI processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( INTCON3_INT2IF ) then
+      processDOAinterrupt()
+  end if
+  
+  -- if ( PIR1_SSPIF ) then
+  --     processSPIinterrupt()
+  -- end if
+end procedure
+
