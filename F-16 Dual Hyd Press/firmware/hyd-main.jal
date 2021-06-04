@@ -1,0 +1,501 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HYD (Hydraulic Pressure Indicators A/B) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Author: Henk "henkie" Gooijen, Copyright (c) 2020, all rights reserved
+--
+-- Compiler: 2.5r1
+--
+-- Description:
+--         HYD control module is the firmware to control 4 synchro coils.
+--         In principle, every output can be set to a specific amplitude, but
+--         the firmware controls 2 groups of 2 coils for the HYD A/B indicators.
+--         The firmware controls the 2 HYDRAULIC PRESSURE indicators, operating
+--         in "s2-grounded" configuration.
+--         The firmware uses a jumper-selectable USB or PHCC-DOA interface.
+--         The communication is one-way only: from PC to HYD.
+--
+-- Notes:  - 01-12-2020: files created (copy from HSI #1 firmware).
+--         - 02-12-2020: removed bearing/heading code, assigned and renamed I/O
+--                       removed "ML3" code, changed ML1/ML2 code to HYDA/HYDB.
+--         - 17-12-2020: pin A1, A5 and B7 are not used.  Although there is no
+--                       provision on the PCB to connect something to these pins
+--                       they are defined as outputs, and can each be controlled
+--                       with a separate command.  If an output is needed, it is
+--                       at least available but a wire must be soldered directly
+--                       to the pin of the PIC (on the PCB of course).
+--         - 24-12-2020: added robustness for USB communication. The message now
+--                       consists of the command byte, data byte and then two
+--                       delimiter bytes ($FF). If the command byte data is not
+--                       defined or any delimiter byte is not $FF, the message
+--                       is rejected, and the state machine returns to the start
+--                       state (await command byte).
+--                       As DOA protocol is defined by PHCC, this check cannot
+--                       be implemented for DOA.
+--         - 27-12-2020: Perfected the delimiters: the first delimiter must be
+--                       equal to the 8-bit sum of the two data bytes. That is
+--                       stronger than a simple $FF.
+--
+-- -----------------------------------------------------------------------------
+
+const byte MAJOR_VERSION = 1
+const byte MINOR_VERSION = 1
+
+include 18f2550                         -- target PIC processor
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- *** defines for compiler version 2.4o
+--pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+--pragma target WDT           DISABLED    -- no watchdog
+--
+-- *** defines for compiler version 2.5r1
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog saler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+alias  USB_DOA      is pin_A0    -- USB/DOA communication port selection
+alias  XA1          is pin_A1    -- not used
+alias  DOA_DATA     is pin_A2    -- PHCC DOA bus data signal
+alias  HYDA_DAC_CS  is pin_A3    -- DAC CS* HYD A stator coils X and Y
+alias  DIAGLED      is pin_A4    -- diagnostic on-board LED
+alias  XA5          is pin_A5    -- not used
+
+alias  SPI_SDI      is pin_B0    -- SPI data input (not used)
+alias  SPI_CLK      is pin_B1    -- SPI clock to DACs
+alias  DOA_CLOCK    is pin_B2    -- PHCC DOA bus clock signal
+alias  HYDB_POL_Y   is pin_B3    -- HYD B Y polarity
+alias  HYDB_POL_X   is pin_B4    -- HYD B X polarity
+alias  HYDA_POL_Y   is pin_B5    -- HYD A Y polarity
+alias  HYDA_POL_X   is pin_B6    -- HYD A X polarity
+alias  XB7          is pin_B7    -- not used
+
+alias  HYDB_DAC_CS  is pin_C0    -- DAC CS* HYD B stator coils X and Y
+alias  HYDA_LDDAC   is pin_C1    -- HYD A DAC LOAD* strobe
+alias  VsenseIN     is pin_C2    -- USB host voltage sense
+--     USBvoltRef   is pin_C3    -- USB voltage reference
+--     USBdataN     is pin_C4    -- USB data -
+--     USBdataP     is pin_C5    -- USB data +
+alias  HYDB_LDDAC   is pin_C6    -- HYD B DAC LOAD* strobe
+alias  SPI_SDO      is pin_C7    -- SPI data output to DACs
+
+
+--  set the I/O direction
+
+pin_A0_direction = input
+pin_A1_direction = output
+pin_A2_direction = input
+pin_A3_direction = output
+pin_A4_direction = output
+pin_A5_direction = output
+
+pin_B0_direction = input
+pin_B1_direction = output
+pin_B2_direction = input
+pin_B3_direction = output
+pin_B4_direction = output
+pin_B5_direction = output
+pin_B6_direction = output
+pin_B7_direction = output
+
+pin_C0_direction = output
+pin_C1_direction = output
+pin_C2_direction = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction = output
+pin_C7_direction = output
+
+
+
+-- =============================================================================
+-- ** constants and variables: DOA and USB protocol receiver routines
+-- =============================================================================
+
+-- DOA and USB receiver
+const byte HYD_DEVICE_ADDR       = 0x59    -- HYD ASCII-Y PHCC ADDRESS
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var byte   commandCode             -- received command code (DOA / USB) sub
+var byte   commandData             -- received command data (DOA / USB) sub
+
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition, diagnostic LED and watchdog
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const COMM_WATCHDOG_SLOT   = 1     -- DOA & USB communication watchdog timer
+const DELAY_SLOTS          = 2     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON          = 0     -- LED connected to common +5, so:
+const byte LED_OFF         = 1     -- inverted logic: 0::on // 1::off
+
+-- diagnostic LED usage definitions
+const byte DIAGLED_OFF       = 0   -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1   -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2   -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3   -- DIAG LED ON/OFF per received message
+const byte DIAGLED_DOA_CHK   = 4   -- DIAG LED DOA protocol check error flag
+var   byte diagLEDuse              -- current usage mode for the DIAG LED
+
+-- variables for USB (dis)connection monitoring
+var byte   chkUSBconnect           -- USB uses a startup (connection made)
+var word   prevISRcounter          -- fast period connection check timer
+
+
+
+  -- setpoint commands
+const byte CMD_HYD_AQ1     = 0     -- set HYD A indicator (000..255)
+const byte CMD_HYD_AQ2     = 1     -- set HYD A indicator (256..511)
+const byte CMD_HYD_AQ3     = 2     -- set HYD A indicator (512..767)
+const byte CMD_HYD_AQ4     = 3     -- set HYD A indicator (768..1023)
+const byte CMD_HYD_BQ1     = 4     -- set HYD B indicator (000..255)
+const byte CMD_HYD_BQ2     = 5     -- set HYD B indicator (256..511)
+const byte CMD_HYD_BQ3     = 6     -- set HYD B indicator (512..767)
+const byte CMD_HYD_BQ4     = 7     -- set HYD B indicator (768..1023)
+
+  -- stator offsets commands
+const byte CMD_LD_OFFS_L   = 8     -- load offset value (lo 8 bits)  -> 1st cmd
+const byte CMD_LD_OFFS_H   = 9     -- load offset value (hi 2 bits)  -> 2nd cmd
+const byte CMD_LOAD_HYD    = 10    -- load HYD PRS offset value mask -> 3rd cmd
+
+   -- amplitude output adjustment or manual fine setpoint setting commands
+const byte CMD_HYD_AX      = 11    -- set output value HYD A X coil
+const byte CMD_HYD_AY      = 12    -- set output value HYD A Y coil
+const byte CMD_HYDA_POL    = 13    -- activate HYD A X, Y polarity
+const byte CMD_HYD_BX      = 14    -- set output value HYD B X coil
+const byte CMD_HYD_BY      = 15    -- set output value HYD B Y coil
+const byte CMD_HYDB_POL    = 16    -- activate HYD B X, Y polarity
+
+  -- optional output control commands
+const byte CMD_XA1         = 17    -- control spare output XA1
+const byte CMD_XA5         = 18    -- control spare output XA5
+const byte CMD_XB7         = 19    -- control spare output XB7
+
+  -- system control commands
+const byte CMD_WTCHDOG_DIS = 20    -- disabled watchdog
+const byte CMD_WTCHDOG_ENA = 21    -- enable watchdog
+const byte CMD_DIAGMODE    = 22    -- set diagnostic LED operating mode
+
+const byte CMD_LASTVAL     = 22    -- last valid command for DOA
+
+   -- USB only commands
+const byte CMD_IDENTIFY    = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG   = (CMD_LASTVAL+2)   -- USB only: enable debug output
+
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+const byte USE_USB         = 1             -- no jumper installed
+const byte USE_DOA         = 0             -- jumper installed
+var   byte commPort                        -- selected port at startup
+
+-- watchdog
+var   byte wtchdogState               -- watchdog ENABLED/DISABLED flag
+const byte WTCHDOG_ENABLED    = 1
+const byte WTCHDOG_DISABLED   = 0
+var   word wtchdogDelayValue          -- set watchdog timeout value
+
+-- HYD A/B control
+var byte   hydAPolarityX              -- HYD A polarity and amplitude
+var byte   hydAPolarityY
+var word   hydAAmplitudeX
+var word   hydAAmplitudeY
+var word   hydAOffsetX                --       offset values for "zero"
+var word   hydAOffsetY
+
+var byte   hydBPolarityX              -- HYD B polarity and amplitude
+var byte   hydBPolarityY
+var word   hydBAmplitudeX
+var word   hydBAmplitudeY
+var word   hydBOffsetX                --       offset values for "zero"
+var word   hydBOffsetY
+
+-- setpoints
+   -- cyclic buffers used to store new setpoints
+const byte MAX_NO_SETPOINTS = 20
+const word NO_NEW_SETPOINT  = 31313   -- impossible value : no setpoint avail
+
+   -- MILES UNIT drumcounter
+var word   hydABuffer[MAX_NO_SETPOINTS+1]
+var byte   hydAHeadIndex
+var byte   hydATailIndex
+var word   hydANewPos                 -- HYD A new setpoint value
+var byte   hydAUpdate                 -- HYD A value update request
+
+   -- MILES TENS drumcounter
+var word   hydBBuffer[MAX_NO_SETPOINTS+1]
+var byte   hydBHeadIndex
+var byte   hydBTailIndex
+var word   hydBNewPos                 -- HYD B new setpoint value
+var byte   hydBUpdate                 -- HYD B value update request
+
+
+-- SPI data transmission to DACs
+var byte   setpointsToDACsActive      -- indicates SPI transmission in progress
+
+-- default synchro stator offset values
+const word HYDA_DFLT_X_ANGLE  = 231   -- indicator at "0"
+const word HYDA_DFLT_Y_ANGLE  = 402   -- 60 degrees
+
+const word HYDB_DFLT_X_ANGLE  = 231   -- indicator at "0"
+const word HYDB_DFLT_Y_ANGLE  = 402   -- 60 degrees
+
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+-- include spi_master_hw       -- SPI master hardware library
+include hyd-doa                -- PHCC DOA receiver routine
+include hyd-usb                -- USB handler
+include hyd-led                -- DIAG LED routines
+include hyd-watchdog           -- communication watchdog
+include hyd-queues             -- setpoint queues
+include hyd-convert            -- setpoint conversion & execution
+include hyd-cmds               -- process received commands
+
+
+-- =============================================================================
+-- ############  START OF HYDRAULIC PRESSURE A/B INDICATOR CONTROL  ############
+-- =============================================================================
+
+BSR               = 0                    -- set bank select register to default
+INTCON_GIE        = FALSE                -- disable all interrupts
+enable_digital_io()                      -- all I/O pins set to digital
+INTCON            = 0                    -- all interrupts disabled
+
+initSPIhardware()                        -- SPI hardware control lines
+initDOA()                                -- init variables DOA communication
+initUSB()                                -- init variables USB communication
+initDiagLED()                            -- diagnostic LED initialization
+set_delay(HEARTBEAT_SLOT, flashRate)     -- start heartbeat blinking
+
+
+-- MILES initial synchro stator polarity output signals
+HYDA_POL_X        = 0                    -- HYD A stators polarity
+HYDA_POL_Y        = 0
+HYDB_POL_X        = 0                    -- HYD B stators polarity
+HYDB_POL_Y        = 0
+
+
+-- initialize setpoint variables
+hydAPolarityX       = 0                -- HYD A polarity and amplitude
+hydAPolarityY       = 0
+hydAAmplitudeX      = 0
+hydAAmplitudeY      = 0
+hydAOffsetX         = HYDA_DFLT_X_ANGLE   --    offset values for "zero"
+hydAOffsetY         = HYDA_DFLT_Y_ANGLE
+
+hydBPolarityX       = 0                -- HYD B polarity and amplitude
+hydBPolarityY       = 0
+hydBAmplitudeX      = 0
+hydBAmplitudeY      = 0
+hydBOffsetX         = HYDB_DFLT_X_ANGLE   --    offset values for "zero"
+hydBOffsetY         = HYDB_DFLT_Y_ANGLE
+
+hydANewPos          = 0                -- HYD A initial setpoint value
+hydBNewPos          = 0                -- HYD B initial setpoint value
+
+hydAUpdate          = FALSE            -- HYD A value update request
+hydBUpdate          = FALSE            -- HYD B value update request
+
+-- initialize the optional 3 outputs
+XA1                 = 0
+XA5                 = 0
+XB7                 = 0
+
+initQueueAdministration()                -- cyclic buffers adminstration
+
+
+-- set environment
+prevISRcounter    = 0
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF        = 0        ; clear SPI interrupt flag
+-- PIE1_SSPIE        = 1        ; enable SPI interrupt
+INTCON2_INTEDG2   = 1           ; external INT2 (DOA) interrupt on rising edge
+INTCON3_INT2IF    = 0           ; clear INT2 (DOA) interrupt flag
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+if (USB_DOA == USE_USB) then
+    commPort       = USE_USB
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = STARTUP_FLASHRATE
+    chkUSBconnect  = TRUE
+    wtchdogState   = WTCHDOG_DISABLED   -- USB DEFAULT watchdog state: disabled
+    INTCON3_INT2IE = 0                  -- disable INT2 (DOA) external interrupt
+else
+    commPort       = USE_DOA
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = DOA_RESET_RATE     -- indicate initial 1 sec delay
+    chkUSBconnect  = FALSE
+    wtchdogState   = WTCHDOG_ENABLED    -- DOA DEFAULT watchdog state: enabled
+    INTCON3_INT2IE = 1                  -- enable INT2 (DOA) external interrupt
+end if
+
+-- watchdog
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT    -- initialize watchdog
+commRestartWatchdog()                       -- start comm protocol watchdog
+
+initSPIcontrol()                            -- initialize DAC load state machine
+preloadDACregisters()                       -- load DAC registers: amplitude 0
+
+-- Interrupts are enabled, so we can send data via SPI to the DACs.
+-- Initial "setpoint" :: all 2 stator coils zero "energized".
+-- ########hyd.Setpoint(hyd.AmplitudeX, hyd.AmplitudeY,
+-- ########             hyd.PolarityX,  hyd.PolarityY  )
+
+
+forever loop
+  -- for PHCC, the DOA communication can start immediately
+  -- for USB, there is first a check that the USB connection is made
+
+  if (chkUSBconnect == TRUE) then
+     -- periodically check for USB connection active
+     diagLEDheartBeat()                                 -- update DIAG LED state
+     if (isr_counter != prevISRcounter) then
+        -- one (or more) timer tick elapsed
+        prevISRcounter = isr_counter
+        if (VsenseIN) then                               -- check_comm_active()
+           chkUSBconnect = FALSE
+           -- USB connection established: setup USB serial library
+           usb_serial_init()
+           flashRate = USB_FLASH_RATE
+        end if
+     end if
+  else
+     -- main loop: startup phase for USB done __OR__ PHCC DOA selected
+     if (commPort == USE_USB) then
+        -- USB communication: keep checking whether USB is still connected!
+        if (VsenseIN) then
+           handleUSBcommunication()
+           if (USBcmdReceived == TRUE) then
+              USBcmdReceived = FALSE
+              commandCode = USBrxByte1
+              commandData = USBrxByte2
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        else
+           -- USB connection lost -> restart USB connection setup loop
+           chkUSBconnect  = TRUE
+           flashRate      = STARTUP_FLASHRATE
+           diagLEDuse     = DIAGLED_HEARTBEAT     -- make sure the DIAG LED flashes
+           prevISRcounter = 0
+        end if
+     else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+     end if
+
+     -- execute continuously running actions (if required)
+
+     diagLEDheartBeat()          -- update DIAG LED state if in "heart beat" mode
+     commCheckWatchdog()         -- check communication protocol watchdog
+
+     accNewHydASetpoint()
+     accNewHydBSetpoint()
+
+     updHydAPosition()           -- move synchro axis to new setpoint
+     updHydBPosition()
+
+     processSPIloading()         -- send data to DACs (if active)
+
+  end if
+end loop
+
+
+-- =============================================================================
+-- Interrupt routine for the DOA serial communication and SPI processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( INTCON3_INT2IF ) then
+      processDOAinterrupt()
+  end if
+
+  -- if ( PIR1_SSPIF ) then
+  --     processSPIinterrupt()
+  -- end if
+end procedure
+

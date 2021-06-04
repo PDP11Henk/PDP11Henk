@@ -1,0 +1,226 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HYD (Hydraulic Pressure Indicators A/B) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: hyd-cmds
+--
+--    this module contains the processing of all "HYD" commands.
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+
+var word loadOffset
+var word loadOffsetLsb
+
+
+procedure processCommand() is
+  var byte IDbyte
+  var sword delta
+
+  case (commandCode) of
+      CMD_HYD_AQ1 : block
+              hydANewPos = word(commandData)
+              hydAUpdate = TRUE
+          end block
+      CMD_HYD_AQ2 : block
+              hydANewPos = word(commandData) + 256
+              hydAUpdate = TRUE
+          end block
+      CMD_HYD_AQ3 : block
+              hydANewPos = word(commandData) + 512
+              hydAUpdate = TRUE
+          end block
+      CMD_HYD_AQ4 : block
+              hydANewPos = word(commandData) + 768
+              hydAUpdate = TRUE
+          end block
+--
+      CMD_HYD_BQ1 : block
+              hydBNewPos = word(commandData)
+              hydBUpdate = TRUE
+          end block
+      CMD_HYD_BQ2 : block
+              hydBNewPos = word(commandData) + 256
+              hydBUpdate = TRUE
+          end block
+      CMD_HYD_BQ3 : block
+              hydBNewPos = word(commandData) + 512
+              hydBUpdate = TRUE
+          end block
+      CMD_HYD_BQ4 : block
+              hydBNewPos = word(commandData) + 768
+              hydBUpdate = TRUE
+          end block
+--
+      CMD_WTCHDOG_DIS : block
+              disableWatchdog()
+          end block
+      CMD_WTCHDOG_ENA : block
+              if ((commandData & 0x3F) == 0x00) then
+                  -- set default timeout value
+                  wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+              else
+                  wtchdogDelayValue = word(commandData & 0x3F)
+              end if
+              if ((commandData & 0xC0) == 0x80) then
+                  -- enable watchdog
+                  set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                  enableWatchdog()
+              end if
+              if ((commandData & 0xC0) == 0x00) then
+                  -- disable watchdog
+                  disableWatchdog()
+              end if
+          end block
+--
+      CMD_DIAGMODE : block
+              if (flashRate != DOA_RESET_RATE) then
+                  -- do not accept DIAG commands during DOA power-up
+                  setDiagLEDmode(commandData)
+              end if
+          end block
+--
+      -- load base angle offsets (in 10-bit accuracy)
+      -- NOTE: LSB value must be set *before* MSB value!
+      CMD_LD_OFFS_L : block
+              loadOffsetLsb = word(commandData)
+          end block
+      CMD_LD_OFFS_H : block
+              loadOffset = word(commandData & 0x03) << 8
+              loadOffset = loadOffset + loadOffsetLsb
+          end block
+--
+      CMD_LOAD_HYD : block
+              if ((commandData & 0x01) == 0x01) then
+                  hydAOffsetX = loadOffset
+              elsif ((commandData & 0x02) == 0x02) then
+                  hydAOffsetY = loadOffset
+              elsif ((commandData & 0x04) == 0x04) then
+                  hydBOffsetX = loadOffset
+              elsif ((commandData & 0x08) == 0x08) then
+                  hydBOffsetY = loadOffset
+              else
+                  -- reject: wrong bitmask
+              end if
+          end block
+--
+      CMD_HYD_AX : block
+              hydAAmplitudeX = word(255 - commandData) << 2
+          end block
+      CMD_HYD_AY : block
+              hydAAmplitudeY = word(255 - commandData) << 2
+          end block
+--
+      CMD_HYDA_POL : block
+              --  +--7--+--6--+--5--+--4--+--3--+--2--+--1--+--0--+
+              --  |     |     |     |     |     |     |  Y  |  X  |
+              --  +-----+-----+-----+-----+-----+-----+-----+-----+
+              --                                        pol   pol
+              --
+              --  Bits 0 and 1 set the polarity of X and Y
+              --  respectively of the HYD A synchro.
+              --  Bits 2-3-4-5-6-7 are ignored.
+
+              hydAPolarityX = (commandData & 0x01)
+              hydAPolarityY = (commandData & 0x02) >> 1
+              if (setpointsToDACsActive == FALSE) then
+                  setpointsToDACsActive = TRUE
+                  hydASetpoint(hydAAmplitudeX, hydAAmplitudeY,
+                               hydAPolarityX,  hydAPolarityY )
+              end if
+          end block
+--
+      CMD_HYD_BX : block
+              hydBAmplitudeX = word(255 - commandData) << 2
+          end block
+      CMD_HYD_BY : block
+              hydBAmplitudeY = word(255 - commandData) << 2
+          end block
+--
+      CMD_HYDB_POL : block
+              --  +--7--+--6--+--5--+--4--+--3--+--2--+--1--+--0--+
+              --  |     |     |     |     |     |     |  Y  |  X  |
+              --  +-----+-----+-----+-----+-----+-----+-----+-----+
+              --                                        pol   pol
+              --
+              --  Bits 0 and 1 set the polarity of X and Y
+              --  respectively of the HYD B synchro.
+              --  Bits 2-3-4-5-6-7 are ignored.
+
+              hydBPolarityX = (commandData & 0x01)
+              hydBPolarityY = (commandData & 0x02) >> 1
+              if (setpointsToDACsActive == FALSE) then
+                  setpointsToDACsActive = TRUE
+                  hydBSetpoint(hydBAmplitudeX, hydBAmplitudeY,
+                               hydBPolarityX,  hydBPolarityY )
+              end if
+          end block
+--
+-- spare outputs
+      CMD_XA1 : block
+              if (commandData == 0x00) then
+                  XA1 = 0
+              else
+                  XA1 = 1
+              end if
+          end block
+      CMD_XA5 : block
+              if (commandData == 0x00) then
+                  XA5 = 0
+              else
+                  XA5 = 1
+              end if
+          end block
+      CMD_XB7 : block
+              if (commandData == 0x00) then
+                  XB7 = 0
+              else
+                  XB7 = 1
+              end if
+          end block
+--
+-- USB test
+      CMD_IDENTIFY  : block
+              -- double check that USB is the COM port in use!
+              if (commPort == USE_USB) then
+                  usb_serial_data = "H"
+                  usb_serial_data = "Y"
+                  usb_serial_data = "D"
+                  usb_serial_data = " "
+                  usb_serial_data = "v"
+                  usb_serial_data = "0" + MAJOR_VERSION
+                  usb_serial_data = "."
+                  usb_serial_data = "0" + MINOR_VERSION
+                  usb_serial_data = " "
+                  usb_serial_data = "$"
+                  IDbyte = ((HYD_DEVICE_ADDR >> 4) & 0x0F) + "0"
+                  if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                  usb_serial_data = IDbyte
+                  IDbyte = (HYD_DEVICE_ADDR & 0x0F) + "0"
+                  if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                  usb_serial_data = IDbyte
+                  usb_serial_data = 13                        -- add CR
+                  usb_serial_data = 10                        -- add LF
+              end if
+          end block
+-- USB debug
+      CMD_USB_DEBUG : block
+              -- double check that USB is the COM port in use!
+              if (commPort == USE_USB) then
+                  if (commandData == "N") then
+                      USBdebugEnabled = FALSE
+                  elsif (commandData == "Y") then
+                      USBdebugEnabled = TRUE
+                  end if
+              end if
+          end block
+
+      -- ignore everything else
+      otherwise block
+              ; do nothing - reject
+          end block
+  end case
+end procedure
+

@@ -1,0 +1,158 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HYD (Hydraulic Pressure Indicators A/B) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: hyd-convert
+--
+--    this module contains the conversion of a setpoint to synchro stator
+--    signals, and the main synchro position update routines.
+
+include hyd-sinelog         -- sine logarithmic lookup 0° - 180° (512 entries)
+include hyd-dacs            -- DAC analog control voltage for VCA amplitudes
+
+
+
+-- -----------------------------------------------------------------------------
+-- convert an angle (10-bit sized) to a 10-bit sine value (V2164 log corrected)
+-- -----------------------------------------------------------------------------
+
+    -- global variables to pass angle calculation results to caller
+var word  amplitude
+var byte  polarity
+
+
+
+procedure convert10bitAngle(WORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 1023.
+  ; This range (0 - 1023) represents 0° to 360° rotation of the synchro.
+  ; The value is converted to a look-up value for a "half-sine" (thus 9-bit).
+  ; The first half sine period is equal to the second half, except for polarity.
+
+var word baseAngle, sineValue
+
+  -- get "base" angle :: always in first half of sine wave for table lookup
+  if (angle < 512) then
+     baseAngle = angle
+     polarity = 1                       -- sine value is positive
+  else
+     baseAngle = 512 - (1024 - angle)
+     if (baseAngle == 512) then
+        baseAngle = 0
+     end if
+     polarity = 0                       -- sine value is negative
+  end if
+
+  sineValue = sineLog[baseAngle]        -- retrieve sine value (V2164 corrected)
+
+  -- the higher the sine value, the lower the VCA control voltage must be
+  -- VCA control voltage 0V => attenuation = 0 dB  (gain = 1)
+  -- VCA control voltage 1V => attenuation ~ 30 dB (gain = 1/1000)
+  amplitude = 1023 - sineValue
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- set HYD [A|B]
+--    accept a 10-bit setpoint angle where 0 :: 0° and 1023 :: 360°.
+--    sine lookup table is used to retrieve the individual stator amplitudes.
+--    As the angle varies from 0 to 1023 for one full sine wave, one "half"
+--    spans a range of 512 values. Therefore, the sine table has 512 entries,
+--    and returns a value between 0 and 1023 (10-bit synchro stator amplitude).
+-- -----------------------------------------------------------------------------
+
+procedure calcHydA(WORD in setAngle) is
+  var word sxAngle, syAngle
+
+  sxAngle = setAngle + hydAOffsetX
+  syAngle = setAngle + hydAOffsetY
+
+  -- normalize to base value
+  if (sxAngle >= 1024) then sxAngle = sxAngle - 1024  end if   ; 1024 == 0
+  if (syAngle >= 1024) then syAngle = syAngle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(sxAngle)
+  hydAAmplitudeX = amplitude
+  hydAPolarityX  = polarity
+
+  convert10bitAngle(syAngle)
+  hydAAmplitudeY = amplitude
+  hydAPolarityY  = polarity
+end procedure
+
+
+
+procedure setHydA(WORD in setAngle) is
+    calcHydA(setAngle)
+    hydASetpoint( hydAAmplitudeX, hydAAmplitudeY,
+                  hydAPolarityX,  hydAPolarityY  )
+end procedure
+
+
+
+procedure calcHydB(WORD in setAngle) is
+  var word sxAngle, syAngle
+
+  sxAngle = setAngle + hydBOffsetX
+  syAngle = setAngle + hydBOffsetY
+
+  -- normalize to base value
+  if (sxAngle >= 1024) then sxAngle = sxAngle - 1024  end if   ; 1024 == 0
+  if (syAngle >= 1024) then syAngle = syAngle - 1024  end if
+
+  -- retrieve amplitude and polarity
+  convert10bitAngle(sxAngle)
+  hydBAmplitudeX = amplitude
+  hydBPolarityX  = polarity
+
+  convert10bitAngle(syAngle)
+  hydBAmplitudeY = amplitude
+  hydBPolarityY  = polarity
+end procedure
+
+
+
+procedure setHydB(WORD in setAngle) is
+    calcHydB(setAngle)
+    hydBSetpoint( hydBAmplitudeX, hydBAmplitudeY,
+                  hydBPolarityX,  hydBPolarityY  )
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- activate (new) setpoint for HYD [A/B] from cyclic buffer
+-- called from main()
+-- output a new setpoint only if no previous setpoint output is in progress!
+-- -----------------------------------------------------------------------------
+
+procedure updHydAPosition() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewHydASetpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setHydA(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+procedure updHydBPosition() is
+  var word setpoint
+
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = getNewHydBSetpoint()
+      if (setpoint != NO_NEW_SETPOINT) then
+          -- start cycle to send data to the DACs
+          setpointsToDACsActive = TRUE
+          setHydB(setpoint)
+      end if
+  end if
+end procedure
+

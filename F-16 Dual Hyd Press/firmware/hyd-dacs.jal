@@ -1,0 +1,293 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HYD (Hydraulic Pressure Indicators A/B) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: hyd-dacs
+--
+--    this module contains the actual requested setpoint execution for the
+--    HYDRAULIC PRESSURE A and B indicators.
+--
+--    The "setpoint" function has input parameters for the stator amplitude
+--    settings and their polarity with respect to the rotor (reference) signal.
+--    This data is formatted and stored in an array and then "startHydXDAC" is
+--    called.  This routine sends the 1st data to the DAC and enables the SPI
+--    interrupt. The SPI interrupt routine takes care of the successive bytes
+--    that must be sent to the DAC, and correct CS and LDAC pulse generation.
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+--    *** NOTE:
+--    SPI hardware control sometimes seems to send "spurious" data. Therefore,
+--    SPI is software controlled. Data and successive data are sent over the SPI
+--    hardware lines, but control is managed in a state machine which is called
+--    from main(). The state machine is implemented in processSPIloading().
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+
+var byte   statorData[12]     -- holds amplitude and polarity data for stators
+var byte   loadState          -- state machine data transmission progress
+var byte   setIndicator       -- identify for which indication setpoint is
+
+const byte DAC_LOAD_IDLE      = 0
+
+  -- output stator coil setting // Chip Select identification  of correct DAC
+const byte OUTPUT_HYDA_X      = 1
+const byte OUTPUT_HYDA_Y      = 2
+const byte OUTPUT_HYDB_X      = 3
+const byte OUTPUT_HYDB_Y      = 4
+const byte OUTPUT_LATCH       = 5
+
+-- DAC CS* state
+const byte ASSERT             = 0     -- DAC CS* control pin asserted level
+const byte NEGATE             = 1     -- DAC CS* control pin negated level
+
+const byte SET_HYD_A          = 0
+const byte SET_HYD_B          = 1
+
+const byte DAC_A              = 0x30  -- load DAC A, gain 1x
+const byte DAC_B              = 0xB0  -- load DAC B, gain 1x
+
+
+
+procedure initSPIhardware() is
+    HYDA_DAC_CS       = 1          -- CS* DAC HYD A
+    HYDB_DAC_CS       = 1          -- CS* DAC HYD B
+    HYDA_LDDAC        = 1          -- LOAD* strobe DAC HYD A
+    HYDB_LDDAC        = 1          -- LOAD* strobe DAC HYD B
+    SPI_CLK           = 0          -- SPI clock inactive level
+end procedure
+
+
+
+procedure initSPIcontrol() is
+  loadState = DAC_LOAD_IDLE
+  setpointsToDACsActive = FALSE    -- no SPI transmission in progress
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Initiate the transfer of the bytes to the DAC(s): start the state machine.
+-- The words are sent via processSPIloading() called from the main() loop.
+-- -----------------------------------------------------------------------------
+
+procedure startHydADAC() is
+    loadState = OUTPUT_HYDA_X
+end procedure
+
+
+procedure startHydBDAC() is
+    loadState = OUTPUT_HYDB_X
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Store setpoint information in byte array for DAC loading.
+-- Initiate data transfer to DAC.
+-- -----------------------------------------------------------------------------
+
+procedure hydASetpoint(WORD in amplitudeX, WORD in amplitudeY,
+                       BYTE in polarityX,  BYTE in polarityY  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[0] = byte((amplitudeX >> 6) & 0x000F) + DAC_A
+  statorData[1] = byte((amplitudeX << 2) & 0x00FC)
+  statorData[2] = byte((amplitudeY >> 6) & 0x000F) + DAC_B
+  statorData[3] = byte((amplitudeY << 2) & 0x00FC)
+  statorData[4] = polarityX
+  statorData[5] = polarityY
+  startHydADAC()            -- trigger DAC load sequence
+end procedure
+
+
+
+procedure hydBSetpoint(WORD in amplitudeX, WORD in amplitudeY,
+                       BYTE in polarityX,  BYTE in polarityY  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[6] = byte((amplitudeX >> 6) & 0x000F) + DAC_A
+  statorData[7] = byte((amplitudeX << 2) & 0x00FC)
+  statorData[8] = byte((amplitudeY >> 6) & 0x000F) + DAC_B
+  statorData[9] = byte((amplitudeY << 2) & 0x00FC)
+  statorData[10] = polarityX
+  statorData[11] = polarityY
+  startHydBDAC()             -- trigger DAC load sequence
+end procedure
+
+
+
+-- Assert or negate the correct DAC Chip Select (CS) pin
+
+procedure controlDACCS(BYTE in statorID, BYTE in CSstate) is
+  case (statorID) of
+      OUTPUT_HYDA_X   : block   HYDA_DAC_CS = CSstate   end block
+      OUTPUT_HYDA_Y   : block   HYDA_DAC_CS = CSstate   end block
+      OUTPUT_HYDB_X   : block   HYDB_DAC_CS = CSstate   end block
+      OUTPUT_HYDB_Y   : block   HYDB_DAC_CS = CSstate   end block
+
+      otherwise block
+            -- ignore everything else  -- reject
+      end block
+  end case
+end procedure
+
+
+
+-- This routine sends the data word to the DAC using "bit-banging".
+-- It is a generic routine, starting with asserting the appropriate CS of the
+-- DAC identified by the statorID. The data bits are subsequently loaded and
+-- clocked into the DAC. The CS of the DAC is negated after the last bit.
+
+procedure sendSPIdata(BYTE in SPIdataHI, BYTE in SPIdataLO, BYTE in statorID) is
+  var byte bitmask
+
+    controlDACCS(statorID, ASSERT)       -- assert appropriate DAC CS*
+    ASM nop                              -- CS settling time
+    ASM nop
+    ASM nop
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the HI data byte
+        if ((SPIdataHI & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 0x00) loop
+        -- bit-bang the LO data byte
+        if ((SPIdataLO & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_CLK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_CLK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    ASM nop
+    ASM nop
+    controlDACCS(statorID, NEGATE)       -- negate appropriate DAC CS*
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Preload all DAC registers for output zero signal amplitude to synchro coils
+-- (called once before main loop is entered)
+-- -----------------------------------------------------------------------------
+
+procedure preloadDACregisters() is
+  var word setpoint
+--  var byte hiByte, loByte
+
+    setpoint = 1023
+-- HYD A
+    statorData[0] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[1] = byte((setpoint << 2) & 0x00FC)
+    statorData[2] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[3] = byte((setpoint << 2) & 0x00FC)
+    statorData[4] = 0
+    statorData[5] = 0
+-- HYD B
+    statorData[6] = byte((setpoint >> 6) & 0x000F) + DAC_A
+    statorData[7] = byte((setpoint << 2) & 0x00FC)
+    statorData[8] = byte((setpoint >> 6) & 0x000F) + DAC_B
+    statorData[9] = byte((setpoint << 2) & 0x00FC)
+    statorData[10] = 0
+    statorData[11] = 0
+--
+    sendSPIdata(statorData[0], statorData[1], OUTPUT_HYDA_X)
+    sendSPIdata(statorData[2], statorData[3], OUTPUT_HYDA_Y)
+
+    sendSPIdata(statorData[6], statorData[7], OUTPUT_HYDB_X)
+    sendSPIdata(statorData[8], statorData[9], OUTPUT_HYDB_Y)
+
+    ASM nop
+    HYDA_LDDAC = 0
+    HYDB_LDDAC = 0
+    ASM nop
+    ASM nop                 -- LDAC* : t > 40 ns
+    ASM nop
+    HYDA_LDDAC = 1          -- latch transfer
+    HYDB_LDDAC = 1
+    ASM nop
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- SPI send data routine
+-- -----------------------------------------------------------------------------
+
+procedure processSPIloading() is
+  case (loadState) of
+      DAC_LOAD_IDLE : block
+                        -- nothing to do, no transmission active
+                      end block
+--
+      OUTPUT_HYDA_X : block
+                        sendSPIdata(statorData[0], statorData[1], loadState)
+                        loadState = OUTPUT_HYDA_Y
+                      end block
+      OUTPUT_HYDA_Y : block
+                        sendSPIdata(statorData[2], statorData[3], loadState)
+                        setIndicator = SET_HYD_A
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_HYDB_X : block
+                        sendSPIdata(statorData[6], statorData[7], loadState)
+                        loadState = OUTPUT_HYDB_Y
+                      end block
+      OUTPUT_HYDB_Y : block
+                        sendSPIdata(statorData[8], statorData[9], loadState)
+                        setIndicator = SET_HYD_B
+                        loadState = OUTPUT_LATCH
+                      end block
+--
+      OUTPUT_LATCH  : block
+                        -- stator setpoints loaded into DAC
+                        -- transfer DAC analog values to DAC outputs
+                        -- and set signal polarity
+                        ASM nop
+                        if (setIndicator == SET_HYD_A) then
+                            HYDA_LDDAC = 0
+                            HYDA_POL_X = statorData[4]
+                            HYDA_POL_Y = statorData[5]
+                            ASM nop
+                            ASM nop                         -- LDAC* : t > 40 ns
+                            ASM nop
+                            HYDA_LDDAC = 1                  -- latch transfer
+                        elsif (setIndicator == SET_HYD_B) then
+                            HYDB_LDDAC = 0
+                            HYDB_POL_X = statorData[10]
+                            HYDB_POL_Y = statorData[11]
+                            ASM nop
+                            ASM nop                         -- LDAC* : t > 40 ns
+                            ASM nop
+                            HYDB_LDDAC = 1                  -- latch transfer
+                        else
+                            -- code error, wrong!
+                        end if
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release lock
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

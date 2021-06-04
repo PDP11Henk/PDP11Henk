@@ -1,0 +1,108 @@
+-- -----------------------------------------------------------------------------
+-- Title:  HYD (Hydraulic Pressure Indicators A/B) control modules
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: hyd-queues
+--
+--    this module contains the circular buffer to store/retrieve setpoints.
+
+
+-- -----------------------------------------------------------------------------
+-- accept new setpoint for HYD [A|B]
+-- -----------------------------------------------------------------------------
+
+procedure initQueueAdministration() is
+    hydAHeadIndex       = 0
+    hydATailIndex       = 0
+    hydBHeadIndex       = 0
+    hydBTailIndex       = 0
+end procedure
+
+
+
+procedure accNewHydASetpoint() is
+  var byte nextIndex
+
+  if (hydAUpdate == TRUE) then
+     nextIndex = hydAHeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        nextIndex = 0
+     end if
+     if (nextIndex != hydATailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        hydABuffer[hydAHeadIndex] = hydANewPos
+        hydAHeadIndex = nextIndex
+     end if
+     hydAUpdate = FALSE
+  end if
+end procedure
+
+
+
+procedure accNewHydBSetpoint() is
+  var byte nextIndex
+
+  if (hydBUpdate == TRUE) then
+     nextIndex = hydBHeadIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        nextIndex = 0
+     end if
+     if (nextIndex != hydBTailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        hydBBuffer[hydBHeadIndex] = hydBNewPos
+        hydBHeadIndex = nextIndex
+     end if
+     hydBUpdate = FALSE
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- retrieve new setpoint for HYD [A|B] from cyclic buffer
+-- -----------------------------------------------------------------------------
+
+function getNewHydASetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (hydAHeadIndex == hydATailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = hydABuffer[hydATailIndex]
+      nextIndex = hydATailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          nextIndex = 0
+      end if
+      hydATailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+function getNewHydBSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (hydBHeadIndex == hydBTailIndex) then
+      -- buffer is empty
+      setpoint = NO_NEW_SETPOINT
+  else
+      setpoint = hydBBuffer[hydBTailIndex]
+      nextIndex = hydBTailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- the last location of the buffer is not used.
+          nextIndex = 0
+      end if
+      hydBTailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
