@@ -1,0 +1,535 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Standby Attitude Direction Indicator (SADI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Author: Henk Gooijen, Copyright (c) 2017, all rights reserved
+--
+-- Compiler: 2.4q5
+--
+-- Released under the GPL license
+--         (http://www.opensource.org/licenses/bsd-license.php)
+--
+-- Description
+--         Standby ADI control module is the firmware to control the SimTek
+--         Standby Attitude Direction Indicator. The SimTek SADI has a PITCH and
+--         a ROLL drive mechanism. Each mechanism is controlled by a sine and
+--         cosine signal. This module generates four sine/cosine pairs.
+--         The 8 analog voltages to control the sine/cosine signal for ROLL and
+--         sine/cosine for PITCH are realized using DACs with SPI connection.
+--         The analog output of the DACs are filtered with a Sallen-Key filter
+--         to obtain a smooth update of the setpoint position.
+--
+-- Data flow diagram
+--         The SADI setpoint for roll and pitch is a number between 0 and 1023.
+--         This number represents an *angle* between 0 and 360 degrees, thus the
+--         resolution is 0.35 degrees.
+--         Received setpoints are stored in a queue (circular buffer). However,
+--         not the received angle is stored, but the calculated DAC value, which
+--         is a sine and cosine value of the specified angle.
+--         For the optional devices (DEVICE-3 and DEVICE-4 sin and cos setpoint)
+--         the DAC setpoint is also stored in a queue.
+--         It is also possible to set the SADI directly by sending DAC values.
+--         As for SADI and for DEVICE-3 and DEVICE-4 the DAC values are stored,
+--         a uniform mechanism is used for each sin/cos drive.
+--
+-- Notes
+--         File creation date: 28 November 2017.
+--         09-01-2018:
+--            Frame work for 8 sin/cos pairs.
+--            SimTek SADI I/O definition and command set.
+--         11-01-2018:
+--            Added PULL TO CAGE functionality.
+--         06-02-2018:
+--            Moved initialization of variables in main() to the .jal files
+--            where those variables are used -- called by "initXXX" routines.
+--         21-03-2018:
+--            Firmware finished for the QSC board V1.0
+--
+-- -----------------------------------------------------------------------------
+const byte MAJOR_VERSION = 1            -- hardware PCB version 1
+const byte MINOR_VERSION = 1            -- software version 1
+
+include 18f2550                         -- target PIC processor
+
+
+
+-- The program assumes that a 20 MHz crystal is connected to pins OSC1 and OSC2.
+-- (unspecified configuration bits may cause a different frequency!)
+pragma target clock 48_000_000          -- OSC frequency used by delay routines
+--
+-- -----------------------------------------------------------------------------
+-- ** fuses
+-- -----------------------------------------------------------------------------
+--
+pragma target PLLDIV        P5          -- divide by 5 - 20 MHz_INPUT
+pragma target CPUDIV        P2          -- OSC1_OSC2_SRC_1_96MHZ_PLL_SRC_2
+--
+-- *** defines for compiler version 2.4n
+;pragma target USBPLL        F48MHZ      -- CLOCK_SRC_FROM_96MHZ_PLL_2
+;pragma target WDT           DISABLED    -- no watchdog
+;pragma target XINST         ENABLED     -- extended instruction set
+--
+-- *** defines for compiler version 2.4q5
+pragma target USBDIV        P2          -- CLOCK_SRC_FROM_96MHZ_PLL_2
+pragma target WDT           CONTROL     -- no watchdog
+pragma target XINST         DISABLED    -- ext'ed instruction set (not JAL V2)
+--
+pragma target OSC           HS_PLL
+pragma target FCMEN         DISABLED
+pragma target IESO          DISABLED
+pragma target PWRTE         ENABLED     -- power up timer
+pragma target VREGEN        ENABLED     -- USB voltage regulator
+pragma target BROWNOUT      ENABLED     -- brownout detection
+pragma target WDTPS         P32K        -- watch dog scaler setting
+pragma target PBADEN        DIGITAL     -- analog input port<0..4>
+pragma target LPT1OSC       LOW_POWER   -- low power timer 1
+pragma target MCLR          EXTERNAL    -- master reset on RE3
+pragma target STVR          DISABLED    -- reset on stack over/under flow
+pragma target LVP           DISABLED    -- no low-voltage programming
+pragma target DEBUG         DISABLED    -- background debugging
+pragma target CP0           DISABLED    -- code block 0 not protected
+pragma target CP1           DISABLED    -- code block 1 not protected
+pragma target CP2           DISABLED    -- code block 2 not protected
+pragma target CP3           DISABLED    -- code block 3 not protected
+pragma target CPB           DISABLED    -- bootblock code not write protected
+pragma target CPD           DISABLED    -- eeprom code not write protected
+pragma target WRT0          DISABLED    -- table writeblock 0 not protected
+pragma target WRT1          DISABLED    -- table write block 1 not protected
+pragma target WRT2          DISABLED    -- table write block 2 not protected
+pragma target WRT3          DISABLED    -- table write block 3 not protected
+pragma target WRTB          DISABLED    -- bootblock not write protected
+pragma target WRTD          DISABLED    -- eeprom not write protected
+pragma target WRTC          DISABLED    -- config not write protected
+pragma target EBTR0         DISABLED    -- table read block 0 not protected
+pragma target EBTR1         DISABLED    -- table read block 1 not protected
+pragma target EBTR2         DISABLED    -- table read block 2 not protected
+pragma target EBTR3         DISABLED    -- table read block 3 not protected
+pragma target EBTRB         DISABLED    -- boot block not protected
+
+
+
+-- =============================================================================
+-- ** Hardware declarations
+-- =============================================================================
+--
+--  I/O pin definitions
+
+alias  PULL2CAGE   is pin_A0        -- PULL TO CAGE switch, active low
+alias  USB_DOA     is pin_A1        -- USB/DOA selection jumper
+alias  LOADDAC4    is pin_A2        -- LDAC* sin4/cos4 DAC
+alias  CS_DAC_S4   is pin_A3        -- CS* DAC sin4/cos4 amplitude output
+alias  DIAGLED     is pin_A4        -- diagnostic on-board LED
+alias  DOA_DATA    is pin_A5        -- PHCC DOA bus data signal
+
+alias  SPI_SDI     is pin_B0        -- SPI: SDI (not used)
+alias  SPI_SCK     is pin_B1        -- SPI: SCK
+alias  DOA_CLOCK   is pin_B2        -- PHCC DOA bus clock signal
+alias  CS_DAC_S2   is pin_B3        -- CS* DAC sin2/cos2 amplitude output
+alias  CS_DAC_S3   is pin_B4        -- CS* DAC sin3/cos3 amplitude output
+alias  LOADDAC3    is pin_B5        -- LDAC* sin3/cos3 DAC
+alias  OFFFLAG     is pin_B6        -- OFF flag (1:: active // 0 :: inactive)
+alias  DIGOUT      is pin_B7        -- DEVICE 3/4 digital output
+
+alias  LOADDAC1    is pin_C0        -- LDAC* sin1/cos1 DAC
+alias  CS_DAC_S1   is pin_C1        -- CS* DAC sin1/cos1 amplitude output
+alias  VsenseIN    is pin_C2        -- USB host voltage sense
+--     USBvoltRef  is pin_C3        -- USB voltage reference
+--     USBdataN    is pin_C4        -- USB data -
+--     USBdataP    is pin_C5        -- USB data +
+alias  LOADDAC2    is pin_C6        -- LDAC* sin2/cos2 DAC
+alias  SPI_SDO     is pin_C7        -- SPI: SDO
+
+--  I/O direction
+
+pin_A0_direction    = input
+pin_A1_direction    = input
+pin_A2_direction    = output
+pin_A3_direction    = output
+pin_A4_direction    = output
+pin_A5_direction    = input
+
+pin_B0_direction    = input
+pin_B1_direction    = output
+pin_B2_direction    = input
+pin_B3_direction    = output
+pin_B4_direction    = output
+pin_B5_direction    = output
+pin_B6_direction    = output
+pin_B7_direction    = output
+
+pin_C0_direction    = output
+pin_C1_direction    = output
+pin_C2_direction    = input
+-- pin_C3_direction = input
+-- pin_C4_direction = input
+-- pin_C5_direction = input
+pin_C6_direction    = output
+pin_C7_direction    = output
+
+
+
+-- =============================================================================
+-- ** constants and variables: DOA and USB protocol receiver routines
+-- =============================================================================
+
+const byte SADI_ADDR             = 0x53    -- SADI CONTROL PHCC ADDRESS
+const word USB_SERIAL_VENDOR_ID  = 0x04D8  -- Microchip
+const word USB_SERIAL_PRODUCT_ID = 0x000A  -- CDC
+
+var byte   DOA_address             -- DOA IRQ routine device address
+var byte   DOA_subaddr             -- DOA IRQ device sub address
+var byte   DOA_databyte            -- DOA IRQ data
+var byte   bitcounter              -- DOA IRQ count for received bits
+var byte   DOA_RXstate             -- DOA IRQ protocol RX byte state
+const byte DOA_STATE_ADDRESS  = 0  -- DOA receiver state machine state
+const byte DOA_STATE_SUBADRS  = 1
+const byte DOA_STATE_DATA     = 2
+
+var byte   DOAcmdReceived          -- flag: DOA valid command received
+var byte   deviceaddress           -- DOA received device address
+var byte   subaddress              -- DOA received sub-address
+var byte   databyte                -- DOA received data byte
+
+var byte   USB_RXstate             -- USB protocol RX byte state
+const byte USB_STATE_IDLE     = 0  -- USB receiver state machine state
+const byte USB_STATE_DATA     = 1
+const byte USB_STATE_RESET    = 2
+var byte   USBrxByte1              -- USB first received byte
+var byte   USBrxByte2              -- USB second received byte
+var byte   USBcmdReceived          -- flag: USB valid command received
+var byte   USBdebugEnabled         -- flag: output USB debug info
+
+var byte   commandCode             -- received command code (DOA / USB) sub
+var byte   commandData             -- received command data (DOA / USB) sub
+
+
+
+-- =============================================================================
+-- ** constants and variables: timer definition, diagnostic LED and watchdog
+-- =============================================================================
+
+-- timer slots
+const HEARTBEAT_SLOT       = 0     -- time slot for flashing DIAG LED
+const COMM_WATCHDOG_SLOT   = 1     -- DOA & USB communication watchdog timer
+const CAGE_DEBOUNCE_SLOT   = 2     -- PULL TO CAGE switch debounce timer
+const DELAY_SLOTS          = 3     -- number of needed time slots
+const timer0_isr_rate      = 1000  -- system interval time = 1 ms
+
+-- diagnostic LED
+const byte LED_ON  = 0             -- LED connected to common +5, so:
+const byte LED_OFF = 1             -- inverted logic: 0::on // 1::off
+
+var byte   diagLEDstate            -- current state (LED_ON|LED_OFF)
+var word   flashRate               -- selected current flash frequency
+var byte   diagLEDuse              -- current usage mode for the DIAG LED
+var byte   heartbeatState          -- heartbeat mode LED state (LED_ON|LED_OFF)
+var byte   resetFlashCount         -- # times flash during DOA reset @ power up
+
+const byte DIAGLED_OFF       = 0   -- DIAG LED mode :: always OFF
+const byte DIAGLED_ON        = 1   -- DIAG LED mode :: always ON
+const byte DIAGLED_HEARTBEAT = 2   -- DIAG LED flash at heartbeat rate
+const byte DIAGLED_MSG_ACK   = 3   -- DIAG LED ON/OFF per received message
+
+const word DOA_FLASH_RATE    = 1000   -- DOA selected: blink at approx 0.5 Hz
+const word DOA_RESET_RATE    = 40     -- DOA selected: initial 1 sec reset time
+const word USB_FLASH_RATE    = 500    -- USB selected: blink at approx 1 Hz
+const word STARTUP_FLASHRATE = 200    -- LED flash rate during (USB) startup
+
+
+-- DOA communication watchdog
+--     Bit time is set by Motherboard and is 500 us. As the timer granularity
+--     of SDI is 1 ms, it means that 2 bits, thus 2 clock pulses, occur the
+--     watchdog resolution is 2 bits of the DOA data bitstream.
+--     Initially the timer is started. Every time a DOA clock pulse is detected
+--     the timer is restarted. If the timer expires (time out) there has been
+--     a time out time period of inactivity on the DOA bus. This inactivity is
+--     used as a synchronization: the DOA data reception state machine is reset.
+
+const byte WTCHDOG_DISABLED     = FALSE
+const byte WTCHDOG_ENABLED      = TRUE
+const      WTCHDOG_DFLT_TIMEOUT = 20      -- default watchdog timeout
+var word   wtchdogDelayValue              -- set watchdog timeout value
+var byte   wtchdogState                   -- watchdog state: enabled/disabled
+
+
+-- PULL TO CAGE knob State Machine variable
+var byte   p2cState                -- state machine variable
+var byte   debounceCount           -- debounce counter
+
+const byte P2C_IDLE          = 0   -- idle state
+const byte P2C_DEBOUNCE      = 1   -- switch debounce state
+
+
+-- variables for USB connection monitoring
+
+var byte   chkUSBconnect           -- USB uses a startup (connection made)
+var word   prevISRcounter          -- fast period connection check timer
+
+
+
+-- =============================================================================
+-- ** QSC (Quad SinCos) commands
+--    (for DOA this is the sub-address, for USB this is the first message byte)
+-- =============================================================================
+--
+-- "high level" commands :: ANGLE data
+const byte CMD_SADI_ROLL0  = 0     -- SADI ROLL *angle* 0 .. 1023 :: 0 .. 359.x
+const byte CMD_SADI_ROLL1  = 1
+const byte CMD_SADI_ROLL2  = 2
+const byte CMD_SADI_ROLL3  = 3
+const byte CMD_SADI_PITCH0 = 4     -- SADI PITCH *angle* 0 .. 1023 :: 0 .. 359.x
+const byte CMD_SADI_PITCH1 = 5
+const byte CMD_SADI_PITCH2 = 6
+const byte CMD_SADI_PITCH3 = 7
+const byte CMD_OFFFLAG     = 8     -- SADI OFF flag
+--
+-- "low level" commands :: SIN/COS data
+const byte CMD_SIN_1       = 9     -- indicator *SINE*     0 .. 255
+const byte CMD_SIN_2       = 10    --                     256 .. 511
+const byte CMD_SIN_3       = 11    --                     511 .. 767
+const byte CMD_SIN_4       = 12    --                     768 .. 1023
+const byte CMD_COS_1       = 13    -- indicator *COSINE*   0 .. 255
+const byte CMD_COS_2       = 14    --                     256 .. 511
+const byte CMD_COS_3       = 15    --                     512 .. 767
+const byte CMD_COS_4       = 16    --                     768 .. 1023
+const byte CMD_LOAD        = 17    -- setpoint indicator identification
+--
+-- LOAD identifiers
+const byte LOAD_SADI_ROLL  = 0     -- do NOT change !
+const byte LOAD_SADI_PITCH = 1
+const byte LOAD_DVC_2      = 2
+const byte LOAD_DVC_3      = 3
+--
+const byte CMD_DVC2OUT     = 18    -- digital output for DEVICE 3/4
+--
+const byte CMD_P2C_SIN_R1  = 19    -- PULL-TO-CAGE roll sin/cos setpoint
+const byte CMD_P2C_SIN_R2  = 20
+const byte CMD_P2C_SIN_R3  = 21
+const byte CMD_P2C_SIN_R4  = 22
+const byte CMD_P2C_COS_R1  = 23
+const byte CMD_P2C_COS_R2  = 24
+const byte CMD_P2C_COS_R3  = 25
+const byte CMD_P2C_COS_R4  = 26
+const byte CMD_P2C_SIN_P1  = 27    -- PULL-TO-CAGE pitch sin/cos setpoint
+const byte CMD_P2C_SIN_P2  = 28
+const byte CMD_P2C_SIN_P3  = 29
+const byte CMD_P2C_SIN_P4  = 30
+const byte CMD_P2C_COS_P1  = 31
+const byte CMD_P2C_COS_P2  = 32
+const byte CMD_P2C_COS_P3  = 33
+const byte CMD_P2C_COS_P4  = 34
+--
+const byte CMD_WTCHDOG_DIS = 35    -- disabled watchdog
+const byte CMD_WTCHDOG_ENA = 36    -- enable watchdog
+const byte CMD_DIAGMODE    = 37    -- set diagnostic LED operating mode
+--
+const byte CMD_LASTVAL     = 37    -- last valid command for DOA
+--
+-- USB only commands
+const byte CMD_IDENTIFY    = (CMD_LASTVAL+1)   -- USB only: send identification
+const byte CMD_USB_DEBUG   = (CMD_LASTVAL+2)   -- USB only: enable debug output
+
+
+
+-- =============================================================================
+-- ** Application administration variables
+-- =============================================================================
+
+-- USB_DOA communication port selection (USB/DOA input jumper)
+const byte USE_USB         = 0              ; jumper installed
+const byte USE_DOA         = 1              ; no jumper installed
+var byte   commPort                         ; selected port at startup
+
+const byte ROLL_AXIS       = 0              ; ROLL uses sin2/cos2
+const byte PITCH_AXIS      = 1              ; PITCH uses sin1/cos1
+const byte DVC2_AXIS       = 2              ; DEVICE 2 uses sin3/cos3
+const byte DVC3_AXIS       = 3              ; DEVICE 3 uses sin4/cos4
+
+var byte   cycleAxis                        ; avoid axis starvation
+
+-- setpoint variables
+var word   newSinSetpoint                   ; sine setpoint *value*
+var word   newCosSetpoint                   ; cosine setpoint *value*
+var word   p2cRollSinSetpoint               ; pull2cage ROLL sin setpoint
+var word   p2cRollCosSetpoint               ; pull2cage ROLL cos setpoint
+var word   p2cPitchSinSetpoint              ; pull2cage PITCH sin setpoint
+var word   p2cPitchCosSetpoint              ; pull2cage PITCH cos setpoint
+
+-- cyclic buffers to store new setpoints (sin & cos pair)
+const byte MAX_NO_SETPOINTS = 20*2
+
+var word   q1SetpointBuffer[MAX_NO_SETPOINTS+2]
+var word   q2SetpointBuffer[MAX_NO_SETPOINTS+2]
+var word   q3SetpointBuffer[MAX_NO_SETPOINTS+2]
+var word   q4SetpointBuffer[MAX_NO_SETPOINTS+2]
+var byte   q1HeadIndex
+var byte   q2HeadIndex
+var byte   q3HeadIndex
+var byte   q4HeadIndex
+var byte   q1TailIndex
+var byte   q2TailIndex
+var byte   q3TailIndex
+var byte   q4TailIndex
+
+-- SPI data transmission to DACs (mutual exclusive)
+var byte   setpointToDAC1Active            ; indicates transmission in progress
+var byte   setpointToDAC2Active
+var byte   setpointToDAC3Active
+var byte   setpointToDAC4Active
+
+
+include delay
+include timer0_isr_interval    -- timer0 for interval ticks
+include sadi-watchdog          -- communication watchdog
+include sadi-doa               -- PHCC DOA receiver routine
+include sadi-usb               -- USB handler
+include sadi-led               -- DIAG LED routines
+include sadi-code              -- process received commands
+
+
+-- =============================================================================
+-- START OF SADI INTERFACE PROGRAM
+-- =============================================================================
+
+BSR = 0                                   -- set bank select register to default
+INTCON_GIE = FALSE                        -- disable all interrupts
+enable_digital_io()                       -- all I/O pins set to digital
+INTCON = 0                                -- all interrupts disabled
+
+initSPIhardware()                         -- SPI hardware control lines
+initDOA()                                 -- init DOA communication variables
+initUSB()                                 -- init USB communication variables
+initDiagLED()                             -- diagnostic LED initialization
+set_delay(HEARTBEAT_SLOT, flashRate)      -- start heartbeat blinking
+
+DIGOUT            = 0                     -- set outputs to inactive state
+OFFFLAG           = 0                     -- power up: OFF flag shown
+
+initQindexes()                            -- init setpoint buffer indexes
+initDACaccess()                           -- init DAC access control flags
+initP2Csetpoint()                         -- init PULL-TO-CAGE sin/cos setpoints
+
+p2cState          = P2C_IDLE              -- init PULL TO CAGE state machine var
+prevISRcounter    = 0
+
+RCON_IPEN         = 0           ; disable priority levels on interrupts
+-- PIR1_SSPIF     = 0           ; clear SPI interrupt flag
+-- PIE1_SSPIE     = 1           ; enable SPI interrupt
+INTCON2_INTEDG2   = 1           ; external INT2 interrupt on rising edge (DOA)
+INTCON3_INT2IF    = 0           ; clear INT2 (DOA) interrupt flag
+timer0_isr_init()               ; initialize timer0 (also enables interrupts)
+INTCON_GIE        = 1           ; (IPEN=0) enable unmasked interrupts
+INTCON_PEIE       = 1           ; (IPEN=0) enable unmasked peripheral interrupts
+
+
+-- startup phase: set selected communication port and DIAG LED flash rate
+
+if (USB_DOA == USE_USB) then
+    commPort       = USE_USB
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = STARTUP_FLASHRATE
+    chkUSBconnect  = TRUE
+    wtchdogState   = WTCHDOG_DISABLED   -- USB DEFAULT watchdog state: disabled
+    INTCON3_INT2IE = 0                  -- disable INT2 (DOA) external interrupt
+else
+    commPort       = USE_DOA
+    diagLEDuse     = DIAGLED_HEARTBEAT
+    flashRate      = DOA_RESET_RATE     -- indicate initial 1 sec delay
+    chkUSBconnect  = FALSE
+    wtchdogState   = WTCHDOG_ENABLED    -- DOA DEFAULT watchdog state: enabled
+    INTCON3_INT2IE = 1                  -- enable INT2 (DOA) external interrupt
+end if
+
+-- watchdog
+wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT    -- initialize watchdog
+commRestartWatchdog()                       -- start comm protocol watchdog
+
+initSPIcontrol()                            -- initialize DAC load state machine
+
+forever loop
+   -- for PHCC : the DOA communication can start immediately
+   -- for USB  : first check that the USB connection is made
+
+   if (chkUSBconnect == TRUE) then
+      -- check periodically for USB connection active
+      diagLEDheartBeat()                                 ; update DIAG LED state
+      if (isr_counter != prevISRcounter) then
+         -- one (or more) timer tick elapsed
+         prevISRcounter = isr_counter
+--       if (usb_cdc_line_status() != 0x00) then          ; check_comm_active()
+         if (VsenseIN) then                               ; check_comm_active()
+            chkUSBconnect = FALSE
+            -- USB connection established: setup USB serial library
+            usb_serial_init()
+            flashRate = USB_FLASH_RATE
+         end if
+      end if
+   else
+      -- main loop: startup phase for USB done -- OR -- PHCC DOA selected
+     if (commPort == USE_USB) then
+        -- USB communication
+        -- keep checking whether USB is still connected!
+        if (VsenseIN) then           ; was: if (usb_cdc_line_status() != 0) then
+           handleUSBcommunication()
+           if (USBcmdReceived == TRUE) then
+              USBcmdReceived = FALSE
+              commandCode = USBrxByte1
+              commandData = USBrxByte2
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        else
+           -- USB connection lost -> restart USB connection setup loop
+           chkUSBconnect  = TRUE
+           flashRate      = STARTUP_FLASHRATE
+           diagLEDuse     = DIAGLED_HEARTBEAT  -- make sure the DIAG LED flashes
+           prevISRcounter = 0
+        end if
+     else
+        -- PHCC DOA communication
+        -- ignore "possible garbage" at power up
+        if (flashRate != DOA_RESET_RATE) then
+           if (DOAcmdReceived == TRUE) then
+              DOAcmdReceived = FALSE
+              commandCode = subaddress
+              commandData = databyte
+              if (diagLEDuse == DIAGLED_MSG_ACK) then
+                 DIAGLED = !DIAGLED
+              end if
+              processCommand()
+           end if
+        end if
+     end if
+
+     -- execute actions (if required)
+     diagLEDheartBeat()          ; update DIAG LED state if in "heart beat" mode
+     commCheckWatchdog()         ; check communication protocol watchdog
+     updateSetpoints()           ; set new setpoint (if available)
+     processSPIloading()         ; send data to DACs (if active)
+     checkPullToCage()           ; check for PULL TO CAGE knob activated
+
+   end if
+end loop
+
+
+-- =============================================================================
+
+-- Interrupt routine for the DOA serial communication and SPI processing.
+-- As all defined interrupt routines are called whenever any interrupt occurs,
+-- it is the responsibility of each interrupt routine to check if the
+-- interrupt was "for him".
+
+procedure interruptHandler is
+  pragma INTERRUPT
+
+  if ( INTCON3_INT2IF ) then
+      processDOAinterrupt()
+  end if
+  
+  -- if ( PIR1_SSPIF ) then
+  --     processSPIinterrupt()
+  -- end if
+end procedure
+

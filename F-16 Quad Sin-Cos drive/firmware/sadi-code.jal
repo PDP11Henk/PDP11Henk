@@ -1,0 +1,668 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Standby Attitude Direction Indicator (SADI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: sadi-code
+--
+--    this module contains the circular buffers to store setpoints, the
+--    conversion of a 10-bit "angle" to sine/cosine signals for the SADI, the
+--    SADI PITCH and ROLL, and DEVICE3 and DEVICE 4 position update routine, and
+--    the processing of all other "QSC" commands.
+
+include sadi-sin8bit
+include sadi-dacs
+
+
+procedure initQindexes() is
+    q1HeadIndex = 0
+    q2HeadIndex = 0
+    q3HeadIndex = 0
+    q4HeadIndex = 0
+    q1TailIndex = 0
+    q2TailIndex = 0
+    q3TailIndex = 0
+    q4TailIndex = 0
+end procedure
+
+
+
+procedure initP2Csetpoint() is
+    p2cRollSinSetpoint  = 512     -- roll angle  0°  --> sin = 0 :: value = 512
+    p2cRollCosSetpoint  = 1023    --                     cos = 1 :: value = 1023
+    p2cPitchSinSetpoint = 512     -- pitch angle 0°  --> sin = 0 :: value = 512
+    p2cPitchCosSetpoint = 1023    --                     cos = 1 :: value = 1023
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Accept new sine/cosine setpoint.
+--   parameter in : axis        - device identifier
+--                  sinSetpoint - sine value of the setpoint
+--                  cosSetpoint - cosine value of the setpoint
+--   parameter out: -
+--   description  : The sine and cosine value are stored in the circular buffer
+--                  allocated for the specifiied device (axis identifier).
+--   called from processCommand()
+--
+--   remarks 1 : JAL does not support pointers, so we have to write the queue
+--               handling for each axis as separate code using a case statement
+--           2 : the last location of the buffer is not used. This makes the
+--               identification "buffer full" and "buffer empty" easy.
+--           3 : if no space is available, the new setpoint is simply lost!
+-- -----------------------------------------------------------------------------
+procedure acceptSinCosSetpoint(BYTE in axis,
+                               WORD in sinSetpoint, WORD in cosSetpoint) is
+  var byte nextIndex
+
+  case (axis) of
+      PITCH_AXIS :
+         block
+            nextIndex = q1HeadIndex + 2
+            if (nextIndex >= MAX_NO_SETPOINTS) then
+               nextIndex = 0
+            end if
+            if (nextIndex != q1TailIndex) then
+               q1SetpointBuffer[q1HeadIndex] = sinSetpoint
+               q1SetpointBuffer[q1HeadIndex+1] = cosSetpoint
+               q1HeadIndex = nextIndex
+            end if
+         end block
+
+      ROLL_AXIS :
+         block
+            nextIndex = q2HeadIndex + 2
+            if (nextIndex >= MAX_NO_SETPOINTS) then
+               nextIndex = 0
+            end if
+            if (nextIndex != q2TailIndex) then
+               q2SetpointBuffer[q2HeadIndex] = sinSetpoint
+               q2SetpointBuffer[q2HeadIndex+1] = cosSetpoint
+               q2HeadIndex = nextIndex
+            end if
+         end block
+
+      DVC2_AXIS :
+         block
+            nextIndex = q3HeadIndex + 2
+            if (nextIndex >= MAX_NO_SETPOINTS) then
+               nextIndex = 0
+            end if
+            if (nextIndex != q3TailIndex) then
+               q3SetpointBuffer[q3HeadIndex] = sinSetpoint
+               q3SetpointBuffer[q3HeadIndex+1] = cosSetpoint
+               q3HeadIndex = nextIndex
+            end if
+         end block
+
+      DVC3_AXIS :
+         block
+            nextIndex = q4HeadIndex + 2
+            if (nextIndex >= MAX_NO_SETPOINTS) then
+               nextIndex = 0
+            end if
+            if (nextIndex != q4TailIndex) then
+               q4SetpointBuffer[q4HeadIndex] = sinSetpoint
+               q4SetpointBuffer[q4HeadIndex+1] = cosSetpoint
+               q4HeadIndex = nextIndex
+            end if
+         end block
+  end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Retrieve sine/cosine setpoint.
+--   parameter in : axis     - device identifier
+--   parameter out: sinValue - sine value of the setpoint
+--                  cosValue - cosine value of the setpoint
+--                  setpointAvailable - boolean return value
+--   description  : The sine and cosine value are retrieved from the circular
+--                  buffer allocated for the specifiied device (axis identifier)
+--   called from updateSetpoints()
+--
+--   remarks 1 : JAL does not support pointers, so we have to write the queue
+--               handling for each axis as separate code using a case statement
+--           2 : the last location of the buffer is not used. This makes the
+--               identification "buffer full" and "buffer empty" easy.
+--           3 : if no setpoint is available (buffer is empty), the return
+--               boolean is set to FALSE.
+-- -----------------------------------------------------------------------------
+function retrieveSinCosSetpoint(BYTE in axis,
+                                WORD out sinValue,
+                                WORD out cosValue) return BYTE is
+  var byte nextIndex, setpointAvailable
+
+  setpointAvailable = TRUE
+  case (axis) of
+      PITCH_AXIS :
+         block
+            if (q1HeadIndex == q1TailIndex) then
+               setpointAvailable = FALSE
+            else
+               sinValue = q1SetpointBuffer[q1TailIndex]
+               cosValue = q1SetpointBuffer[q1TailIndex+1]
+               nextIndex = q1TailIndex + 2
+               if (nextIndex >= MAX_NO_SETPOINTS) then
+                  nextIndex = 0
+               end if
+               q1TailIndex = nextIndex
+            end if
+         end block
+
+      ROLL_AXIS :
+         block
+            if (q2HeadIndex == q2TailIndex) then
+               setpointAvailable = FALSE
+            else
+               sinValue = q2SetpointBuffer[q2TailIndex]
+               cosValue = q2SetpointBuffer[q2TailIndex+1]
+               nextIndex = q2TailIndex + 2
+               if (nextIndex >= MAX_NO_SETPOINTS) then
+                  nextIndex = 0
+               end if
+               q2TailIndex = nextIndex
+            end if
+         end block
+
+      DVC2_AXIS :
+         block
+            if (q3HeadIndex == q3TailIndex) then
+               setpointAvailable = FALSE
+            else
+               sinValue = q3SetpointBuffer[q3TailIndex]
+               cosValue = q3SetpointBuffer[q3TailIndex+1]
+               nextIndex = q3TailIndex + 2
+               if (nextIndex >= MAX_NO_SETPOINTS) then
+                  nextIndex = 0
+               end if
+               q3TailIndex = nextIndex
+            end if
+         end block
+
+      DVC3_AXIS :
+         block
+            if (q4HeadIndex == q4TailIndex) then
+               setpointAvailable = FALSE
+            else
+               sinValue = q4SetpointBuffer[q4TailIndex]
+               cosValue = q4SetpointBuffer[q4TailIndex+1]
+               nextIndex = q4TailIndex + 2
+               if (nextIndex >= MAX_NO_SETPOINTS) then
+                  nextIndex = 0
+               end if
+               q4TailIndex = nextIndex
+            end if
+         end block
+  end case
+  return setpointAvailable
+end function
+
+
+
+
+
+
+var word SADIsine
+var word SADIcosine
+
+-- -----------------------------------------------------------------------------
+-- Convert an angle (0..360 degrees) to a sine and cosine value.
+--   parameter in : axis identifier (PITCH_AXIS or ROLL_AXIS)
+--                  angle setpoint (10-bit value, range 0 - 1023)
+--   parameter out: global variables SADIsine, SADIcosine
+--   description  : setAngle's 0 - 1023 represents -180...+180 degrees rotation
+--                  of the axis. The sine lookup table has 256 entries for a
+--                  base angle of 0 .. +90 degrees, and returns sine values
+--                  between 0 and 511.
+--
+--   The DAC has 10-bit resolution for the range of -10V to +10V. These 10 bits
+--   represent 360 degrees rotation. A sine lookup table is used to retrieve the
+--   sine value of a number which represents an angle between 0 and 90 degrees.
+--   Simple math determines the sine value for an angle between 90..360 degrees.
+--   Similar for the cosine value.
+
+--   called from setSADI()
+-- -----------------------------------------------------------------------------
+procedure convertAngle(WORD in angle) is
+;
+; SimTek datasheet 10-0335-01
+;
+;   PITCH angle   drum actual
+;    indicated     degrees       sin      cos
+;  -----------------------------------------------
+;     CLIMB  90      180       +10.000     0.000
+;     CLIMB  45       90        +7.071    +7.071
+;     CLIMB  30       60        +5.000    +8.660
+;     CLIMB  20       40        +3.420    +9.397
+;     CLIMB  10       20        +1.736    +9.848
+;       0     0       0          0.000   +10.000
+;      DIVE  10      340        -1.736    +9.848
+;      DIVE  20      320        -3.420    +9.397
+;      DIVE  30      300        -5.000    +5.000
+;      DIVE  45      270        -7.071    +7.071
+;      DIVE  90      180       -10.000     0.000
+;
+;
+;    ROLL angle   drum actual
+;    indicated      degrees       sin      cos
+;  -----------------------------------------------
+;      LEFT  90      270       -10.000     0.000
+;      LEFT  60      300        -8.660    +5.000
+;      LEFT  30      330        -5.000    +8.660
+;      LEFT  10      350        -1.736    +9.848
+;       0     0       0          0.000   +10.000
+;     RIGHT  10       10        +1.736    +9.848
+;     RIGHT  30       30        +5.000    +8.660
+;     RIGHT  60       60        +8.660    +5.000
+;     RIGHT  90       90       +10.000    +0.000
+;
+; ----------------------------------------------------------------------------
+;
+;                   0                        512                      1023
+;   specified data  |-------------------------|-------------------------|
+;   degrees         -90   DIVE / ROLL LEFT    0   CLIMB / ROLL RIGHT   +90
+;
+;
+;
+;   PITCH (Volts)   -10.......................0.......................+10 sin
+;                   0........................+10........................0 cos
+;
+;
+;   ROLL (Volts)    -10.......................0.......................+10 sin
+;                   0........................+10........................0 cos
+;
+
+  var word sinAngle, cosAngle
+
+  -- determine sine and cosine value of angle
+  if (angle < 256) then
+     ; 0 .. 255
+     SADIsine = 511- sine[angle]
+     cosAngle = 255 - angle
+     SADIcosine = 511 - sine[cosAngle]
+  elsif (angle < 512) then
+     ; 256 .. 511
+     sinAngle = 511 - angle
+     SADIsine = 511 - sine[sinAngle]
+     cosAngle = angle - 256
+     SADIcosine = 512 + sine[cosAngle]
+  elsif (angle < 768) then
+     ; 512 .. 767
+     sinAngle = angle - 512
+     SADIsine = 512 + sine[sinAngle]
+     cosAngle = 767 - angle
+     SADIcosine = 512 + sine[cosAngle]
+  else
+     ; 768 .. 1023
+     sinAngle = 1023 - angle
+     SADIsine = 512 + sine[sinAngle]
+     cosAngle = angle - 768
+     SADIcosine = 511 - sine[cosAngle]
+  end if
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Set SADI (new) *angle* setpoint.
+--   parameter in : axis identifier (PITCH_AXIS or ROLL_AXIS)
+--                  angle setpoint
+--   parameter out: -
+--   description  : setAngle is the 10-bit setpoint angle where 0 :: 0° and
+--                  1024 :: 360°. The DAC output generates a voltage between 0V
+--                  and +5V. As the SimTek SADI requires a sine/cosine control
+--                  voltage between -10V and +10V, the QSC board has voltage
+--                  level-shifters and amplifiers for all signals.
+--   called from processCommand()
+-- -----------------------------------------------------------------------------
+procedure setSADI(BYTE in axis, WORD in setAngle) is
+
+  convertAngle(setAngle)                             -- convert angle to sin/cos
+  acceptSinCosSetpoint(axis, SADIsine, SADIcosine)   -- store in circular buffer
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Set (new) setpoint.
+--   parameter in : -
+--   parameter out: -
+--   description  : This procedure is called repetitively from main().
+--                  The variable "cycleAxis" cycles through the four axes, thus
+--                  every call of this function will process a setpoint (if
+--                  available) from the "next" axis. A possible "starvation" of
+--                  an axis might be avoided with this mechanism.
+--                  A new setpoint output is only issued if no other setpoint
+--                  output is active. When a new setpoint can be sent to the DAC
+--                  the appropriate "setpointToDACxActive" boolean is set, and
+--                  then the "axisSetpoint" is called. Due to the boolean, the
+--                  function "axisSetpoint" is "atomic".
+--                  => The boolean MUST be cleared when the DAC has been loaded.
+--   called from main()
+-- -----------------------------------------------------------------------------
+procedure updateSetpoints() is
+  var word loadSinDAC, loadCosDAC
+
+  if ((setpointToDAC1Active == FALSE) & (setpointToDAC2Active == FALSE) &
+      (setpointToDAC3Active == FALSE) & (setpointToDAC4Active == FALSE) ) then
+      cycleAxis = (cycleAxis + 1) & 0x03
+      -- cycleAxis can only have the same values as the axis identifiers
+      case (cycleAxis) of
+          PITCH_AXIS :
+             block
+                if (retrieveSinCosSetpoint(PITCH_AXIS, loadSinDAC, loadCosDAC)
+                    == TRUE) then
+                   setpointToDAC1Active = TRUE
+                   axisSetpoint(PITCH_AXIS, loadSinDAC, loadCosDAC)
+                end if
+             end block
+
+          ROLL_AXIS :
+             block
+                if (retrieveSinCosSetpoint(ROLL_AXIS, loadSinDAC, loadCosDAC)
+                    == TRUE) then
+                    setpointToDAC2Active = TRUE
+                    axisSetpoint(ROLL_AXIS, loadSinDAC, loadCosDAC)
+                end if
+             end block
+
+          DVC2_AXIS :
+             block
+                if (retrieveSinCosSetpoint(DVC2_AXIS, loadSinDAC, loadCosDAC)
+                    == TRUE) then
+                    setpointToDAC3Active = TRUE
+                    axisSetpoint(DVC2_AXIS, loadSinDAC, loadCosDAC)
+                end if
+             end block
+
+          DVC3_AXIS :
+             block
+                if (retrieveSinCosSetpoint(DVC3_AXIS, loadSinDAC, loadCosDAC)
+                    == TRUE) then
+                    setpointToDAC3Active = TRUE
+                    axisSetpoint(DVC3_AXIS, loadSinDAC, loadCosDAC)
+                end if
+             end block
+      end case
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Check whether PULL TO CAGE knob - set SADI "horizontal-leveled".
+--   parameter in : -
+--   parameter out: -
+--   description  : This procedure maintains a state machine to debounce the
+--                  "PULL TO CAGE" switch of the SADI. When after debouncing the
+--                  switch is active, the sine/cosine values for PITCH and ROLL
+--                  are added to the circulare buffer. Ths will result that the
+--                  SADI will be set to "horizontal-leveled". After this action,
+--                  the state machine also takes care of debouncing of reverting
+--                  to the "idle" state.
+--                  Debouncing avoids multiple "horizontal-leveled" setpoints.
+--                  One is enough :->
+--   called from main()
+--
+--   remark : the PULL TOP CAGE switch is "active LOW".
+-- -----------------------------------------------------------------------------
+procedure checkPullToCage() is
+  case (p2cState) of
+      P2C_IDLE :
+          block
+             if (PULL2CAGE == 0) then
+                -- PULL TO CAGE knob pulled: set SADI "horizontal-leveled"
+                acceptSinCosSetpoint(PITCH_AXIS,
+                                     p2cPitchSinSetpoint, p2cPitchCosSetpoint)
+                acceptSinCosSetpoint(ROLL_AXIS,
+                                     p2cRollSinSetpoint, p2cRollCosSetpoint)
+                debounceCount = 10                    ; check debounce 10x
+                p2cState = P2C_DEBOUNCE
+                set_delay(CAGE_DEBOUNCE_SLOT, 200)    ; start check after 200 ms
+             end if
+          end block
+
+      P2C_DEBOUNCE :
+          block
+             if ( check_delay(CAGE_DEBOUNCE_SLOT) ) then
+                -- debounce timer expired: check PULL TO CAGE knob "state"
+                if (PULL2CAGE == 0) then
+                   -- switch still active: start debounce cycle all over again
+                   debounceCount = 10
+                   set_delay(CAGE_DEBOUNCE_SLOT, 50)  ; check after 50 ms
+                else
+                   -- switch is inactive
+                   if (debounceCount == 0) then
+                      -- switch debounced: back to idle state
+                      p2cState = P2C_IDLE
+                   else
+                      -- check for full debounce time period
+                      debounceCount = debounceCount - 1
+                      set_delay(CAGE_DEBOUNCE_SLOT, 50)  ; check after 50 ms
+                   end if
+                end if
+             end if
+          end block
+
+      otherwise block
+                   p2cState = P2C_IDLE
+                end block
+  end case
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte IDbyte
+  var word setAngle
+
+  case (commandCode) of
+      CMD_SADI_PITCH0 : block
+                           setAngle = word(commandData)
+                           setSADI(PITCH_AXIS, setAngle)
+                        end block
+      CMD_SADI_PITCH1 : block
+                           setAngle = word(commandData) + 256
+                           setSADI(PITCH_AXIS, setAngle)
+                        end block
+      CMD_SADI_PITCH2 : block
+                           setAngle = word(commandData) + 512
+                           setSADI(PITCH_AXIS, setAngle)
+                        end block
+      CMD_SADI_PITCH3 : block
+                           setAngle = word(commandData) + 768
+                           setSADI(PITCH_AXIS, setAngle)
+                        end block
+      CMD_SADI_ROLL0  : block
+                           setAngle = word(commandData)
+                           setSADI(ROLL_AXIS, setAngle)
+                        end block
+      CMD_SADI_ROLL1  : block
+                           setAngle = word(commandData) + 256
+                           setSADI(ROLL_AXIS, setAngle)
+                        end block
+      CMD_SADI_ROLL2  : block
+                           setAngle = word(commandData) + 512
+                           setSADI(ROLL_AXIS, setAngle)
+                        end block
+      CMD_SADI_ROLL3  : block
+                           setAngle = word(commandData) + 768
+                           setSADI(ROLL_AXIS, setAngle)
+                        end block
+      CMD_OFFFLAG  : block
+                        if (commandData == 0) then  OFFFLAG = 0 end if
+                        if (commandData == 1) then  OFFFLAG = 1 end if
+                     end block
+--
+--    direct SINE/COSINE value setpoint & LOAD commands
+      CMD_SIN_1    : block  newSinSetpoint = word(commandData)        end block
+      CMD_SIN_2    : block  newSinSetpoint = word(commandData) + 256  end block
+      CMD_SIN_3    : block  newSinSetpoint = word(commandData) + 512  end block
+      CMD_SIN_4    : block  newSinSetpoint = word(commandData) + 768  end block
+      CMD_COS_1    : block  newCosSetpoint = word(commandData)        end block
+      CMD_COS_2    : block  newCosSetpoint = word(commandData) + 256  end block
+      CMD_COS_3    : block  newCosSetpoint = word(commandData) + 512  end block
+      CMD_COS_4    : block  newCosSetpoint = word(commandData) + 768  end block
+      CMD_LOAD     : block
+                        case (commandData) of
+                          PITCH_AXIS :
+                             block
+                                acceptSinCosSetpoint(PITCH_AXIS,
+                                                     newSinSetpoint,
+                                                     newCosSetpoint)
+                             end block
+                          ROLL_AXIS :
+                             block
+                                acceptSinCosSetpoint(ROLL_AXIS,
+                                                     newSinSetpoint,
+                                                     newCosSetpoint)
+                             end block
+                          DVC2_AXIS :
+                             block
+                                acceptSinCosSetpoint(DVC2_AXIS,
+                                                     newSinSetpoint,
+                                                     newCosSetpoint)
+                             end block
+                          DVC3_AXIS :
+                             block
+                                acceptSinCosSetpoint(DVC3_AXIS,
+                                                     newSinSetpoint,
+                                                     newCosSetpoint)
+                             end block
+                        end case
+                     end block
+--
+      CMD_DVC2OUT     : block
+                           if (commandData == 0) then  DIGOUT = 0 end if
+                           if (commandData == 1) then  DIGOUT = 1 end if
+                        end block
+--
+--    define ROLL/PITCH PULL-TO-CAGE setpoints
+      CMD_P2C_SIN_R1  : block
+                           p2cRollSinSetpoint = word(commandData)
+                        end block
+      CMD_P2C_SIN_R2  : block
+                           p2cRollSinSetpoint = word(commandData) + 256
+                        end block
+      CMD_P2C_SIN_R3  : block
+                           p2cRollSinSetpoint = word(commandData) + 512
+                        end block
+      CMD_P2C_SIN_R4  : block
+                           p2cRollSinSetpoint = word(commandData) + 768
+                        end block
+      CMD_P2C_COS_R1  : block
+                           p2cRollCosSetpoint = word(commandData)
+                        end block
+      CMD_P2C_COS_R2  : block
+                           p2cRollCosSetpoint = word(commandData) + 256
+                        end block
+      CMD_P2C_COS_R3  : block
+                           p2cRollCosSetpoint = word(commandData) + 512
+                        end block
+      CMD_P2C_COS_R4  : block
+                           p2cRollCosSetpoint = word(commandData) + 768
+                        end block
+      CMD_P2C_SIN_P1  : block
+                           p2cPitchSinSetpoint = word(commandData)
+                        end block
+      CMD_P2C_SIN_P2  : block
+                           p2cPitchSinSetpoint = word(commandData) + 256
+                        end block
+      CMD_P2C_SIN_P3  : block
+                           p2cPitchSinSetpoint = word(commandData) + 512
+                        end block
+      CMD_P2C_SIN_P4  : block
+                           p2cPitchSinSetpoint = word(commandData) + 768
+                        end block
+      CMD_P2C_COS_P1  : block
+                           p2cPitchCosSetpoint = word(commandData)
+                        end block
+      CMD_P2C_COS_P2  : block
+                           p2cPitchCosSetpoint = word(commandData) + 256
+                        end block
+      CMD_P2C_COS_P3  : block
+                           p2cPitchCosSetpoint = word(commandData) + 512
+                        end block
+      CMD_P2C_COS_P4  : block
+                           p2cPitchCosSetpoint = word(commandData) + 768
+                        end block
+--
+      CMD_WTCHDOG_DIS : block
+                            wtchdogState = WTCHDOG_DISABLED
+                        end block
+      CMD_WTCHDOG_ENA : block
+                           if ((commandData & 0x3F) == 0x00) then
+                               -- set default timeout value
+                               wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+                           else
+                               wtchdogDelayValue = word(commandData & 0x3F)
+                           end if
+                           if ((commandData & 0xC0) == 0x80) then
+                               -- enable watchdog
+                               wtchdogState = WTCHDOG_ENABLED
+                               set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                           end if
+                           if ((commandData & 0xC0) == 0x00) then
+                               -- disable watchdog
+                               wtchdogState = WTCHDOG_DISABLED
+                           end if
+                        end block
+--
+      CMD_DIAGMODE : block
+                        if (flashRate != DOA_RESET_RATE) then
+                           -- do not accept DIAG commands during DOA power-up
+                           setDiagLEDmode(commandData)
+                        end if
+                     end block
+--
+      -- USB test
+      CMD_IDENTIFY  : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            usb_serial_data = "Q"
+                            usb_serial_data = "S"
+                            usb_serial_data = "C"
+                            usb_serial_data = " "
+                            usb_serial_data = "v"
+                            usb_serial_data = "0" + MAJOR_VERSION
+                            usb_serial_data = "."
+                            usb_serial_data = "0" + MINOR_VERSION
+                            usb_serial_data = " "
+                            usb_serial_data = "$"
+                            IDbyte = ((SADI_ADDR >> 4) & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            IDbyte = (SADI_ADDR & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            usb_serial_data = ASCII_CR                ; add CR
+                            usb_serial_data = ASCII_LF                ; add LF
+                         end if
+                      end block
+      -- USB debug
+      CMD_USB_DEBUG : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            if (commandData == "N") then
+                               USBdebugEnabled = FALSE
+                            elsif (commandData == "Y") then
+                               USBdebugEnabled = TRUE
+                            end if
+                         end if
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

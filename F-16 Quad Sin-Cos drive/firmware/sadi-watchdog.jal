@@ -1,0 +1,45 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Standby Attitude Direction Indicator (SADI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: sadi-watchdog : communication watchdog routines
+
+procedure commRestartWatchdog() is
+   if (wtchdogState == WTCHDOG_ENABLED) then
+      set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+   end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- communication watchdog check (based on timer) - called from main()
+-- -----------------------------------------------------------------------------
+procedure commCheckWatchdog() is
+   if (wtchdogState == WTCHDOG_ENABLED) then
+      if ( check_delay(COMM_WATCHDOG_SLOT) ) then
+         -- try to avoid spurious interrupt processing: state machine in "idle"
+         USB_RXstate = USB_STATE_RESET
+         -- watchdog enabled and time out occurred.
+         -- OK to reset DOA & USB protocol state machine and reset variables.
+         -- Note that USB reception is based on polling, thus a reset is safe
+         -- to execute (on a single-processor system). However, DOA is based on
+         -- an interrupt, so the interrupt must be disabled before the update
+         -- is executed, to prevent corruption.
+         INTCON3_INT2IE = 0                      -- disable INT2 (DOA) interrupt
+                                                 -- (for USB: already disabled)
+         if (commPort == USE_DOA) then
+               bitcounter     = 7
+               DOA_address    = 0
+               DOA_subaddr    = 0
+               DOA_databyte   = 0
+               DOA_RXstate    = DOA_STATE_ADDRESS
+               INTCON3_INT2IE = 1                 -- enable INT2 (DOA) interrupt
+         else  -- commPort == USE_USB
+               USB_RXstate    = USB_STATE_IDLE
+         end if
+         set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+      end if
+   end if
+end procedure
+

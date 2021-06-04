@@ -1,0 +1,308 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Standby Attitude Direction Indicator (SADI) control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: sadi-dacs
+--
+--    this module contains the actual requested setpoint loading to the DACs.
+--
+--    The "setpoint" function has 3 input parameters, the sine/cosine amplitude
+--    settings and the axis identifier. This data is stored in an array and then
+--    "startLoadPitchDAC" or "startLoadRollDAC" is called depending on the axis.
+--    These routines send the first data to the appropriate (axis) DAC and
+--    sets the state machine variable "loadState". Via the "processSPIloading()"
+--    routine called from main() the successive word is sent to the DAC with the
+--    correct CS pulses and LDAC pulse.
+--    When the transmit cycle is complete the appropriate flag
+--    "setpointToDAC1Active" (PITCH) / "setpointToDAC2Active" (ROLL) is cleared.
+
+
+var byte   sinData[8]         -- holds amplitude data for sine setpoint value
+var byte   cosData[8]         -- holds amplitude data for cosine setpoint value
+var byte   loadState          -- DAC loading state machine variable
+
+  ; loadState values
+const byte DAC_LOAD_IDLE      = 0     -- no data loading in progress
+const byte DAC_LOAD_SIN1      = 1     -- sending sine word to DAC#1 output (A)
+const byte DAC_LOAD_SIN2      = 2     -- sending sine word to DAC#2 output (A)
+const byte DAC_LOAD_SIN3      = 3     -- sending sine word to DAC#3 output (A)
+const byte DAC_LOAD_SIN4      = 4     -- sending sine word to DAC#4 output (A)
+const byte DAC_LOAD_COS1      = 5     -- sending cosine word to DAC#1 output (B)
+const byte DAC_LOAD_COS2      = 6     -- sending cosine word to DAC#2 output (B)
+const byte DAC_LOAD_COS3      = 7     -- sending cosine word to DAC#3 output (B)
+const byte DAC_LOAD_COS4      = 8     -- sending cosine word to DAC#4 output (B)
+
+
+
+procedure initSPIhardware() is
+    CS_DAC_S1  = 1                    -- CS* DAC sin1/cos1 amplitude output
+    CS_DAC_S2  = 1                    -- CS* DAC sin2/cos2 amplitude output
+    CS_DAC_S3  = 1                    -- CS* DAC sin3/cos3 amplitude output
+    CS_DAC_S4  = 1                    -- CS* DAC sin4/cos4 amplitude output
+    LOADDAC1   = 1                    -- LDAC* sin1/cos1
+    LOADDAC2   = 1                    -- LDAC* sin2/cos2
+    LOADDAC3   = 1                    -- LDAC* sin3/cos3
+    LOADDAC4   = 1                    -- LDAC* sin4/cos4
+    SPI_SCK    = 0                    -- SPI clock inactive level
+end procedure
+
+
+
+procedure initDACaccess() is
+    setpointToDAC1Active = FALSE
+    setpointToDAC2Active = FALSE
+    setpointToDAC3Active = FALSE
+    setpointToDAC4Active = FALSE
+end procedure
+
+
+
+procedure initSPIcontrol() is
+  loadState = DAC_LOAD_IDLE
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- Load DAC with first data byte for requested axis.
+--   parameter in : axis      - device identifier
+--                  SPIdataHI -
+--                  SPIdataLO -
+--   parameter out: -
+--   description  : send the data byte to the DAC using "bit-banging".
+--                  It is a generic routine, starting with asserting the
+--                  appropriate CS of the DAC identified by the axisID. The data
+--                  bits are subsequently loaded and clocked into the DAC.
+--                  The CS of the DAC is negated after the last bit.
+--   called from startLoadDAC()
+--   remark       : the appropriate "setpointToDACxActive" boolean is set, thus
+--                  all actions are "atomic".
+-- -----------------------------------------------------------------------------
+procedure sendSPIdata(BYTE in axisID, BYTE in SPIdataHI, BYTE in SPIdataLO) is
+
+  var byte bitmask
+
+  ; assert appropriate DAC CS*
+  case (axisID) of
+      PITCH_AXIS : block   CS_DAC_S1 = 0  end block
+      ROLL_AXIS :  block   CS_DAC_S2 = 0  end block
+      DVC2_AXIS :  block   CS_DAC_S3 = 0  end block
+      DVC3_AXIS :  block   CS_DAC_S4 = 0  end block
+  end case
+
+  ASM nop       -- CS settling time
+  ASM nop
+  ASM nop
+  bitmask = 0x80        -- setup bit position to be sent
+  while (bitmask != 00) loop
+      -- bit-bang the HI data byte
+      if ((SPIdataHI & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+      ASM nop
+      ASM nop
+      SPI_SCK = 1       -- assert clock
+      ASM nop
+      ASM nop
+      SPI_SCK = 0       -- negate clock
+      bitmask = bitmask >> 1
+      ASM nop
+  end loop
+
+  bitmask = 0x80        -- setup bit position to be sent
+  while (bitmask != 00) loop
+      -- bit-bang the LO data byte
+      if ((SPIdataLO & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+      ASM nop
+      ASM nop
+      SPI_SCK = 1       -- assert clock
+      ASM nop
+      ASM nop
+      SPI_SCK = 0       -- negate clock
+      bitmask = bitmask >> 1
+      ASM nop
+  end loop
+  ASM nop
+
+  ; negate appropriate DAC CS*
+  case (axisID) of
+      PITCH_AXIS : block   CS_DAC_S1 = 1  end block
+      ROLL_AXIS :  block   CS_DAC_S2 = 1  end block
+      DVC2_AXIS :  block   CS_DAC_S3 = 1  end block
+      DVC3_AXIS :  block   CS_DAC_S4 = 1  end block
+  end case
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Start DAC loading sequence for requested axis.
+--   parameter in : axis   - device identifier
+--   parameter out: -
+--   description  : initiate the transfer of the 4 bytes to the DAC. The bytes
+--                  are stored in the arrays sinData and cosData. The first byte
+--                  transfer is initiated here, the remaining 3 are handled via
+--                  the main loop calling processSPIloading().
+--   called from axisSetpoint()
+--   remark       : the appropriate "setpointToDACxActive" boolean is set, thus
+--                  all actions are "atomic".
+-- -----------------------------------------------------------------------------
+procedure startLoadDAC(BYTE in axis) is
+  case (axis) of
+      PITCH_AXIS :
+         block
+            loadState  = DAC_LOAD_SIN1
+            -- send data word to DAC #1
+            sendSPIdata(PITCH_AXIS, sinData[0], sinData[1])
+         end block
+
+      ROLL_AXIS :
+         block
+            loadState  = DAC_LOAD_SIN2
+            -- send data word to DAC #2
+            sendSPIdata(ROLL_AXIS, sinData[2], sinData[3])
+         end block
+
+      DVC2_AXIS :
+         block
+            loadState  = DAC_LOAD_SIN3
+            -- send data word to DAC #3
+            sendSPIdata(DVC2_AXIS, sinData[4], sinData[5])
+         end block
+
+      DVC3_AXIS :
+         block
+            loadState  = DAC_LOAD_SIN4
+            -- send data word to DAC #4
+            sendSPIdata(DVC3_AXIS, sinData[6], sinData[7])
+         end block
+  end case
+end procedure
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Load new axis setpoint values (sin/cos pair).
+--   parameter in : axis   - device identifier
+--                  sine   - sine value of the setpoint
+--                  cosine - cosine value of the setpoint
+--   parameter out: -
+--   description  : the supplied sine and cosine data are stored in the local
+--                  arrays sinData and cosData, after the bit manipulations so
+--                  that the data is correct for immediate DAC register loading.
+--   called from updateSetpoints()
+--   remark       : the appropriate "setpointToDACxActive" boolean is set, thus
+--                  all actions are "atomic".
+-- -----------------------------------------------------------------------------
+procedure axisSetpoint(BYTE in axis, WORD in sine, WORD in cosine) is
+  ; determine the values to be sent to the DACs
+  case (axis) of
+      PITCH_AXIS :
+         block
+           sinData[0] = byte((sine >> 6) & 0x000F) + 0x10      -- DAC A, gain *2
+           sinData[1] = byte((sine << 2) & 0x00FC)
+           cosData[0] = byte((cosine >> 6) & 0x000F) + 0x90    -- DAC B, gain *2
+           cosData[1] = byte((cosine << 2) & 0x00FC)
+           startLoadDAC(PITCH_AXIS)                    ; start DAC load sequence
+        end block
+
+      ROLL_AXIS :
+         block
+           sinData[2] = byte((sine >> 6) & 0x000F) + 0x10      -- DAC A, gain *2
+           sinData[3] = byte((sine << 2) & 0x00FC)
+           cosData[2] = byte((cosine >> 6) & 0x000F) + 0x90    -- DAC B, gain *2
+           cosData[3] = byte((cosine << 2) & 0x00FC)
+           startLoadDAC(ROLL_AXIS)                     ; start DAC load sequence
+         end block
+
+      DVC2_AXIS :
+         block
+           sinData[4] = byte((sine >> 6) & 0x000F) + 0x10      -- DAC A, gain *2
+           sinData[5] = byte((sine << 2) & 0x00FC)
+           cosData[4] = byte((cosine >> 6) & 0x000F) + 0x90    -- DAC B, gain *2
+           cosData[5] = byte((cosine << 2) & 0x00FC)
+           startLoadDAC(DVC2_AXIS)                     ; start DAC load sequence
+         end block
+
+      DVC3_AXIS :
+         block
+           sinData[6] = byte((sine >> 6) & 0x000F) + 0x10      -- DAC A, gain *2
+           sinData[7] = byte((sine << 2) & 0x00FC)
+           cosData[6] = byte((cosine >> 6) & 0x000F) + 0x90    -- DAC B, gain *2
+           cosData[7] = byte((cosine << 2) & 0x00FC)
+           startLoadDAC(DVC3_AXIS)                     ; start DAC load sequence
+         end block
+  end case
+end procedure
+
+
+
+
+procedure processSPIloading() is
+  case (loadState) of
+      DAC_LOAD_IDLE : block
+                        -- nothing to do, no DAC loading active
+                      end block
+      DAC_LOAD_SIN1 : block
+                        loadState = DAC_LOAD_COS1
+                        sendSPIdata(PITCH_AXIS, cosData[0], cosData[1])
+                      end block
+      DAC_LOAD_SIN2 : block
+                        loadState = DAC_LOAD_COS2
+                        sendSPIdata(ROLL_AXIS, cosData[2], cosData[3])
+                      end block
+      DAC_LOAD_SIN3 : block
+                        loadState = DAC_LOAD_COS3
+                        sendSPIdata(DVC2_AXIS, cosData[4], cosData[5])
+                      end block
+      DAC_LOAD_SIN4 : block
+                        loadState = DAC_LOAD_COS4
+                        sendSPIdata(DVC3_AXIS, cosData[6], cosData[7])
+                      end block
+
+      -- sine/cosine pair setpoint loaded into appropriate DAC
+      -- 1. transfer DAC analog values to DAC output (LDAC* pulse)
+      -- 2. clear "setpointToDACxActive" :: end of "atomic" action.
+      DAC_LOAD_COS1 : block
+                        loadState = DAC_LOAD_IDLE
+                        LOADDAC1 = 0
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LOADDAC1 = 1                        -- latch transfer
+                        setpointToDAC1Active = FALSE        -- release lock
+                      end block
+      DAC_LOAD_COS2 : block
+                        loadState = DAC_LOAD_IDLE
+                        LOADDAC2 = 0
+                        ASM nop
+                        ASM nop
+                        ASM nop
+                        LOADDAC2 = 1
+                        setpointToDAC2Active = FALSE
+                      end block
+      DAC_LOAD_COS3 : block
+                        loadState = DAC_LOAD_IDLE
+                        LOADDAC3 = 0
+                        ASM nop
+                        ASM nop
+                        ASM nop
+                        LOADDAC3 = 1
+                        setpointToDAC3Active = FALSE
+                      end block
+      DAC_LOAD_COS4 : block
+                        loadState = DAC_LOAD_IDLE
+                        LOADDAC4 = 0
+                        ASM nop
+                        ASM nop
+                        ASM nop
+                        LOADDAC4 = 1
+                        setpointToDAC4Active = FALSE
+                      end block
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+
