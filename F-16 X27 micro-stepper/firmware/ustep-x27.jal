@@ -1,0 +1,393 @@
+-- -----------------------------------------------------------------------------
+-- Title:  microStepper control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: ustep-x27
+--
+--    this module contains te X27 stepper control software which is based on
+--    the SwitecX27 library for Arduino made by Guy Carpenter.
+
+
+const word MAXSTEP            = 3780 -- 315 degrees 3 steps/degree 4 microsteps
+const word STEP_PULSE_TIME    = 1    -- *1 us (check code when changing value!)
+const byte STEP_TO_STEP_TIME  = 30   -- *10 us
+const dword STEP_TO_STEP_HOME = 400
+const word MAXV               = 300
+
+-- motor control variables
+-- all variables are in an array [0..3]. Index 0::motor#1, .. index 3::motor#4.
+
+var word  currentStep[4]        -- current step position
+var word  targetStep[4]         -- target position moving to
+var word  steps[4]              -- total steps available
+var dword time0[4]              -- time when state was entered
+var word  microDelay[4]         -- number of usec till next state
+var word  maxVel[4]             -- fastest allowed velocity
+var word  vel[4]                -- steps moved under acceleration
+var sbyte dir[4]                -- movement direction (-1, 0, +1)
+var byte  stopped[4]            -- flag, TRUE if stopped.
+var word  stepsToDo[4]          -- homing: max #steps to HOME (against end stop)
+var dword homeTime[4]           -- homing: time for next pulse
+
+var byte  useTable[4]           -- acc/dec table used (0=default / 1=user-def)
+const byte DEFAULT      = 0
+const byte USERDEF      = 1
+
+
+-- motor identifiers
+const BYTE MOTOR1       = 0
+const BYTE MOTOR2       = 1
+const BYTE MOTOR3       = 2
+const BYTE MOTOR4       = 3
+const BYTE MOTOR_NONE   = 4
+
+
+-- acceleration curve definition (one for each motor)
+-- 1st entry is step speed, 2nd entry is delay in usec.
+-- 1st entry in each row must be larger than the 1st entry of the next row.
+-- 1st entry in the last row should be equal to "maxVel", must be <= "maxVel".
+const word defaultAccDecTable_1[] = {   20,  750,
+                                        50,  325,
+                                       100,  150,
+                                       150,  120,
+                                      MAXV,   90  }
+const word defaultAccDecTable_2[] = {   20,  750,
+                                        50,  325,
+                                       100,  150,
+                                       150,  120,
+                                      MAXV,   90  }
+const word defaultAccDecTable_3[] = {   20,  750,
+                                        50,  325,
+                                       100,  150,
+                                       150,  120,
+                                      MAXV,   90  }
+const word defaultAccDecTable_4[] = {   20,  750,
+                                        50,  325,
+                                       100,  150,
+                                       150,  120,
+                                      MAXV,   90  }
+
+
+var word  userDefAccDecTable_1[10]    -- user-defined acc/dec table for motor #1
+var word  userDefAccDecTable_2[10]    -- user-defined acc/dec table for motor #2
+var word  userDefAccDecTable_3[10]    -- user-defined acc/dec table for motor #3
+var word  userDefAccDecTable_4[10]    -- user-defined acc/dec table for motor #4
+
+
+
+procedure initX27data() is
+  var byte ix
+    ix = 0
+    while (ix < 4) loop
+        currentStep[ix] = 0           -- current step position
+        targetStep[ix]  = 0           -- target position moving to
+        vel[ix]         = 0           -- steps moved under acceleration
+        dir[ix]         = 0           -- movement direction (-1, 0, +1)
+        stopped[ix]     = TRUE        -- flag, TRUE if stopped.
+        steps[ix]       = MAXSTEP     -- total steps available
+        maxVel[ix]      = MAXV        -- fastest allowed velocity
+        useTable[ix]    = DEFAULT     -- use default acc/dec table
+        ix = ix + 1
+    end loop
+end procedure
+
+
+
+procedure setX27MaxStep(BYTE in motorID, WORD in maxStepRange) is
+    steps[motorID] = maxStepRange
+end procedure
+
+
+
+procedure changeToDefaultAccDec(BYTE in motorID) is
+    useTable[motorID]    = DEFAULT
+    currentStep[motorID] = 0
+    targetStep[motorID]  = 0
+    vel[motorID]         = 0
+    dir[motorID]         = 0
+    stopped[motorID]     = TRUE
+    maxVel[motorID]      = MAXV
+end procedure
+
+
+
+procedure changeToUserDefAccDec(BYTE in motorID) is
+    useTable[motorID]    = USERDEF
+    currentStep[motorID] = 0
+    targetStep[motorID]  = 0
+    vel[motorID]         = 0
+    dir[motorID]         = 0
+    stopped[motorID]     = TRUE
+    case (motorID) of
+        MOTOR1 : block
+                     maxVel[MOTOR1] = userDefAccDecTable_1[8]
+                 end block
+        MOTOR2 : block
+                     maxVel[MOTOR2] = userDefAccDecTable_2[8]
+                 end block
+        MOTOR3 : block
+                     maxVel[MOTOR3] = userDefAccDecTable_3[8]
+                 end block
+        MOTOR4 : block
+                     maxVel[MOTOR4] = userDefAccDecTable_4[8]
+                 end block
+    end case
+end procedure
+
+
+
+function X27position(BYTE in motorId) return WORD is
+    return (currentStep[motorId])
+end function
+
+
+
+procedure X27step(BYTE in motorId, SBYTE in direction) is
+    case (motorId) of
+      MOTOR1 : block
+                   if (direction > 0) then DIRMOT1 = 0 else DIRMOT1 = 1 end if
+                   CLKMOT1 = 1
+                   _usec_delay(STEP_PULSE_TIME)
+                   CLKMOT1 = 0
+                   currentStep[MOTOR1] = currentStep[MOTOR1] + direction
+               end block
+      MOTOR2 : block
+                   if (direction > 0) then DIRMOT2 = 0 else DIRMOT2 = 1 end if
+                   CLKMOT2 = 1
+                   _usec_delay(STEP_PULSE_TIME)
+                   CLKMOT2 = 0
+                   currentStep[MOTOR2] = currentStep[MOTOR2] + direction
+               end block
+      MOTOR3 : block
+                   if (direction > 0) then DIRMOT3 = 0 else DIRMOT3 = 1 end if
+                   CLKMOT3 = 1
+                   _usec_delay(STEP_PULSE_TIME)
+                   CLKMOT3 = 0
+                   currentStep[MOTOR3] = currentStep[MOTOR3] + direction
+               end block
+      MOTOR4 : block
+                   if (direction > 0) then DIRMOT4 = 0 else DIRMOT4 = 1 end if
+                   CLKMOT4 = 1
+                   _usec_delay(STEP_PULSE_TIME)
+                   CLKMOT4 = 0
+                   currentStep[MOTOR4] = currentStep[MOTOR4] + direction
+               end block
+    end case
+end procedure
+
+
+
+-- procedure X27stepTo(byte in motorId, WORD in position) is
+--   var word stepCount, stepsDone
+--   var sbyte direction
+--
+--     if (position > currentStep[motorId]) then
+--         direction = 1
+--         stepCount = position - currentStep[motorId]
+--     else
+--         direction = -1
+--         stepCount = currentStep[motorId] - position
+--     end if
+--     --
+--     stepsDone = 0
+--     while (stepsDone < stepCount) loop
+--         X27step(motorId, direction)
+--         delay_10us(STEP_TO_STEP_TIME)
+--         stepsDone = stepsDone + 1
+--     end loop
+-- end procedure
+
+
+
+procedure X27atHome(byte in motorId) is
+    targetStep[motorId] = 0
+    vel[motorId] = 0
+    dir[motorId] = 0
+end procedure
+
+
+
+procedure X27startHoming(byte in motorId) is
+    currentStep[motorId] = steps[motorId] - 1
+    stepsToDo[motorId] = currentStep[motorId] -- max # steps to HOME (end stop)
+    homeTime[motorId] = micros() + STEP_TO_STEP_HOME
+    motorHomeStatus[motorId] = HOME_STS_HOMING
+end procedure
+
+
+
+-- this function returns AFTER the motor is homed against end stop
+-- procedure X27zero(byte in motorId) is
+--     currentStep[motorId] = steps[motorId] - 1
+--     X27stepTo(motorId, 0)
+--     targetStep[motorId] = 0
+--     vel[motorId] = 0
+--     dir[motorId] = 0
+-- end procedure
+
+
+
+procedure X27advance(byte in motorId) is
+  var sword delta
+  var byte  ix
+
+    -- detect stopped state
+    if ( (currentStep[motorId] == targetStep[motorId]) &
+         (vel[motorId] == 0) ) then
+        stopped[motorId] = TRUE
+        dir[motorId] = 0
+        time0[motorId] = micros()
+        return
+    end if
+    -- if stopped, determine direction
+    if (vel[motorId] == 0) then
+        if (currentStep[motorId] < targetStep[motorId]) then
+            dir[motorId] = 1
+        else
+            dir[motorId] = -1
+        end if
+        vel[motorId] = 1
+    end if
+
+    X27step(motorId, dir[motorId])
+
+    -- determine delta, # steps in current direction to target.
+    -- may be negative if moving away from target
+    if (dir[motorId] > 0) then
+        delta = sword(targetStep[motorId]) - sword(currentStep[motorId])
+    else
+        delta = sword(currentStep[motorId]) - sword(targetStep[motorId])
+    end if
+
+    if (delta > 0) then
+        -- case 1 : moving towards target (maybe under acc or dec)
+        if (delta < vel[motorId]) then
+            -- time to decelerate
+            vel[motorId] = vel[motorId] - 1
+        elsif (vel[motorId] < maxVel[motorId]) then
+            -- accelerating
+            vel[motorId] = vel[motorId] + 1
+        else
+            -- at full speed - stay here
+        end if
+    else
+        -- case 2 : at or moving away from target (slow down!)
+        vel[motorId] = vel[motorId] - 1
+    end if
+    -- vel now defines delay
+    ix = 0
+    case (motorId) of
+      MOTOR1 : block
+                   if (useTable[MOTOR1] == DEFAULT) then
+                       while (defaultAccDecTable_1[ix] < vel[MOTOR1]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR1] = defaultAccDecTable_1[(ix+1)]
+                   else
+                       while (userDefAccDecTable_1[ix] < vel[MOTOR1]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR1] = userDefAccDecTable_1[(ix+1)]
+                   end if
+               end block
+      MOTOR2 : block
+                   if (useTable[MOTOR2] == DEFAULT) then
+                       while (defaultAccDecTable_2[ix] < vel[MOTOR2]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR2] = defaultAccDecTable_2[(ix+1)]
+                   else
+                       while (userDefAccDecTable_2[ix] < vel[MOTOR2]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR2] = userDefAccDecTable_2[(ix+1)]
+                   end if
+               end block
+      MOTOR3 : block
+                   if (useTable[MOTOR3] == DEFAULT) then
+                       while (defaultAccDecTable_3[ix] < vel[MOTOR3]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR3] = defaultAccDecTable_3[(ix+1)]
+                   else
+                       while (userDefAccDecTable_3[ix] < vel[MOTOR3]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR3] = userDefAccDecTable_3[(ix+1)]
+                   end if
+               end block
+      MOTOR4 : block
+                   if (useTable[MOTOR4] == DEFAULT) then
+                       while (defaultAccDecTable_4[ix] < vel[MOTOR4]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR4] = defaultAccDecTable_4[(ix+1)]
+                   else
+                       while (userDefAccDecTable_4[ix] < vel[MOTOR4]) loop
+                           ix = ix + 2
+                       end loop
+                       microDelay[MOTOR4] = userDefAccDecTable_4[(ix+1)]
+                   end if
+               end block
+    end case
+
+    time0[motorId] = micros()
+end procedure
+
+
+
+procedure X27AbsPosition(byte in motorId, word in position) is
+  var word pos
+
+    pos = position
+    if (pos >= steps[motorId]) then  pos = steps[motorId] - 1  end if
+    targetStep[motorId] = pos
+    if (stopped[motorId] == TRUE) then
+        -- reset timer to avoid possible time overflow
+        stopped[motorId] = FALSE
+        time0[motorId] = micros()
+        microDelay[motorId] = 0
+    end if
+end procedure
+
+
+
+procedure X27RelPosition(byte in motorId, byte in relative) is
+  var word curPos, relPos
+
+    curPos = currentStep[motorId]
+    if (relative > 127) then
+        relPos = word(relative & 0x7F)   -- strip sign bit
+        if (curPos >= relPos) then
+            curPos = curPos - relPos
+            X27AbsPosition(motorId, curPos)
+        else
+            X27AbsPosition(motorId, 0)
+        end if
+    else
+        relPos = word(relative)
+        curPos = curPos + relPos
+        X27AbsPosition(motorId, curPos)
+    end if
+end procedure
+
+
+
+procedure X27update(byte in motorId) is
+  var word delta
+
+    if (stopped[motorId] == FALSE) then
+        delta = word(micros() - time0[motorId])
+        if (delta > microDelay[motorId]) then
+            X27advance(motorId)
+--      else
+--          -- update some counter to measure remaining time ("idle loop time").
+--          -- As long as there is some remaining time, the motor could run
+--          -- faster from a software point of view. Possibly the motor itself
+--          -- cannot be run faster though (load inertia, etc.) ...
+--          -- The counter value could be averaged over time, and be retrieved
+--          -- on request (by a new command!) while in "debug mode".
+        end if
+    end if
+end procedure
+

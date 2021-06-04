@@ -1,0 +1,583 @@
+-- -----------------------------------------------------------------------------
+-- Title:  microStepper control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: ustep-code
+--
+--    this module contains
+--    the main position update routine, and processing all "USTEP" commands.
+
+
+-- -----------------------------------------------------------------------------
+-- Initialize stepper motor status defaults
+-- -----------------------------------------------------------------------------
+procedure initMotorStatus() is
+  useHomeSensor[MOTOR1]         = FALSE
+  useHomeSensor[MOTOR2]         = FALSE
+  useHomeSensor[MOTOR3]         = FALSE
+  useHomeSensor[MOTOR4]         = FALSE
+  homeSensorActiveLevel[MOTOR1] = 0
+  homeSensorActiveLevel[MOTOR2] = 0
+  homeSensorActiveLevel[MOTOR3] = 0
+  homeSensorActiveLevel[MOTOR4] = 0
+  motorHomeStatus[MOTOR1]       = HOME_STS_NOT_HOMED
+  motorHomeStatus[MOTOR2]       = HOME_STS_NOT_HOMED
+  motorHomeStatus[MOTOR3]       = HOME_STS_NOT_HOMED
+  motorHomeStatus[MOTOR4]       = HOME_STS_NOT_HOMED
+  motorSelectedForAbsPos        = MOTOR_NONE
+  motorSelectedForMaxStp        = MOTOR_NONE
+  motorSelectedForAccDec        = MOTOR_NONE
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- initialize stepper controller IC inputs - called from main()
+-- -----------------------------------------------------------------------------
+procedure initController() is
+  CLKMOT1   = 0
+  CLKMOT2   = 0
+  CLKMOT3   = 0
+  CLKMOT4   = 0
+  DIRMOT1   = 0
+  DIRMOT2   = 0
+  DIRMOT3   = 0
+  DIRMOT4   = 0
+  STPRRESET = 1         -- stepper motor IC reset negated
+  MOTENABLE = 0         -- stepper drivers L293 outputs disabled
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- reset stepper controller IC - called from main()  & as command
+-- -----------------------------------------------------------------------------
+procedure resetController() is
+  STPRRESET = 0         -- stepper motor IC reset asserted
+  delay_1ms(1)          -- reset pulse duration 1 msec
+  STPRRESET = 1         -- stepper motor IC reset negated
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- enable/disable L293 motor driver outputs - called from main()  & as command
+-- -----------------------------------------------------------------------------
+procedure enableL293outputs() is
+  MOTENABLE = 1         -- L293 motor drivers output enabled
+end procedure
+
+
+procedure disableL293outputs() is
+  MOTENABLE = 0         -- L293 motor drivers output disabled
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- update stepper setpoint for all motors - called from main()
+--   setpoint update per X27update call is ONE STEP
+--   setpoint update is only executed after the motor is homed!
+-- -----------------------------------------------------------------------------
+procedure updStepperPosition() is
+    if (motorHomeStatus[MOTOR1] == HOME_STS_HOMED) then X27update(MOTOR1) end if
+    if (motorHomeStatus[MOTOR2] == HOME_STS_HOMED) then X27update(MOTOR2) end if
+    if (motorHomeStatus[MOTOR3] == HOME_STS_HOMED) then X27update(MOTOR3) end if
+    if (motorHomeStatus[MOTOR4] == HOME_STS_HOMED) then X27update(MOTOR4) end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- home a motor
+-- -----------------------------------------------------------------------------
+procedure homeMotor(byte in motorId) is
+  var dword curTime
+  var byte  sensor[4]
+
+    sensor[MOTOR1] = SENSOR1
+    sensor[MOTOR2] = SENSOR2
+    sensor[MOTOR3] = SENSOR3
+    sensor[MOTOR4] = SENSOR4
+
+    if (motorHomeStatus[motorId] == HOME_STS_HOMING) then
+        curTime = micros()
+        if (curTime > homeTime[motorId]) then
+            -- home pulse delay time elapsed: check if homed
+            if (useHomeSensor[motorId] == TRUE) then
+                -- check sensor
+                if (sensor[motorId] == homeSensorActiveLevel[motorId]) then
+                    -- sensor active
+                    X27atHome(motorId)
+                    motorHomeStatus[motorId] = HOME_STS_HOMED
+                else
+                    -- sensor not yet active
+                    if (stepsToDo[motorId] > 0) then
+                        X27step(motorId, -1)
+                        stepsToDo[motorId] = stepsToDo[motorId] - 1
+                        homeTime[motorId] = micros() + STEP_TO_STEP_HOME
+                    else
+                        -- must be at HOME (against end stop)
+                        X27atHome(motorId)
+                        motorHomeStatus[motorId] = HOME_STS_HOMED
+                    end if
+                end if
+            else
+                if (stepsToDo[motorId] > 0) then
+                    -- not yet at HOME (end stop)
+                    X27step(motorId, -1)
+                    stepsToDo[motorId] = stepsToDo[motorId] - 1
+                    homeTime[motorId] = micros() + STEP_TO_STEP_HOME
+                else
+                    -- must be at HOME (against end stop)
+                    X27atHome(motorId)
+                    motorHomeStatus[motorId] = HOME_STS_HOMED
+                end if
+            end if
+        end if
+    end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- motor homing - called from main()
+-- -----------------------------------------------------------------------------
+procedure executeHoming() is
+    homeMotor(MOTOR1)
+    homeMotor(MOTOR2)
+    homeMotor(MOTOR3)
+    homeMotor(MOTOR4)
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- processAbsValue - process data for an absolute value setting
+-- -----------------------------------------------------------------------------
+procedure processAbsValue(WORD in position) is
+  var byte IDbyte, entryData, tableEntry
+
+    if (motorSelectedForAbsPos != MOTOR_NONE) then
+        -- move to an absolute position
+        if (motorHomeStatus[motorSelectedForAbsPos] == HOME_STS_HOMED) then
+            X27AbsPosition(motorSelectedForAbsPos, position)
+        end if
+    elsif (motorSelectedForMaxStp != MOTOR_NONE) then
+        -- define maximum number of steps
+        setX27MaxStep(motorSelectedForMaxStp, position)
+        motorHomeStatus[motorSelectedForMaxStp] = HOME_STS_NOT_HOMED
+    elsif ( (motorSelectedForAccDec & 0x03) != MOTOR_NONE) then
+        IDbyte = commandData & 0x03         -- get motor ID bits
+        entryData = commandData & 0x70      -- strip DLY bit and motor ID bits
+        tableEntry = entryData >> 3
+        if ( (commandData & 0x80) == 0x80) then
+            tableEntry = tableEntry + 1
+        end if
+        -- store value in motor table / table entry
+        case (IDbyte) of
+            MOTOR1 : block
+                        userDefAccDecTable_1[tableEntry] = position
+                     end block
+            MOTOR2 : block
+                        userDefAccDecTable_2[tableEntry] = position
+                     end block
+            MOTOR3 : block
+                        userDefAccDecTable_3[tableEntry] = position
+                     end block
+            MOTOR4 : block
+                        userDefAccDecTable_4[tableEntry] = position
+                     end block
+        end case
+    end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte IDbyte, entryNumber
+  var word position
+
+  case (commandCode) of
+      CMD_ABSPOS_0    : block
+         -- absolute position range 000..255
+         position = word(commandData)
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_1    : block
+         -- absolute position range 256..511
+         position = word(commandData) + 256
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_2    : block
+         -- absolute position range 512..767
+         position = word(commandData) + 512
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_3    : block
+         -- absolute position range 768..1023
+         position = word(commandData) + 768
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_4    : block
+         -- absolute position range 1024..1279
+         position = word(commandData) + 1024
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_5    : block
+         -- absolute position range 1280..1535
+         position = word(commandData) + 1280
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_6    : block
+         -- absolute position range 1536..1791
+         position = word(commandData) + 1536
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_7    : block
+         -- absolute position range 1792..2047
+         position = word(commandData) + 1792
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_8    : block
+         -- absolute position range 2048..2303
+         position = word(commandData) + 2048
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_9    : block
+         -- absolute position range 2304..2559
+         position = word(commandData) + 2304
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_A    : block
+         -- absolute position range 2560..2815
+         position = word(commandData) + 2560
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_B    : block
+         -- absolute position range 2816..3071
+         position = word(commandData) + 2816
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_C    : block
+         -- absolute position range 3072..3327
+         position = word(commandData) + 3072
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_D    : block
+         -- absolute position range 3328..3583
+         position = word(commandData) + 3328
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_E    : block
+         -- absolute position range 3584..3839
+         position = word(commandData) + 3584
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_F    : block
+         -- absolute position range 3840..4095
+         position = word(commandData) + 3840
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_G    : block
+         -- absolute position range 4096..4351
+         position = word(commandData) + 4096
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_H    : block
+         -- absolute position range 4352..4607
+         position = word(commandData) + 4352
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_I    : block
+         -- absolute position range 4608..4863
+         position = word(commandData) + 4608
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_J    : block
+         -- absolute position range 4864..5119
+         position = word(commandData) + 4864
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_K    : block
+         -- absolute position range 5120..5375
+         position = word(commandData) + 5120
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_L    : block
+         -- absolute position range 5376..5631
+         position = word(commandData) + 5376
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_M    : block
+         -- absolute position range 5632..5887
+         position = word(commandData) + 5632
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_N    : block
+         -- absolute position range 5888..6143
+         position = word(commandData) + 5888
+         processAbsValue(position)
+         end block
+      CMD_ABSPOS_O    : block
+         -- absolute position range 6144..6399
+         position = word(commandData) + 6144
+         processAbsValue(position)
+         end block
+--
+      CMD_ABS_SET_MOT : block
+         -- specify motor ID for absolute position cmd
+         if ((commandData == MOTOR1) | (commandData == MOTOR2) |
+             (commandData == MOTOR3) | (commandData == MOTOR4)) then
+             motorSelectedForAbsPos = commandData
+             motorSelectedForMaxStp = MOTOR_NONE
+             motorSelectedForAccDec = MOTOR_NONE
+         else
+             motorSelectedForAbsPos = MOTOR_NONE
+             motorSelectedForMaxStp = MOTOR_NONE
+             motorSelectedForAccDec = MOTOR_NONE
+         end if
+         end block
+--
+      CMD_MAX_RNG_MOT : block
+         -- specify motor ID for maximum step range definition
+         if ((commandData == MOTOR1) | (commandData == MOTOR2) |
+             (commandData == MOTOR3) | (commandData == MOTOR4)) then
+             -- deselect any "active" motor, setup "load maximum step range"
+             motorSelectedForAbsPos = MOTOR_NONE
+             motorSelectedForMaxStp = commandData
+             motorSelectedForAccDec = MOTOR_NONE
+         else
+             motorSelectedForAbsPos = MOTOR_NONE
+             motorSelectedForMaxStp = MOTOR_NONE
+             motorSelectedForAccDec = MOTOR_NONE
+         end if
+         end block
+--
+      CMD_USR_DEF_MOT : block
+         -- specify motor ID for user-defined acceleration/deceleration table
+         -- and velocity/delay entry
+         IDbyte = commandData & 0x03   -- isolate motor ID bits
+         if ((IDbyte == MOTOR1) | (IDbyte == MOTOR2) |
+             (IDbyte == MOTOR3) | (IDbyte == MOTOR4)) then
+             motorSelectedForAbsPos = MOTOR_NONE
+             motorSelectedForMaxStp = MOTOR_NONE
+             -- check validity of table entry VEL number and DLY number
+             entryNumber = commandData & 0x70  -- strip DLY bit and motor#
+             if ((entryNumber == 0x00) | (entryNumber == 0x10) |
+                 (entryNumber == 0x20) | (entryNumber == 0x30) |
+                 (entryNumber == 0x40) ) then
+                 motorSelectedForAccDec = commandData
+             else
+                 motorSelectedForAccDec = MOTOR_NONE
+             end if
+         else
+             motorSelectedForAbsPos = MOTOR_NONE
+             motorSelectedForMaxStp = MOTOR_NONE
+             motorSelectedForAccDec = MOTOR_NONE
+         end if
+         end block
+--
+      CMD_STEP_REL_M1 : block
+         if (motorHomeStatus[MOTOR1] == HOME_STS_HOMED) then
+             X27RelPosition(MOTOR1, commandData)
+         end if
+         end block
+      CMD_STEP_REL_M2 : block
+         if (motorHomeStatus[MOTOR2] == HOME_STS_HOMED) then
+             X27RelPosition(MOTOR2, commandData)
+         end if
+         end block
+      CMD_STEP_REL_M3 : block
+         if (motorHomeStatus[MOTOR3] == HOME_STS_HOMED) then
+             X27RelPosition(MOTOR3, commandData)
+         end if
+         end block
+      CMD_STEP_REL_M4 : block
+         if (motorHomeStatus[MOTOR4] == HOME_STS_HOMED) then
+             X27RelPosition(MOTOR4, commandData)
+         end if
+         end block
+--
+      CMD_HOME_MOTOR1 : block
+         motorHomeStatus[MOTOR1] = HOME_STS_NOT_HOMED
+         X27startHoming(MOTOR1)
+         end block
+      CMD_HOME_MOTOR2 : block
+         motorHomeStatus[MOTOR2] = HOME_STS_NOT_HOMED
+         X27startHoming(MOTOR2)
+         end block
+      CMD_HOME_MOTOR3 : block
+         motorHomeStatus[MOTOR3] = HOME_STS_NOT_HOMED
+         X27startHoming(MOTOR3)
+         end block
+      CMD_HOME_MOTOR4 : block
+         motorHomeStatus[MOTOR4] = HOME_STS_NOT_HOMED
+         X27startHoming(MOTOR4)
+         end block
+      CMD_HOME_MOTORS : block
+         motorHomeStatus[MOTOR1] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR2] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR3] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR4] = HOME_STS_NOT_HOMED
+         X27startHoming(MOTOR1)
+         X27startHoming(MOTOR2)
+         X27startHoming(MOTOR3)
+         X27startHoming(MOTOR4)
+         end block
+--
+      CMD_CONTROL_RST : block
+         resetController()
+         motorHomeStatus[MOTOR1] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR2] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR3] = HOME_STS_NOT_HOMED
+         motorHomeStatus[MOTOR4] = HOME_STS_NOT_HOMED
+         end block
+--
+      CMD_MOTOR_PWR   : block
+         if ((commandData & 0x01) == 0x00) then
+             disableL293outputs()
+         else
+             enableL293outputs()
+         end if
+         end block
+--
+      CMD_USE_HOME_1  : block
+         if ( (commandData & 0x0F) == 0) then
+             useHomeSensor[MOTOR1] = FALSE
+         else
+             useHomeSensor[MOTOR1] = TRUE
+             if ( (commandData & 0xF0) == 0) then
+                 homeSensorActiveLevel[MOTOR1] = 0
+             else
+                 homeSensorActiveLevel[MOTOR1] = 1
+             end if
+         end if
+         end block
+      CMD_USE_HOME_2  : block
+         if ( (commandData & 0x0F) == 0) then
+             useHomeSensor[MOTOR2] = FALSE
+         else
+             useHomeSensor[MOTOR2] = TRUE
+             if ( (commandData & 0xF0) == 0) then
+                 homeSensorActiveLevel[MOTOR2] = 0
+             else
+                 homeSensorActiveLevel[MOTOR2] = 1
+             end if
+         end if
+         end block
+      CMD_USE_HOME_3  : block
+         if ( (commandData & 0x0F) == 0) then
+             useHomeSensor[MOTOR3] = FALSE
+         else
+             useHomeSensor[MOTOR3] = TRUE
+             if ( (commandData & 0xF0) == 0) then
+                 homeSensorActiveLevel[MOTOR3] = 0
+             else
+                 homeSensorActiveLevel[MOTOR3] = 1
+             end if
+         end if
+         end block
+      CMD_USE_HOME_4  : block
+         if ( (commandData & 0x0F) == 0) then
+             useHomeSensor[MOTOR4] = FALSE
+         else
+             useHomeSensor[MOTOR4] = TRUE
+             if ( (commandData & 0xF0) == 0) then
+                 homeSensorActiveLevel[MOTOR4] = 0
+             else
+                 homeSensorActiveLevel[MOTOR4] = 1
+             end if
+         end if
+         end block
+--
+      CMD_VEL_TABLE : block
+         IDbyte = commandData & 0x03   -- isolate motor ID bits
+         if ((IDbyte == MOTOR1) | (IDbyte == MOTOR2) |
+             (IDbyte == MOTOR3) | (IDbyte == MOTOR4)) then
+             -- get DEFAULT / USERDEF bit
+             motorHomeStatus[IDbyte] = HOME_STS_NOT_HOMED  -- always!
+             if ( (commandData & 0xF0) == 0) then
+                 changeToDefaultAccDec(IDbyte)
+             else
+                 changeToUserDefAccDec(IDbyte)
+             end if
+         end if
+         end block
+--
+      CMD_WTCHDOG_DIS : block
+         disableWatchdog()
+         end block
+      CMD_WTCHDOG_ENA : block
+         if ((commandData & 0x3F) == 0x00) then
+             -- set default timeout value
+             wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+         else
+             wtchdogDelayValue = word(commandData & 0x3F)
+         end if
+         if ((commandData & 0xC0) == 0x80) then
+             -- enable watchdog
+             set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+             enableWatchdog()
+         end if
+         if ((commandData & 0xC0) == 0x00) then
+             -- disable watchdog
+             disableWatchdog()
+         end if
+         end block
+--
+      CMD_DIAGMODE : block
+         if (flashRate != DOA_RESET_RATE) then
+             -- do not accept DIAG commands during DOA power-up
+             setDiagLEDmode(commandData)
+         end if
+         end block
+--
+      -- USB test
+      CMD_IDENTIFY  : block
+         -- double check that USB is the COM port in use!
+         if (commPort == USE_USB) then
+             usb_serial_data = "u"
+             usb_serial_data = "S"
+             usb_serial_data = "T"
+             usb_serial_data = "E"
+             usb_serial_data = "P"
+             usb_serial_data = " "
+             usb_serial_data = "v"
+             usb_serial_data = "0" + MAJOR_VERSION
+             usb_serial_data = "."
+             usb_serial_data = "0" + MINOR_VERSION
+             usb_serial_data = " "
+             usb_serial_data = "$"
+             IDbyte = ((USTEP_ADDR >> 4) & 0x0F) + "0"
+             if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+             usb_serial_data = IDbyte
+             IDbyte = (USTEP_ADDR & 0x0F) + "0"
+             if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+             usb_serial_data = IDbyte
+             usb_serial_data = ASCII_CR                  ; add CR
+             usb_serial_data = ASCII_LF                  ; add LF
+         end if
+         end block
+      -- USB debug
+      CMD_USB_DEBUG : block
+         -- double check that USB is the COM port in use!
+         if (commPort == USE_USB) then
+             if (commandData == "N") then
+                 USBdebugEnabled = FALSE
+             elsif (commandData == "Y") then
+                 USBdebugEnabled = TRUE
+             end if
+         end if
+         end block
+
+      -- ignore everything else
+      otherwise block
+         ; do nothing - reject
+         end block
+  end case
+end procedure
+
