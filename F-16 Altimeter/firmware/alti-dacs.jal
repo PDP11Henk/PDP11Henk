@@ -1,0 +1,171 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Altimeter control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: alti-dacs
+--
+--    this module contains the actual altimeter requested setpoint execution.
+--    The "setpoint" function has 6 input parameters, the 3 stator amplitude
+--    settings and their polarity with respect to the rotor (reference) signal.
+--    This data is stored in an array and then "startLoadDAC" is called.
+
+
+-- This
+--    routine sends the first data to the DAC and enables the SPI interrupt.
+--    The SPI interrupt routine takes care of the successive bytes that must be
+--    sent to the DAC and the correct CS pulses and LDAC pulse.
+--    When the transmit cycle is complete the flag "setpointsToDACsActive" is
+--    cleared.
+
+
+var byte   statorData[9]      -- holds amplitude and polarity data for S1-S2-S3
+var byte   loadState          -- data transmission progress "tracker"
+
+const byte STATOR_S1_S2       = 0
+const byte STATOR_S3          = 1
+
+const byte DAC_LOAD_IDLE      = 0     -- no data transmission active
+const byte DAC_LOAD_S1        = 1     -- sending S1 word to DAC output (A)
+const byte DAC_LOAD_S2        = 2     -- sending S2 word to DAC output (B)
+const byte DAC_LOAD_S3        = 3     -- sending S3 word to DAC output (A)
+
+
+
+procedure initSPIcontrol() is
+    loadState = DAC_LOAD_IDLE
+end procedure
+
+
+
+-- This routine sends the data byte to the DAC using "bit-banging".
+-- It is a generic routine, starting with asserting the appropriate CS of the
+-- DAC identified by the statorID. The data bits are subsequently loaded and
+-- clocked into the DAC. The CS of the DAC is negated after the last bit.
+
+procedure sendSPIdata(BYTE in SPIdataHI, BYTE in SPIdataLO, BYTE in statorID) is
+  var byte bitmask
+
+    ; assert appropriate DAC CS*
+    if (statorID == STATOR_S1_S2) then
+        CS_DAC_S12 = 0
+    elsif (statorID == STATOR_S3) then
+        CS_DAC_S3 = 0
+    else
+        -- ignore: coding error!
+    end if
+    ASM nop               -- CS settling time
+    ASM nop
+    ASM nop
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 00) loop
+        -- bit-bang the HI data byte
+        if ((SPIdataHI & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_SCK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_SCK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    bitmask = 0x80        -- setup bit position to be sent
+    while (bitmask != 00) loop
+        -- bit-bang the LO data byte
+        if ((SPIdataLO & bitmask) == 0) then SPI_SDO = 0 else SPI_SDO = 1 end if
+        ASM nop
+        ASM nop
+        SPI_SCK = 1       -- assert clock
+        ASM nop
+        ASM nop
+        SPI_SCK = 0       -- negate clock
+        bitmask = bitmask >> 1
+        ASM nop
+    end loop
+
+    ASM nop
+    ; negate appropriate DAC CS*
+    if (statorID == STATOR_S1_S2) then
+        CS_DAC_S12 = 1
+    elsif (statorID == STATOR_S3) then
+        CS_DAC_S3 = 1
+    else
+        -- ignore: coding error!
+    end if
+end procedure
+
+
+
+
+procedure startLoadDAC() is
+  ; initiate the transfer of the 6 bytes to the two DACs.
+  ; The first byte transfer is initiated here, the remaining 5 are handled in
+  ; via main loop calling XXX.
+
+  loadState  = DAC_LOAD_S1
+  -- send data word to DAC #1
+  sendSPIdata(statorData[0], statorData[1], STATOR_S1_S2)
+end procedure
+
+
+
+procedure synchroSetpoint(WORD in amplitudeS1, WORD in amplitudeS2,
+                          WORD in amplitudeS3, BYTE in polarityS1,
+                          BYTE in polarityS2,  BYTE in polarityS3  ) is
+
+  ; determine the values to be sent to the DACs
+  statorData[0] = byte((amplitudeS1 >> 6) & 0x000F) + 0x30 -- DAC A, gain *1
+  statorData[1] = byte((amplitudeS1 << 2) & 0x00FC)
+  statorData[2] = byte((amplitudeS2 >> 6) & 0x000F) + 0xB0 -- DAC B, gain *1
+  statorData[3] = byte((amplitudeS2 << 2) & 0x00FC)
+  statorData[4] = byte((amplitudeS3 >> 6) & 0x000F) + 0x30 -- DAC A, gain *1
+  statorData[5] = byte((amplitudeS3 << 2) & 0x00FC)
+  statorData[6] = polarityS1
+  statorData[7] = polarityS2
+  statorData[8] = polarityS3
+
+  ; trigger DAC load sequence
+  startLoadDAC()
+end procedure
+
+
+
+procedure processSPIloading() is
+  case (loadState) of
+      DAC_LOAD_IDLE : block
+                        -- nothing to do, no transmission active
+                      end block
+      DAC_LOAD_S1   : block
+                        loadState = DAC_LOAD_S2
+                        sendSPIdata(statorData[2], statorData[3], STATOR_S1_S2)
+                      end block
+      DAC_LOAD_S2   : block
+                        loadState = DAC_LOAD_S3
+                        sendSPIdata(statorData[4], statorData[5], STATOR_S3)
+                      end block
+      DAC_LOAD_S3   : block
+                        -- stator setpoints loaded into DACs
+                        -- transfer DAC analog values to DAC outputs
+                        -- and set signal polarity
+                        loadState  = DAC_LOAD_IDLE
+                        LOADDACS   = 0
+                        S1POLARITY = statorData[6]
+                        S2POLARITY = statorData[7]
+                        S3POLARITY = statorData[8]
+                        ASM nop
+                        ASM nop                             -- LDAC* : t > 40 ns
+                        ASM nop
+                        LOADDACS = 1                        -- latch transfer
+                        ASM nop
+                        setpointsToDACsActive = FALSE       -- release locks
+                        manualLoadFinished = TRUE
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+

@@ -1,0 +1,948 @@
+-- -----------------------------------------------------------------------------
+-- Title:  Altimeter control module
+--         with USB and PHCC DOA connection using the Microchip PIC18F2550
+--
+-- Submodule: alti-code
+--
+--    this module contains the circular buffer to store altimeter setpoints, the
+--    conversion of a 12-bit "angle" to synchro stator signals, the main synchro
+--    position update routine, and the processing of all "ALTI" commands.
+
+-- include alti-correction
+include alti-sin11bit
+include alti-dacs
+
+var word    amplitude
+var byte    polarity
+var word    stepSize
+
+
+-- -----------------------------------------------------------------------------
+-- new altimeter setpoint received: store in buffer - called from main()
+-- -----------------------------------------------------------------------------
+procedure acceptNewSetpoint() is
+  var byte nextIndex
+
+  if (altiUpdate == TRUE) then
+     nextIndex = headIndex + 1
+     if (nextIndex >= MAX_NO_SETPOINTS) then
+        -- the last location of the buffer is not used.
+        -- This makes identification "buffer full" and "buffer empty" easy.
+        nextIndex = 0
+     end if
+     if (nextIndex != tailIndex) then
+        -- space available in buffer: store the new setpoint.
+        -- Note: if no space is available, the new setpoint is simply lost!
+        setpointBuffer[headIndex] = newSetpoint
+        headIndex = nextIndex
+     end if
+     altiUpdate = FALSE
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- get (new) altimeter setpoint from buffer - called from updSynchroPosition()
+-- -----------------------------------------------------------------------------
+function retrieveNewSetpoint() return WORD is
+  var word setpoint
+  var byte nextIndex
+
+  if (headIndex == tailIndex) then
+      -- buffer is empty
+      setpoint = 22222 -- impossible value to indicate no new setpoint available
+  else
+      setpoint = setpointBuffer[tailIndex]
+      nextIndex = tailIndex + 1
+      if (nextIndex >= MAX_NO_SETPOINTS) then
+          -- yes I know; the last location of the buffer is not used.
+          -- But this makes it easy to identify "buffer full" and "buffer empty"
+          nextIndex = 0
+      end if
+      tailIndex = nextIndex
+  end if
+  return setpoint
+end function
+
+
+
+
+procedure convertAngle(WORD in angle) is
+  ; the input variable angle is a word, but its range is between 0 and 4096.
+  ; The value is converted to a look-up value for a "half-sine" (11-bit).
+  ; The first half sine period is equal to the second half, except for polarity.
+
+var word baseAngle, sineValue
+
+  -- get "base" angle :: always in first half of sine wave for table lookup
+  if (angle < 2048) then
+     baseAngle = angle
+     polarity = 1                       -- sine value is positive
+  else
+     baseAngle = 2048 - (4096 - angle)
+     if (baseAngle == 2048) then
+        baseAngle = 0
+     end if
+     polarity = 0                       -- sine value is negative
+  end if
+
+  sineValue = sine[baseAngle]
+
+  -- the higher the sine value, the lower the VCA control voltage must be
+  -- VCA control voltage 0V => attenuation = 0 dB  (gain = 1)
+  -- VCA control voltage 1V => attenuation ~ 30 dB (gain = 1/1000)
+  amplitude = 1023 - sineValue
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- set altimeter setpoint - called from updSynchroPosition()
+-- -----------------------------------------------------------------------------
+procedure setAltimeter(WORD in setAngle) is
+  ; setAngle is the 12-bit setpoint angle where 0 :: 0° and 4096 :: 360°
+  ; sine lookup table is used to retrieve the individual stator amplitudes.
+  ; As the angle varies from 0 to 4096 for one full sine wave, one "half"
+  ; spans a range of 2048 values. Therefore, the sine table has 2048 entries,
+  ; and returns a value between 0 and 1023 (10-bit synchro stator amplitude).
+
+var word s1Angle, s2Angle, s3Angle
+;var word deltaAngle
+;var byte altCorDirection, altCorValue
+
+;const byte POSITIVE = 0
+;const byte NEGATIVE = 1
+
+
+;  const byte  setA[]      = "setAngle: !"
+;  const byte  shwS1[]     = "  S1: !"
+;  const byte  shwS2[]     = "  S2: !"
+;  const byte  shwS3[]     = "  S3: !"
+;  const byte  prvA[]      = "previousAngles!"
+;  const byte  ampli[]     = "amplitudes    !"
+;  const byte  pols[]      = "  polarities!"
+  --
+;  const byte  range1i[]   = "  range 1 increment!"
+;  const byte  range1d[]   = "  range 1 decrement!"
+;  const byte  range2i[]   = "  range 2 increment!"
+;  const byte  range2d[]   = "  range 2 decrement!"
+;  const byte  range3i[]   = "  range 3 increment!"
+;  const byte  range3d[]   = "  range 3 decrement!"
+;  const byte  range4i[]   = "  range 4 increment!"
+;  const byte  range4d[]   = "  range 4 decrement!"
+;  const byte  range5i[]   = "  range 5 increment!"
+;  const byte  range5d[]   = "  range 5 decrement!"
+;  const byte  range6i[]   = "  range 6 increment!"
+;  const byte  range6d[]   = "  range 6 decrement!"
+
+
+  -- altitude correction (requested setpoint / actual indicated altitude)
+;  if (useAltiCorrection != 0) then
+      -- There seems to be an "error" (delta) between the specified setpoint and
+      -- the actual indicated altitude. The electric periodicy of the indicated
+      -- altitude is 2*PI which corresponds to a range of 10.000 feet.
+      -- Measurements show that the delta has a periodicy of PI/3, thus there
+      -- are 6 complete repeating periods of identical deltas. Further, it looks
+      -- as the delta itself is also a sine wave, where the first PI sine half
+      -- are positive deltas and the second PI sine half are negative deltas.
+      -- The maximum of the positive delta is lower than the maximum of the
+      -- negative delta (the "too high" indication is less than the "too low"
+      -- indication).
+      -- As the electical period of the indicator is 4096 steps, the period of
+      -- the "delta sine wave" is 4096 / 6 = 683 (rounded, small error).
+      --
+      -- find "base" of delta sine period
+;      deltaAngle = setAngle
+;      while (deltaAngle > 683) loop
+;          deltaAngle = deltaAngle - 683
+;      end loop
+      -- determine whether correction value must be added or subtracted
+;      if (deltaAngle < 341) then
+;          altCorDirection = POSITIVE
+;      else
+;          altCorDirection = NEGATIVE
+;      end if
+      -- update altimeter setting with correction value from lookup table
+;      altCorValue = altDeltaCorrection[deltaAngle]
+;      if (altCorDirection == POSITIVE) then
+;          setAngle = setAngle + word(altCorValue)
+;      else
+;          setAngle = setAngle - word(altCorValue)
+;      end if
+;  end if
+
+  s1Angle = setAngle + offsetS1
+  s2Angle = setAngle + offsetS2
+  s3Angle = setAngle + offsetS3
+
+  -- normalize to base value
+  if (s1Angle >= 4096) then s1Angle = s1Angle - 4096  end if   ; 4096 == 0
+  if (s2Angle >= 4096) then s2Angle = s2Angle - 4096  end if
+  if (s3Angle >= 4096) then s3Angle = s3Angle - 4096  end if
+
+  -- retrieve amplitude and polarity
+  convertAngle(s1Angle)             -- convert S1
+  amplitudeS1 = amplitude
+  polarityS1  = polarity
+
+  convertAngle(s2Angle)             -- convert S2
+  amplitudeS2 = amplitude
+  polarityS2  = polarity
+
+  convertAngle(s3Angle)             -- convert S3
+  amplitudeS3 = amplitude
+  polarityS3  = polarity
+
+  --
+;setAngle: xxxx  S1: xxxx  S2: xxxx  S3: xxxx  polarities S1: xx  S2: xx  S3: xx
+;previousAngles  S1: xxxx  S2: xxxx  S3: xxxx  polarities S1: xx  S2: xx  S3: xx
+;amplitudes      S1: xxxx  S2: xxxx  S3: xxxx  range x xxxrement
+;  sendDebugChar(ASCII_CR)
+;  sendDebugChar(ASCII_LF)
+;  sendDebugString(setA)              -- setAngle:
+;  sendDebugWord(setAngle)
+;  sendDebugString(shwS1)             -- S1:
+;  sendDebugWord(s1Angle)
+;  sendDebugString(shwS2)             -- S2:
+;  sendDebugWord(s2Angle)
+;  sendDebugString(shwS3)             -- S3:
+;  sendDebugWord(s3Angle)
+;  sendDebugString(pols)              -- polarities
+;  sendDebugString(shwS1)             -- S1:
+;  sendDebugByte(polarityS1)
+;  sendDebugString(shwS2)             -- S2:
+;  sendDebugByte(polarityS2)
+;  sendDebugString(shwS3)             -- S3:
+;  sendDebugByte(polarityS3)
+  --
+;  sendDebugChar(ASCII_CR)
+;  sendDebugChar(ASCII_LF)
+;  sendDebugString(prvA)              -- previousAngles
+;  sendDebugString(shwS1)             -- S1:
+;  sendDebugWord(prevS1Angle)
+;  sendDebugString(shwS2)             -- S2:
+;  sendDebugWord(prevS2Angle)
+;  sendDebugString(shwS3)             -- S3:
+;  sendDebugWord(prevS3Angle)
+;  sendDebugString(pols)             -- polarities
+;  sendDebugString(shwS1)            -- S1:
+;  sendDebugByte(prevS1Pol)
+;  sendDebugString(shwS2)            -- S2:
+;  sendDebugByte(prevS2Pol)
+;  sendDebugString(shwS3)            -- S3:
+;  sendDebugByte(prevS3Pol)
+  --
+;  sendDebugChar(ASCII_CR)
+;  sendDebugChar(ASCII_LF)
+;  sendDebugString(ampli)            -- amplitudes
+;  sendDebugString(shwS1)            -- S1:
+;  sendDebugWord(amplitudeS1)
+;  sendDebugString(shwS2)            -- S2:
+;  sendDebugWord(amplitudeS2)
+;  sendDebugString(shwS3)            -- S3:
+;  sendDebugWord(amplitudeS3)
+  --
+  -- At six positions there is a "jump" in the indication.
+  -- When at setpoint 0 the altimeter reads 00000 ft, these are the six ranges
+  -- where one stator sine amplitude goes through zero and the sign changes.
+  -- 1. 1000 ~ 1070ft
+  --                      @ 1000    @ 1070
+  --        s2Angle     = 0x0FFF    0x0000
+  --        amplitudeS2 = 0x03FE    0x03FF
+  --        polarityS2  = 0         1
+  --
+  -- 2. 2660 ~ 2740ft
+  --                      @ 2660    @ 2740
+  --        s3Angle     = 0x07FF    0x0800
+  --        amplitudeS3 = 0x03FE    0x03FF
+  --        polarityS3  = 1         0
+  --
+  -- 3. 4300 ~ 4380ft
+  --                      @ 4300    @ 4380
+  --        s1Angle     = 0x0FFF    0x0000
+  --        amplitudeS1 = 0x03FE    0x03FF
+  --        polarityS1  = 0         1
+  --
+  -- 4. 5990 ~ 6060ft
+  --                      @ 5990    @ 6060
+  --        s2Angle     = 0x07FF    0x0800
+  --        amplitudeS2 = 0x03FE    0x03FF
+  --        polarityS2  = 1         0
+  --
+  -- 5. 7650 ~ 7720ft
+  --                      @ 7650    @ 7720
+  --        s3Angle     = 0x0FFF    0x0000
+  --        amplitudeS3 = 0x03FE    0x03FF
+  --        polarityS3  = 0         1
+  --
+  -- 6. 9340 ~ 9400ft
+  --                      @ 9340    @ 9400
+  --        s1Angle     = 0x07FF    0x0800
+  --        amplitudeS1 = 0x03FE    0x03FF
+  --        polarityS1  = 1         0
+  --
+  -- Try to modify the amplitude of the other two stator signals to make
+  -- the jump "smoother". The modification of the other 2 stator signals
+  -- depends on the altimeter "movement" direction and the "range" (1~6).
+  --
+  -- check for range 1 (1000-1070)
+;  if ( (prevS2Angle == 4095) & (prevS2Pol == 0) &
+;       (s2Angle == 0) & (polarityS2 == 1) ) then
+;      sendDebugString(range1i)   -- inc
+;  elsif
+;     ( (prevS2Angle == 0) & (prevS2Pol == 1) &
+;       (s2Angle == 4095) & (polarityS2 == 0) ) then
+;      sendDebugString(range1d)   -- dec
+  -- check for range 3 (4300-4380)
+;  elsif ( (prevS1Angle == 4095) & (prevS1Pol == 0) &
+;       (s1Angle == 0) & (polarityS1 == 1) ) then
+;      sendDebugString(range3i)   -- inc
+;  elsif
+;     ( (prevS1Angle == 0) & (prevS1Pol == 1) &
+;       (s1Angle == 4095) & (polarityS1 == 0) ) then
+;      sendDebugString(range3d)   -- dec
+  -- check for range 5 (7650-7720)
+;  elsif ( (prevS3Angle == 4095) & (prevS3Pol == 0) &
+;       (s3Angle == 0) & (polarityS3 == 1) ) then
+;      sendDebugString(range5i)   -- inc
+;  elsif ( (prevS3Angle == 0) & (prevS3Pol == 1) &
+;       (s3Angle == 4095) & (polarityS3 == 0) ) then
+;      sendDebugString(range5d)   -- dec
+  -- check for range 2 (2660-2740)
+;  elsif ( (prevS3Angle == 2047) & (prevS3Pol == 1) &
+;       (s3Angle == 2048) & (polarityS3 == 0) ) then
+;      sendDebugString(range2i)   -- inc
+;  elsif ( (prevS3Angle == 2048) & (prevS3Pol == 0) &
+;       (s3Angle == 2047) & (polarityS3 == 1) ) then
+;      sendDebugString(range2d)   -- dec
+  -- check for range 4 (5990-6060)
+;  elsif ( (prevS2Angle == 2047) & (prevS2Pol == 1) &
+;       (s2Angle == 2048) & (polarityS2 == 0) ) then
+;      sendDebugString(range4i)   -- inc
+;  elsif ( (prevS2Angle == 2048) & (prevS2Pol == 0) &
+;       (s2Angle == 2047) & (polarityS2 == 1) ) then
+;      sendDebugString(range4d)   -- dec
+  -- check for range 6 (9340-9400)
+;  elsif ( (prevS1Angle == 2047) & (prevS1Pol == 1) &
+;       (s1Angle == 2048) & (polarityS1 == 0) ) then
+;      sendDebugString(range6i)   -- inc
+;  elsif ( (prevS1Angle == 2048) & (prevS1Pol == 0) &
+;       (s1Angle == 2047) & (polarityS1 == 1) ) then
+;      sendDebugString(range6d)   -- dec
+;  end if
+
+;  prevS1Angle = s1Angle          -- copy for next position update to check
+;  prevS2Angle = s2Angle
+;  prevS3Angle = s3Angle
+;  prevS1Pol   = polarityS1
+;  prevS2Pol   = polarityS2
+;  prevS3Pol   = polarityS3
+
+  -- output to altimeter
+  synchroSetpoint( amplitudeS1, amplitudeS2, amplitudeS3,
+                   polarityS1,  polarityS2,  polarityS3  )
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- set (new) altimeter setpoint - called from main()
+-- -----------------------------------------------------------------------------
+procedure updSynchroPosition() is
+  var word setpoint
+
+  -- output a new setpoint only if no previous setpoint output is in progress!
+  if (setpointsToDACsActive == FALSE) then
+      setpoint = retrieveNewSetpoint()
+      if (setpoint != 22222) then    -- 22222 is magic number for "buffer empty"
+          -- start cycle to send data to the DACs for S1-S2-S3 amplitude
+          setpointsToDACsActive = TRUE
+          setAltimeter(setpoint)
+      end if
+  end if
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- TEST mode - called from main()
+-- -----------------------------------------------------------------------------
+const word STEP_SIZE = 2
+
+procedure testMode() is
+  if (testModeState == TEST_RUNNING) then
+     -- delay time expired to load next setpoint?
+     if ( check_delay(TEST_STEP_DELAY) ) then
+        -- yes: set next setpoint
+        newSetpoint = testModePosition
+        altiUpdate  = TRUE
+        acceptNewSetpoint()
+        -- prepare next setpoint
+        if (testModeDirection == TEST_DIR_INC) then
+           if (testModePosition > (4096 - STEP_SIZE)) then
+              -- "increment" cycle completed --> back to 0
+              testModeDirection = TEST_DIR_DEC
+              testModePosition  = 4095
+           else
+              testModePosition = testModePosition + STEP_SIZE
+           end if
+        else
+           if (testModePosition < STEP_SIZE) then
+              -- "decrement" cycle completed --> increment again
+              testModeDirection = TEST_DIR_INC
+              testModePosition  = 0
+           else
+              testModePosition = testModePosition - STEP_SIZE
+           end if
+        end if
+        set_delay(TEST_STEP_DELAY, testModeStepRate)      -- restart delay timer
+     end if
+
+  elsif (testModeState == TEST_STOPPING) then
+     -- delay time expired to load next setpoint?
+     if ( check_delay(TEST_STEP_DELAY) ) then
+        -- yes: set next setpoint (always back to 0)
+        if (testModePosition == 0) then
+           -- return to 0 completed --> stopped
+           newSetpoint = 0
+           altiUpdate  = TRUE
+           acceptNewSetpoint()
+           testModeState = TEST_INACTIVE
+        else
+           newSetpoint = testModePosition
+           altiUpdate  = TRUE
+           acceptNewSetpoint()
+           if (testModePosition < STEP_SIZE) then
+              testModePosition = 0
+           else
+              testModePosition = testModePosition - STEP_SIZE
+           end if
+           set_delay(TEST_STEP_DELAY, testModeStepRate)   -- restart delay timer
+        end if
+     end if
+  end if
+end procedure
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Manual altimeter setting adjustment
+-- -----------------------------------------------------------------------------
+const BYTE  BUT_ADJUST    = 0
+const BYTE  BUT_UP_DOWN   = 1
+
+function readButton(BYTE in buttonID) return BYTE is
+  var byte buttonState
+
+  if (buttonID == BUT_UP_DOWN) then
+     buttonState = BUTTON_UP
+  else
+     buttonState = BUTTON_ADJ
+  end if
+  return buttonState
+end function
+
+
+
+procedure startDebounceTimer(BYTE in buttonID) is
+  if (buttonID == BUT_UP_DOWN) then
+     set_delay(BUT_UP_TIMER_SLOT, BUTTON_CHK_DELAY)
+  else
+     set_delay(BUT_ADJ_TIMER_SLOT, BUTTON_CHK_DELAY)
+  end if
+end procedure
+
+
+
+function buttonTimerExpired(BYTE in buttonID) return BYTE is
+  var byte timerExpired
+
+  if  (buttonID == BUT_UP_DOWN) then
+     timerExpired = check_delay(BUT_UP_TIMER_SLOT)
+  else
+     timerExpired = check_delay(BUT_ADJ_TIMER_SLOT)
+  end if
+  return timerExpired
+end function
+
+
+
+procedure setNewZeroSetting() is
+  newSetpoint = 0
+  altiUpdate  = TRUE
+  acceptNewSetpoint()
+end procedure
+
+
+
+procedure setOffsetSettings(BYTE in stepDirection, WORD in stepValue) is
+  if (stepDirection == TEST_DIR_INC) then
+     if ((offsetS1 + stepValue) >= 4096) then
+        offsetS1 = stepValue - (4096 - offsetS1)
+     else
+        offsetS1 = offsetS1 + stepValue
+     end if
+     if ((offsetS2 + stepValue) >= 4096) then
+        offsetS2 = stepValue - (4096 - offsetS2)
+     else
+        offsetS2 = offsetS2 + stepValue
+     end if
+     if ((offsetS3 + stepValue) >= 4096) then
+        offsetS3 = stepValue - (4096 - offsetS3)
+     else
+        offsetS3 = offsetS3 + stepValue
+     end if
+  else
+     if (offsetS1 < stepValue) then
+        offsetS1 = 4096 - (stepValue - offsetS1)
+     else
+        offsetS1 = offsetS1 - stepValue
+     end if
+     if (offsetS2 < stepValue) then
+        offsetS2 = 4096 - (stepValue - offsetS2)
+     else
+        offsetS2 = offsetS2 - stepValue
+     end if
+     if (offsetS3 < stepValue) then
+        offsetS3 = 4096 - (stepValue - offsetS3)
+     else
+        offsetS3 = offsetS3 - stepValue
+     end if
+  end if
+end procedure
+
+
+
+const BYTE  BUT_PRESSED    = 0
+const BYTE  BUT_RELEASED   = 1
+
+procedure checkButton(BYTE in buttonID) is
+  -- one routine to handle both buttons, because there are many similarities.
+  -- "buttonID" is used to specify which button to process.
+  -- The buttons have pull-up resistors, thus the active (pressed) state is "0".
+
+  case (buttonCheckState[buttonID]) of
+     BUT_INACTIVE : block
+        -- button is not pressed; check whether it is pressed now.
+        if (readButton(buttonID) == BUT_PRESSED) then
+           -- button is pressed => start debounce timer
+           buttonCheckState[buttonID] = BUT_DEBOUNCE_TO_ACT
+           buttonCheckCount[buttonID] = DEBOUNCE_COUNT
+           startDebounceTimer(buttonID)
+        else
+           -- button not pressed => no actions
+        end if
+     end block
+
+     BUT_DEBOUNCE_TO_ACT : block
+        if (buttonTimerExpired(buttonID) == TRUE) then
+           -- timer expired: check button state
+           if (readButton(buttonID) == BUT_PRESSED) then
+              -- button still pressed
+              buttonCheckCount[buttonID] = buttonCheckCount[buttonID] - 1
+              if (buttonCheckCount[buttonID] == 0) then
+                 -- debounce cycle ended: button activation action(s)
+                 if (buttonID == BUT_UP_DOWN) then
+                    buttonCheckState[buttonID] = BUT_ACTIVE
+                    adjustmentDirection = ADJUST_DOWN
+                 end if
+                 if (buttonID == BUT_ADJUST) then
+                    buttonCheckState[buttonID] = BUT_ACTIVE
+                    adjustStepRate = ADJ_STEPRATE_1
+                    adjustStepCount = STEPS_BEFORE_FASTER
+                    stepSize = 1
+                    setOffsetSettings(adjustmentDirection, stepSize)
+                    setNewZeroSetting()
+                    set_delay(ADJUST_RATE_SLOT, adjustStepRate)
+                 end if
+              else
+                 -- next debounce cycle
+                 startDebounceTimer(buttonID)
+              end if
+           else
+              -- button no longer pressed while in debounce cycle; try again
+              buttonCheckState[buttonID] = BUT_INACTIVE
+              if (buttonID == BUT_UP_DOWN) then
+                  adjustmentDirection = ADJUST_UP
+              end if
+           end if
+        end if
+     end block
+
+     BUT_ACTIVE : block
+        -- button is pressed; check whether it is still pressed.
+        if (readButton(buttonID) == BUT_PRESSED) then
+           -- button is still pressed => check for actions to do
+           if (buttonID == BUT_ADJUST) then
+              if (check_delay(ADJUST_RATE_SLOT)) then
+                 -- new setting update, check for going to larger update steps
+                 if (adjustStepCount != 0) then
+                    adjustStepCount = adjustStepCount - 1
+                 else
+                    if (adjustStepRate == ADJ_STEPRATE_1) then
+                       adjustStepRate = ADJ_STEPRATE_2
+                       adjustStepCount = (STEPS_BEFORE_FASTER << 1)
+                       stepSize = 2
+                    elsif (adjustStepRate == ADJ_STEPRATE_2) then
+                       adjustStepRate = ADJ_STEPRATE_3
+                       adjustStepCount = STEPS_BEFORE_FASTER
+                       stepSize = 10
+                    end if
+                 end if
+                 setOffsetSettings(adjustmentDirection, stepSize)
+                 setNewZeroSetting()
+                 set_delay(ADJUST_RATE_SLOT, adjustStepRate)
+              end if
+           else
+              -- UP/DOWN button still pressed: no further actions
+           end if
+        else
+           -- button no longer pressed => start debounce cycle
+           buttonCheckState[buttonID] = BUT_DEBOUNCE_TO_INACT
+           buttonCheckCount[buttonID] = DEBOUNCE_COUNT
+           startDebounceTimer(buttonID)
+        end if
+     end block
+
+     BUT_DEBOUNCE_TO_INACT : block
+        -- button is released; check whether it is still released.
+        if (buttonTimerExpired(buttonID) == TRUE) then
+           -- timer expired: check button state
+           if (readButton(buttonID) == BUT_RELEASED) then
+              -- button still released
+              buttonCheckCount[buttonID] = buttonCheckCount[buttonID] - 1
+              if (buttonCheckCount[buttonID] == 0) then
+                 -- debounce cycle ended: back to inactive
+                 buttonCheckState[buttonID] = BUT_INACTIVE
+                 if (buttonID == BUT_UP_DOWN) then
+                    adjustmentDirection = ADJUST_UP
+                 end if
+                 ; for (buttonID == BUT_ADJUST) no further actions
+              else
+                 -- next debounce cycle
+                 startDebounceTimer(buttonID)
+              end if
+           else
+              -- button pressed again, but in debounce cycle; try again
+              buttonCheckCount[buttonID] = DEBOUNCE_COUNT
+              startDebounceTimer(buttonID)
+           end if
+        end if
+     end block
+
+     otherwise block
+        -- ignore everything else - reject
+        buttonCheckState[buttonID] = BUT_INACTIVE
+        if (buttonID == BUT_UP_DOWN) then
+            adjustmentDirection = ADJUST_UP
+        end if
+     end block
+  end case
+end procedure
+
+
+
+-- -----------------------------------------------------------------------------
+-- check the initial setpoint SET buttons - called from main()
+-- -----------------------------------------------------------------------------
+procedure checkSettingAdjustment() is
+  checkButton(BUT_UP_DOWN)
+  checkButton(BUT_ADJUST)
+end procedure
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- processCommand - process received command packet
+-- -----------------------------------------------------------------------------
+procedure processCommand() is
+  var byte IDbyte, polData
+
+  case (commandCode) of
+      CMD_SALTQ1A     : block
+                           newSetpoint = word(commandData)
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ1B     : block
+                           newSetpoint = word(commandData) + 256
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ1C     : block
+                           newSetpoint = word(commandData) + 512
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ1D     : block
+                           newSetpoint = word(commandData) + 768
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ2A     : block
+                           newSetpoint = word(commandData) + 1024
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ2B     : block
+                           newSetpoint = word(commandData) + 1024 + 256
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ2C     : block
+                           newSetpoint = word(commandData) + 1024 + 512
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ2D     : block
+                           newSetpoint = word(commandData) + 1024 + 768
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ3A     : block
+                           newSetpoint = word(commandData) + 2048
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ3B     : block
+                           newSetpoint = word(commandData) + 2048 + 256
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ3C     : block
+                           newSetpoint = word(commandData) + 2048 + 512
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ3D     : block
+                           newSetpoint = word(commandData) + 2048 + 768
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ4A     : block
+                           newSetpoint = word(commandData) + 3072
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ4B     : block
+                           newSetpoint = word(commandData) + 3072 + 256
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ4C     : block
+                           newSetpoint = word(commandData) + 3072 + 512
+                           altiUpdate = TRUE
+                        end block
+      CMD_SALTQ4D     : block
+                           newSetpoint = word(commandData) + 3072 + 768
+                           altiUpdate = TRUE
+                        end block
+--
+      CMD_S1AMPL   : block
+                        amplitudeS1 = word(commandData) << 2
+                     end block
+      CMD_S2AMPL   : block
+                        amplitudeS2 = word(commandData) << 2
+                     end block
+      CMD_S3AMPL   : block
+                        amplitudeS3 = word(commandData) << 2
+                     end block
+      CMD_SxPOL    : block
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --  |     |     |     |     |     |  S3 |  S2 |  S1 |
+                        --  +-----+-----+-----+-----+-----+-----+-----+-----+
+                        --                                  pol   pol   pol
+                        --
+                        --  Bits 0, 1, and 2 set the polarity of S1, S2, and S3
+                        --  respectively of the altimeter synchro.
+                        --  Bits 3-4-5-6-7 are ignored.
+
+                        polData = !commandData         -- "0" pass // "1" invert
+                        polarityS1 = (polData & 0x01)
+                        polarityS2 = (polData & 0x02) >> 1
+                        polarityS3 = (polData & 0x04) >> 2
+                        synchroSetpoint(amplitudeS1, amplitudeS2, amplitudeS3,
+                                        polarityS1,  polarityS2,  polarityS3 )
+                     end block
+--
+      -- base angle offsets (in 12-bit accuracy)
+      -- NOTE: LSB value must be set *before* MSB value!
+      CMD_S1BASE_L : block
+                        offsetS1low = word(commandData)
+                     end block
+      CMD_S1BASE_H : block
+                        offsetS1 = (word(commandData)) << 8
+                        offsetS1 = offsetS1 + offsetS1low
+                     end block
+      CMD_S2BASE_L : block
+                        offsetS2low = word(commandData)
+                     end block
+      CMD_S2BASE_H: block
+                        offsetS2 = (word(commandData)) << 8
+                        offsetS2 = offsetS2 + offsetS2low
+                     end block
+      CMD_S3BASE_L : block
+                        offsetS3low = word(commandData)
+                     end block
+      CMD_S3BASE_H : block
+                        offsetS3 = (word(commandData)) << 8
+                        offsetS3 = offsetS3 + offsetS3low
+                     end block
+--
+      CMD_WTCHDOG_DIS : block
+                            wtchdogState = WTCHDOG_DISABLED
+                        end block
+      CMD_WTCHDOG_ENA : block
+                           if ((commandData & 0x3F) == 0x00) then
+                               -- set default timeout value
+                               wtchdogDelayValue = WTCHDOG_DFLT_TIMEOUT
+                           else
+                               wtchdogDelayValue = word(commandData & 0x3F)
+                           end if
+                           if ((commandData & 0xC0) == 0x80) then
+                               -- enable watchdog
+                               wtchdogState = WTCHDOG_ENABLED
+                               set_delay(COMM_WATCHDOG_SLOT, wtchdogDelayValue)
+                           end if
+                           if ((commandData & 0xC0) == 0x00) then
+                               -- disable watchdog
+                               wtchdogState = WTCHDOG_DISABLED
+                           end if
+                        end block
+--
+      CMD_DIAGMODE : block
+                        if (flashRate != DOA_RESET_RATE) then
+                           -- do not accept DIAG commands during DOA power-up
+                           setDiagLEDmode(commandData)
+                        end if
+                     end block
+--
+      CMD_USROUT1  : block
+                        if (commandData == 0) then  DIGOUT1 = 0 end if
+                        if (commandData == 1) then  DIGOUT1 = 1 end if
+                     end block
+      CMD_USROUT2  : block
+                        if (commandData == 0) then  DIGOUT2 = 0 end if
+                        if (commandData == 1) then  DIGOUT2 = 1 end if
+                     end block
+      CMD_USROUT3  : block
+                        if (commandData == 0) then  DIGOUT3 = 0 end if
+                        if (commandData == 1) then  DIGOUT3 = 1 end if
+                     end block
+--
+      CMD_TESTSTART :   block
+                          -- start at 0
+                          if (testModeState == TEST_INACTIVE) then
+                             -- start TEST mode only if current state == INACTIVE
+                             testModePosition  = 0
+                             testModeDirection = TEST_DIR_INC
+                             testModeState     = TEST_RUNNING
+                             set_delay(TEST_STEP_DELAY, testModeStepRate)
+                          end if
+                        end block
+      CMD_TESTSTOP  :   block
+                          -- abort current cycle, go back to 0 and stop
+                          if (testModeState == TEST_RUNNING) then
+                             -- accept STOP command only when RUNNING
+                             testModeState = TEST_STOPPING
+                          end if
+                       end block
+      CMD_TESTRATE  :  block
+                          if (commandData == 0) then
+                             testModeStepRate = TEST_STEP_RATE
+                          else
+                             testModeStepRate = word(commandData) << 2
+                          end if
+                       end block
+--
+      -- load "manual" setpoint via direct access to S1, S2, S3 (12-bit value)
+      -- NOTE 1: LSB value must be set *before* MSB value!
+      -- NOTE 2: NO offset is included!
+      -- NOTE 3: setpoint buffering is bypassed: the DACs are loaded immediately
+      --         but only if a previous manual load is not "in progress". If a
+      --         manual load is in "progress", this new setpoint load is ignored
+      --         There is NO check whether manual loading and "normal" setpoint
+      --         loading is used simultaneously.
+      CMD_S1MAN_L : block
+                       manualS1low = word(commandData)
+                    end block
+      CMD_S1MAN_H : block
+                       manualS1 = (word(commandData)) << 8
+                       manualS1 = manualS1 + manualS1low
+                    end block
+      CMD_S2MAN_L : block
+                       manualS2low = word(commandData)
+                    end block
+      CMD_S2MAN_H: block
+                       manualS2 = (word(commandData)) << 8
+                       manualS2 = manualS2 + manualS2low
+                    end block
+      CMD_S3MAN_L : block
+                       manualS3low = word(commandData)
+                    end block
+      CMD_S3MAN_H : block
+                       manualS3 = (word(commandData)) << 8
+                       manualS3 = manualS3 + manualS3low
+                    end block
+      CMD_LD_MAN  : block
+                       amplitudeS1 = manualS1 & 0x0FFF   -- strip to 12 bits
+                       amplitudeS2 = manualS2 & 0x0FFF
+                       amplitudeS3 = manualS3 & 0x0FFF
+                       if ((commandData & 0x01) == 0x01) then
+                           polarityS1  = 1
+                       else
+                           polarityS1  = 0
+                       end if
+                       if ((commandData & 0x02) == 0x02) then
+                           polarityS2  = 1
+                       else
+                           polarityS2  = 0
+                       end if
+                       if ((commandData & 0x04) == 0x04) then
+                           polarityS3  = 1
+                       else
+                           polarityS3  = 0
+                       end if
+                       if (manualLoadFinished == TRUE) then
+                           manualLoadFinished = FALSE
+                           synchroSetpoint( amplitudeS1, amplitudeS2,
+                                            amplitudeS3, polarityS1,
+                                            polarityS2,  polarityS3 )
+                           -- manualLoadFinished -> TRUE done in SPI interrupt
+                       end if
+                    end block
+
+      -- USB test
+      CMD_IDENTIFY  : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            usb_serial_data = "A"
+                            usb_serial_data = "L"
+                            usb_serial_data = "T"
+                            usb_serial_data = " "
+                            usb_serial_data = "v"
+                            usb_serial_data = "0" + MAJOR_VERSION
+                            usb_serial_data = "."
+                            usb_serial_data = "0" + MINOR_VERSION
+                            usb_serial_data = " "
+                            usb_serial_data = "$"
+                            IDbyte = ((ALTI_ADDR >> 4) & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            IDbyte = (ALTI_ADDR & 0x0F) + "0"
+                            if (IDbyte > "9") then IDbyte = IDbyte + 7  end if
+                            usb_serial_data = IDbyte
+                            usb_serial_data = ASCII_CR                  ; add CR
+                            usb_serial_data = ASCII_LF                  ; add LF
+                         end if
+                      end block
+      -- USB debug
+      CMD_USB_DEBUG : block
+                         -- double check that USB is the COM port in use!
+                         if (commPort == USE_USB) then
+                            if (commandData == "N") then
+                               USBdebugEnabled = FALSE
+                            elsif (commandData == "Y") then
+                               USBdebugEnabled = TRUE
+                            end if
+                         end if
+                      end block
+
+      -- ignore everything else
+      otherwise block
+                   ; do nothing - reject
+                end block
+  end case
+end procedure
+
