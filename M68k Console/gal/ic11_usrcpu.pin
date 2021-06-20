@@ -1,0 +1,25 @@
+
+
+ Pin # | Name     | Pin Type
+-----------------------------
+   1   | A1B      | Input
+   2   | A2B      | Input
+   3   | A3B      | Input
+   4   | A4B      | Input
+   5   | CONSEL   | Input
+   6   | NC6      | Input
+   7   | NC7      | Input
+   8   | NC8      | Input
+   9   | DTACK    | Input
+  10   | GND      | GND
+  11   | RWB      | Input
+  12   | NC12     | NC
+  13   | UDSB     | Input
+  14   | NC14     | NC
+  15   | LATCHD0  | Output
+  16   | LDSB     | Input
+  17   | LATCHD8  | Output
+  18   | NC18     | NC
+  19   | DATA0DIR | Output
+  20   | VCC      | VCC
+

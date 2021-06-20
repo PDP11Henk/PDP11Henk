@@ -1,0 +1,18 @@
+GAL16V8      ; GAL type
+USRCPU       ; signature
+
+; chip pin declaration
+; pin1  --> pin10 (GND)
+; pin11 --> pin20 (VCC)
+
+A1B  A2B   A3B   A4B   CONSEL   NC6   NC7      NC8   DTACK     GND
+RWB  NC12  UDSB  NC14  LATCHD0  LDSB  LATCHD8  NC18  DATA0DIR  VCC
+
+; boolean equations
+
+DATA0DIR = /CONSEL * RWB * /A4B * /A3B + /CONSEL * RWB * A4B * A3B * /A2B * /A1B
+LATCHD8  = UDSB * DTACK
+LATCHD0  = LDSB * DTACK
+
+DESCRIPTION
+IC11 (CPU/USER OUTPUT & DATABUS D0-D7 direction/3-state control)

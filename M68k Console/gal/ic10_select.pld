@@ -1,0 +1,21 @@
+GAL16V8      ; GAL type
+SELECT       ; signature
+
+; chip pin declaration
+; pin1  --> pin10 (GND)
+; pin11 --> pin20 (VCC)
+
+FC0B    FC1B  FC2B  LDSB    A7B     A5B  A6B  ASB  IOSEL  GND
+CONSACT A9B   A8B   ASBINV  LDSINV  IAC  USR  SUP  CONSEL VCC
+
+; boolean equations
+
+/ASBINV = ASB
+/LDSINV = LDSB
+/CONSEL = /IOSEL * CONSACT * /LDSB * A9B *  A8B *  A7B *  A6B *  A5B
+/SUP    = FC2B  * /FC1B * FC0B + FC2B  * FC1B * /FC0B
+/USR    = /FC2B * /FC1B * FC0B + /FC2B * FC1B * /FC0B
+IAC     = FC2B  * FC1B  * FC0B
+
+DESCRIPTION
+IC10 (DTACK generation, device selection and status signals)

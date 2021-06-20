@@ -1,0 +1,17 @@
+GAL16V8      ; GAL type
+IACK         ; signature
+
+; chip pin declaration
+; pin1  --> pin10 (GND)
+; pin11 --> pin20 (VCC)
+
+A3B   A1B   A2B    A10B   A11B  A12B   A13B   A14B   A15B  GND
+A17B  A16B  ASB  CONSACT  NC15  IACK7  FC2B   FC1B   FC0B  VCC
+
+; boolean equations
+
+CONSACT = A17B * A16B * A15B * A14B * A13B * A12B * A11B * A10B
+/IACK7  = FC0B * FC1B * FC2B * A17B *  A3B *  A2B *  A1B * /ASB
+
+DESCRIPTION
+IC13 (IACK generation and partial board address selection)

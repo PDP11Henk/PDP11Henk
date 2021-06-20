@@ -1,0 +1,25 @@
+
+
+ Pin # | Name     | Pin Type
+-----------------------------
+   1   | A3B      | Input
+   2   | A1B      | Input
+   3   | A2B      | Input
+   4   | A10B     | Input
+   5   | A11B     | Input
+   6   | A12B     | Input
+   7   | A13B     | Input
+   8   | A14B     | Input
+   9   | A15B     | Input
+  10   | GND      | GND
+  11   | A17B     | Input
+  12   | A16B     | Input
+  13   | ASB      | Input
+  14   | CONSACT  | Output
+  15   | NC15     | NC
+  16   | IACK7    | Output
+  17   | FC2B     | Input
+  18   | FC1B     | Input
+  19   | FC0B     | Input
+  20   | VCC      | VCC
+

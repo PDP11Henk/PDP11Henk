@@ -1,0 +1,25 @@
+
+
+ Pin # | Name     | Pin Type
+-----------------------------
+   1   | FC0B     | Input
+   2   | FC1B     | Input
+   3   | FC2B     | Input
+   4   | LDSB     | Input
+   5   | A7B      | Input
+   6   | A5B      | Input
+   7   | A6B      | Input
+   8   | ASB      | Input
+   9   | IOSEL    | Input
+  10   | GND      | GND
+  11   | CONSACT  | Input
+  12   | A9B      | Input
+  13   | A8B      | Input
+  14   | ASBINV   | Output
+  15   | LDSINV   | Output
+  16   | IAC      | Output
+  17   | USR      | Output
+  18   | SUP      | Output
+  19   | CONSEL   | Output
+  20   | VCC      | VCC
+

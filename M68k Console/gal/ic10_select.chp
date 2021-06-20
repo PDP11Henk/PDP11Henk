@@ -1,0 +1,25 @@
+
+
+                                GAL16V8
+
+                          -------\___/-------
+                     FC0B |  1           20 | VCC
+                          |                 |
+                     FC1B |  2           19 | CONSEL
+                          |                 |
+                     FC2B |  3           18 | SUP
+                          |                 |
+                     LDSB |  4           17 | USR
+                          |                 |
+                      A7B |  5           16 | IAC
+                          |                 |
+                      A5B |  6           15 | LDSINV
+                          |                 |
+                      A6B |  7           14 | ASBINV
+                          |                 |
+                      ASB |  8           13 | A8B
+                          |                 |
+                    IOSEL |  9           12 | A9B
+                          |                 |
+                      GND | 10           11 | CONSACT
+                          -------------------

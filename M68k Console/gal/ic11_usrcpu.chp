@@ -1,0 +1,25 @@
+
+
+                                GAL16V8
+
+                          -------\___/-------
+                      A1B |  1           20 | VCC
+                          |                 |
+                      A2B |  2           19 | DATA0DIR
+                          |                 |
+                      A3B |  3           18 | NC18
+                          |                 |
+                      A4B |  4           17 | LATCHD8
+                          |                 |
+                   CONSEL |  5           16 | LDSB
+                          |                 |
+                      NC6 |  6           15 | LATCHD0
+                          |                 |
+                      NC7 |  7           14 | NC14
+                          |                 |
+                      NC8 |  8           13 | UDSB
+                          |                 |
+                    DTACK |  9           12 | NC12
+                          |                 |
+                      GND | 10           11 | RWB
+                          -------------------
