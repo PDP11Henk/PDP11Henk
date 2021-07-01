@@ -3,7 +3,7 @@
 Pin 19 = DATA0DIR     XOR = 1   AC1 = 1
   0  ---- ---- ---- ---- ---- ---- ---- ----
   1  ---- -x-- -x-- -x-- ---- ---- ---- --x-
-  2  -x-x x--- x--- -x-- ---- ---- ---- --x-
+  2  -x-x x--- -x-- -x-- ---- ---- ---- --x-
   3  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   4  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
   5  xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
